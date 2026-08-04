@@ -7,9 +7,8 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Функции для красивого вывода
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
@@ -58,14 +57,14 @@ sudo update-locale LANG=ru_RU.UTF-8
 print_success "Русская локаль установлена"
 
 # ============================================
-# 4. УСТАНОВКА БАЗОВЫХ УТИЛИТ (БЕЗ procs)
+# 4. УСТАНОВКА БАЗОВЫХ УТИЛИТ (БЕЗ cargo)
 # ============================================
 print_info "Установка базовых утилит..."
 sudo apt install -y \
     git curl wget unzip jq htop tmux net-tools dnsutils \
     bat eza fd-find ripgrep zoxide fzf \
     python3 python3-pip python3-venv build-essential \
-    btop mtr iperf3 zsh cargo
+    btop mtr iperf3 zsh
 print_success "Базовые утилиты установлены"
 
 # ============================================
@@ -77,37 +76,57 @@ sudo ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
 print_success "Симлинки созданы"
 
 # ============================================
-# 6. УСТАНОВКА procs ЧЕРЕЗ CARGO (Rust)
+# 6. УДАЛЕНИЕ СТАРОГО RUST (если есть)
 # ============================================
-print_info "Установка procs через cargo..."
+print_info "Удаление устаревшего системного Rust..."
+sudo apt remove cargo rustc rust-all -y 2>/dev/null || true
+sudo apt autoremove -y
+print_success "Старый Rust удалён"
+
+# ============================================
+# 7. УСТАНОВКА СВЕЖЕГО RUST ЧЕРЕЗ RUSTUP
+# ============================================
+print_info "Установка свежего Rust через rustup..."
+
 if [ "$CURRENT_USER" = "root" ]; then
     CARGO_BIN="/root/.cargo/bin"
+    CARGO_ENV="/root/.cargo/env"
 else
     CARGO_BIN="$HOME/.cargo/bin"
+    CARGO_ENV="$HOME/.cargo/env"
 fi
 
+if [ ! -f "$CARGO_BIN/rustc" ]; then
+    # Устанавливаем rustup без интерактива
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    print_success "Rust установлен"
+else
+    print_warning "Rust уже установлен"
+fi
+
+# Подгружаем окружение rustup
+if [ -f "$CARGO_ENV" ]; then
+    source "$CARGO_ENV"
+fi
+
+# ============================================
+# 8. УСТАНОВКА procs ЧЕРЕЗ CARGO
+# ============================================
+print_info "Установка procs через cargo..."
+
 if [ ! -f "$CARGO_BIN/procs" ]; then
-    # Запускаем cargo install от имени текущего пользователя
-    if [ "$CURRENT_USER" = "root" ]; then
-        cargo install procs
-    else
-        sudo -u "$CURRENT_USER" cargo install procs
-    fi
+    # Добавляем cargo bin в PATH для текущей сессии
+    export PATH="$CARGO_BIN:$PATH"
+    
+    # Устанавливаем procs
+    cargo install procs
     print_success "procs установлен"
 else
     print_warning "procs уже установлен"
 fi
 
-# Добавляем cargo bin в PATH в .zshrc (позже будет перезаписан, поэтому дублируем в bashrc тоже)
-if [ "$CURRENT_USER" = "root" ]; then
-    PATH_FILE="/root/.bashrc"
-else
-    PATH_FILE="$HOME/.bashrc"
-fi
-grep -q 'cargo/bin' "$PATH_FILE" || echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$PATH_FILE"
-
 # ============================================
-# 7. НАСТРОЙКА SUDOERS (NOPASSWD)
+# 9. НАСТРОЙКА SUDOERS (NOPASSWD)
 # ============================================
 print_info "Настройка sudoers для команд без пароля..."
 SUDOERS_LINE="$CURRENT_USER ALL=(ALL) NOPASSWD: /usr/sbin/ufw, /usr/bin/journalctl"
@@ -119,7 +138,7 @@ else
 fi
 
 # ============================================
-# 8. УСТАНОВКА ZSH КАК ОБОЛОЧКИ ПО УМОЛЧАНИЮ
+# 10. УСТАНОВКА ZSH КАК ОБОЛОЧКИ ПО УМОЛЧАНИЮ
 # ============================================
 print_info "Установка Zsh как оболочки по умолчанию..."
 if [ "$CURRENT_USER" = "root" ]; then
@@ -130,13 +149,12 @@ fi
 print_success "Zsh установлен как оболочка по умолчанию"
 
 # ============================================
-# 9. УСТАНОВКА OH MY ZSH
+# 11. УСТАНОВКА OH MY ZSH
 # ============================================
 print_info "Установка Oh My Zsh..."
 if [ ! -d "$USER_HOME/.oh-my-zsh" ]; then
     export RUNZSH=no
     export KEEP_ZSHRC=no
-    # Установка от имени текущего пользователя
     if [ "$CURRENT_USER" = "root" ]; then
         sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
     else
@@ -148,7 +166,7 @@ else
 fi
 
 # ============================================
-# 10. УСТАНОВКА POWERLEVEL10K
+# 12. УСТАНОВКА POWERLEVEL10K
 # ============================================
 print_info "Установка Powerlevel10k..."
 ZSH_CUSTOM_DIR="$USER_HOME/.oh-my-zsh/custom"
@@ -164,7 +182,7 @@ else
 fi
 
 # ============================================
-# 11. УСТАНОВКА ПЛАГИНОВ OMZ
+# 13. УСТАНОВКА ПЛАГИНОВ OMZ
 # ============================================
 print_info "Установка плагинов Oh My Zsh..."
 clone_plugin() {
@@ -186,7 +204,7 @@ clone_plugin "zsh-completions" "https://github.com/zsh-users/zsh-completions"
 print_success "Плагины установлены"
 
 # ============================================
-# 12. СОЗДАНИЕ .zshrc
+# 14. СОЗДАНИЕ .zshrc
 # ============================================
 print_info "Создание конфигурации .zshrc..."
 
@@ -250,8 +268,8 @@ source /usr/share/doc/fzf/examples/completion.zsh
 # === Zoxide (умный cd) ===
 eval "$(zoxide init zsh)"
 
-# === Cargo bin в PATH ===
-export PATH="$HOME/.cargo/bin:$PATH"
+# === Cargo/Rust окружение ===
+. "$HOME/.cargo/env" 2>/dev/null || true
 
 # Powerlevel10k config
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
@@ -260,12 +278,13 @@ EOF
 print_success "Файл .zshrc создан"
 
 # ============================================
-# 13. НАСТРОЙКА ПРАВ ДОСТУПА
+# 15. НАСТРОЙКА ПРАВ ДОСТУПА
 # ============================================
 if [ "$CURRENT_USER" != "root" ]; then
     sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.oh-my-zsh"
     sudo chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc"
     sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.cargo" 2>/dev/null || true
+    sudo chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.rustup" 2>/dev/null || true
 fi
 
 # ============================================

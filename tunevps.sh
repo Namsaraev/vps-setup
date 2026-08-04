@@ -7,26 +7,33 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
+# Функции для красивого вывода
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-# Проверка прав
-if [ "$EUID" -eq 0 ]; then
-    print_info "Скрипт запущен от имени root"
-    CURRENT_USER="root"
-    USER_HOME="/root"
-elif sudo -n true 2>/dev/null; then
-    print_info "Скрипт запущен с правами sudo"
-    CURRENT_USER=$(whoami)
-    USER_HOME="$HOME"
-else
-    print_error "Для работы скрипта нужны права root или sudo"
-    exit 1
+# ============================================
+# АВТОМАТИЧЕСКИЙ ЗАПУСК ЧЕРЕЗ SUDO
+# ============================================
+if [ "$EUID" -ne 0 ]; then
+    print_info "Требуются права root. Перезапускаем скрипт через sudo..."
+    # Запускаем себя же через sudo, передавая все аргументы
+    exec sudo bash "$0" "$@"
 fi
+
+print_info "Скрипт запущен от имени root"
+CURRENT_USER="${SUDO_USER:-root}"
+if [ "$CURRENT_USER" = "root" ]; then
+    USER_HOME="/root"
+else
+    USER_HOME="/home/$CURRENT_USER"
+fi
+
+print_info "Настройка будет выполнена для пользователя: $CURRENT_USER"
+echo ""
 
 print_info "Начинаем настройку системы для пользователя: $CURRENT_USER"
 echo ""

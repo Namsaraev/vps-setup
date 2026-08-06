@@ -64,53 +64,7 @@ ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
 ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
 print_success "Симлинки созданы"
 
-# 6. УДАЛЕНИЕ СТАРОГО RUST
-print_info "Удаление устаревшего системного Rust..."
-apt remove cargo rustc rust-all -y 2>/dev/null || true
-apt autoremove -y
-print_success "Старый Rust удалён"
-
-# 7. УСТАНОВКА RUSTUP
-print_info "Установка свежего Rust через rustup..."
-if [ "$CURRENT_USER" = "root" ]; then
-    CARGO_BIN="/root/.cargo/bin"
-    CARGO_ENV="/root/.cargo/env"
-else
-    CARGO_BIN="$USER_HOME/.cargo/bin"
-    CARGO_ENV="$USER_HOME/.cargo/env"
-fi
-
-if [ ! -f "$CARGO_BIN/rustc" ]; then
-    # Устанавливаем rustup от имени целевого пользователя
-    if [ "$CURRENT_USER" = "root" ]; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    else
-        sudo -u "$CURRENT_USER" bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
-    fi
-    print_success "Rust установлен"
-else
-    print_warning "Rust уже установлен"
-fi
-
-if [ -f "$CARGO_ENV" ]; then
-    source "$CARGO_ENV"
-fi
-
-# 8. УСТАНОВКА procs
-print_info "Установка procs через cargo..."
-if [ ! -f "$CARGO_BIN/procs" ]; then
-    export PATH="$CARGO_BIN:$PATH"
-    if [ "$CURRENT_USER" = "root" ]; then
-        cargo install procs
-    else
-        sudo -u "$CURRENT_USER" bash -c "source '$CARGO_ENV' && cargo install procs"
-    fi
-    print_success "procs установлен"
-else
-    print_warning "procs уже установлен"
-fi
-
-# 9. SUDOERS (NOPASSWD)
+# 6. SUDOERS (NOPASSWD)
 print_info "Настройка sudoers для команд без пароля..."
 SUDOERS_LINE="$CURRENT_USER ALL=(ALL) NOPASSWD: /usr/sbin/ufw, /usr/bin/journalctl"
 if grep -q "$SUDOERS_LINE" /etc/sudoers 2>/dev/null; then
@@ -120,12 +74,12 @@ else
     print_success "Sudoers настроен"
 fi
 
-# 10. ZSH
+# 7. ZSH
 print_info "Установка Zsh как оболочки по умолчанию..."
 chsh -s $(which zsh) "$CURRENT_USER"
 print_success "Zsh установлен как оболочка по умолчанию"
 
-# 11. OH MY ZSH
+# 8. OH MY ZSH
 print_info "Установка Oh My Zsh..."
 if [ ! -d "$USER_HOME/.oh-my-zsh" ]; then
     export RUNZSH=no
@@ -140,7 +94,7 @@ else
     print_warning "Oh My Zsh уже установлен"
 fi
 
-# 12. POWERLEVEL10K
+# 9. POWERLEVEL10K
 print_info "Установка Powerlevel10k..."
 ZSH_CUSTOM_DIR="$USER_HOME/.oh-my-zsh/custom"
 if [ ! -d "$ZSH_CUSTOM_DIR/themes/powerlevel10k" ]; then
@@ -154,7 +108,7 @@ else
     print_warning "Powerlevel10k уже установлен"
 fi
 
-# 13. ПЛАГИНЫ OMZ
+# 10. ПЛАГИНЫ OMZ
 print_info "Установка плагинов Oh My Zsh..."
 clone_plugin() {
     local name=$1
@@ -173,7 +127,7 @@ clone_plugin "zsh-syntax-highlighting" "https://github.com/zsh-users/zsh-syntax-
 clone_plugin "zsh-completions" "https://github.com/zsh-users/zsh-completions"
 print_success "Плагины установлены"
 
-# 14. .zshrc
+# 11. .zshrc
 print_info "Создание конфигурации .zshrc..."
 cat > "$USER_HOME/.zshrc" << 'EOF'
 # Enable Powerlevel10k instant prompt
@@ -206,8 +160,6 @@ alias grep="rg"
 alias fd="fd"
 alias cd="z"
 alias top="btop"
-alias ps="procs"
-alias psa="procs --tree"
 
 alias ..="cd .."
 alias ...="cd ../.."
@@ -226,18 +178,14 @@ source /usr/share/doc/fzf/examples/completion.zsh
 
 eval "$(zoxide init zsh)"
 
-. "$HOME/.cargo/env" 2>/dev/null || true
-
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
 EOF
 print_success "Файл .zshrc создан"
 
-# 15. ПРАВА ДОСТУПА
+# 12. ПРАВА ДОСТУПА
 if [ "$CURRENT_USER" != "root" ]; then
     chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.oh-my-zsh"
     chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc"
-    chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.cargo" 2>/dev/null || true
-    chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.rustup" 2>/dev/null || true
 fi
 
 # ФИНАЛ

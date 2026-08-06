@@ -15,12 +15,14 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+print_section() { echo -e "\n${CYAN}========== $1 ==========${NC}"; }
 
 # Функция для интерактивного ввода (работает даже через pipe)
 ask_input() {
@@ -44,7 +46,21 @@ if [ "$EUID" -ne 0 ]; then
     exec sudo bash "$0" "$@"
 fi
 
+# ============================================
+# ОПРЕДЕЛЕНИЕ ВЕРСИИ UBUNTU
+# ============================================
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    UBUNTU_VERSION="$VERSION_ID"
+    UBUNTU_CODENAME="$VERSION_CODENAME"
+else
+    print_error "Не удалось определить версию ОС. Скрипт поддерживает только Ubuntu."
+    exit 1
+fi
+
 print_info "Скрипт запущен от имени root"
+print_info "Обнаружена ОС: $PRETTY_NAME (версия: $UBUNTU_VERSION, кодовое имя: $UBUNTU_CODENAME)"
+
 CURRENT_USER="${SUDO_USER:-root}"
 if [ "$CURRENT_USER" = "root" ]; then
     USER_HOME="/root"
@@ -60,6 +76,7 @@ echo ""
 # ============================================
 # 1. ОБНОВЛЕНИЕ СИСТЕМЫ
 # ============================================
+print_section "1. ОБНОВЛЕНИЕ СИСТЕМЫ"
 print_info "Обновление системы..."
 apt-get update -y
 apt-get upgrade -y
@@ -69,6 +86,7 @@ print_success "Система обновлена"
 # ============================================
 # 2. ЧАСОВОЙ ПОЯС
 # ============================================
+print_section "2. ЧАСОВОЙ ПОЯС"
 print_info "Настройка часового пояса: Asia/Irkutsk"
 timedatectl set-timezone Asia/Irkutsk
 print_success "Часовой пояс установлен: $(timedatectl | grep 'Time zone')"
@@ -76,6 +94,7 @@ print_success "Часовой пояс установлен: $(timedatectl | gre
 # ============================================
 # 3. ЛОКАЛЬ
 # ============================================
+print_section "3. ЛОКАЛЬ"
 print_info "Настройка русской локали..."
 apt-get install -y language-pack-ru
 locale-gen ru_RU.UTF-8
@@ -85,6 +104,7 @@ print_success "Русская локаль установлена"
 # ============================================
 # 4. БАЗОВЫЕ УТИЛИТЫ
 # ============================================
+print_section "4. БАЗОВЫЕ УТИЛИТЫ"
 print_info "Установка базовых утилит..."
 apt-get install -y \
     nano git curl wget unzip jq htop tmux net-tools dnsutils \
@@ -96,6 +116,7 @@ print_success "Базовые утилиты установлены"
 # ============================================
 # 5. СИМЛИНКИ
 # ============================================
+print_section "5. СИМЛИНКИ"
 print_info "Создание симлинков для bat и fd..."
 ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
 ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
@@ -104,6 +125,7 @@ print_success "Симлинки созданы"
 # ============================================
 # 6. SUDOERS (NOPASSWD)
 # ============================================
+print_section "6. SUDOERS"
 print_info "Настройка sudoers для команд без пароля..."
 SUDOERS_LINE="$CURRENT_USER ALL=(ALL) NOPASSWD: /usr/sbin/ufw, /usr/bin/journalctl"
 if grep -q "$SUDOERS_LINE" /etc/sudoers 2>/dev/null; then
@@ -116,6 +138,7 @@ fi
 # ============================================
 # 7. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ С ПАРОЛЕМ
 # ============================================
+print_section "7. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ"
 print_info "Проверка пользователя $NEW_USER..."
 
 SET_PASSWORD=false
@@ -142,9 +165,7 @@ else
     ask_input "Создать пользователя $NEW_USER и добавить в группу sudo? [Y/n]: " CREATE_USER
     
     if [[ "$CREATE_USER" =~ ^[Yy]$ ]] || [[ -z "$CREATE_USER" ]]; then
-        # Создаём пользователя без пароля (зададим ниже)
         adduser --disabled-password --gecos "" "$NEW_USER"
-        # Добавляем в группу sudo
         usermod -aG sudo "$NEW_USER"
         print_success "Пользователь $NEW_USER создан и добавлен в группу sudo"
         SET_PASSWORD=true
@@ -176,6 +197,7 @@ fi
 # ============================================
 # 8. ДОБАВЛЕНИЕ SSH-КЛЮЧА ДЛЯ ПОЛЬЗОВАТЕЛЯ
 # ============================================
+print_section "8. SSH-КЛЮЧ ДЛЯ ПОЛЬЗОВАТЕЛЯ"
 print_info "Проверка SSH-ключа для пользователя $NEW_USER..."
 
 if [ ! -d "/home/$NEW_USER" ]; then
@@ -185,7 +207,6 @@ else
     PIN_AUTH_KEYS="$PIN_SSH_DIR/authorized_keys"
     SKIP_KEY=false
     
-    # Проверяем, есть ли уже ключи
     if [ -f "$PIN_AUTH_KEYS" ] && [ -s "$PIN_AUTH_KEYS" ]; then
         KEY_COUNT=$(wc -l < "$PIN_AUTH_KEYS")
         print_info "SSH-ключ для $NEW_USER уже настроен ($KEY_COUNT шт.)"
@@ -267,15 +288,14 @@ fi
 # ============================================
 # 9. НАСТРОЙКА UFW ФАЕРВОЛА
 # ============================================
+print_section "9. НАСТРОЙКА UFW"
 print_info "Проверка файрвола UFW..."
 
-# Устанавливаем UFW, если его нет
 if ! command -v ufw &>/dev/null; then
     print_info "UFW не установлен. Устанавливаем..."
     apt-get install -y ufw
 fi
 
-# Проверяем, активен ли UFW
 if ufw status | grep -q "Status: active"; then
     print_info "UFW уже активен — пропускаем настройку"
     ufw status verbose
@@ -304,7 +324,6 @@ else
         ask_input "Активировать UFW сейчас? [Y/n]: " ENABLE_UFW
         
         if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]] || [[ -z "$ENABLE_UFW" ]]; then
-            # --force чтобы не было интерактивного вопроса про SSH
             ufw --force enable
             print_success "UFW активирован"
             echo ""
@@ -321,7 +340,9 @@ fi
 # ============================================
 # 10. НАСТРОЙКА SSH (БЕЗОПАСНОСТЬ)
 # ============================================
+print_section "10. НАСТРОЙКА SSH"
 print_info "Проверка настроек SSH..."
+print_info "Версия Ubuntu: $UBUNTU_VERSION ($UBUNTU_CODENAME)"
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_FILE="/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
@@ -346,7 +367,7 @@ else
     print_error "❗ После применения вы НЕ СМОЖЕТЕ зайти под root по SSH!"
     echo ""
     
-    # Дополнительная проверка: есть ли ключ у pin перед отключением root
+    # Проверка наличия ключа у pin
     if [ -f "/home/$NEW_USER/.ssh/authorized_keys" ] && [ -s "/home/$NEW_USER/.ssh/authorized_keys" ]; then
         print_success "SSH-ключ для $NEW_USER обнаружен. Можно безопасно отключать root-вход."
     else
@@ -363,9 +384,9 @@ else
         print_info "Резервная копия создана: $BACKUP_FILE"
         
         # Применяем настройки через sed
-        print_info "Применяем настройки SSH..."
+        print_info "Применяем настройки SSH в sshd_config..."
         
-        # Порт (раскомментируем и меняем, либо добавляем если нет)
+        # Порт (в sshd_config - для совместимости)
         if grep -qE "^#?Port " "$SSHD_CONFIG"; then
             sed -i "s/^#\?Port .*/Port $SSH_PORT/" "$SSHD_CONFIG"
         else
@@ -393,12 +414,71 @@ else
             echo "PubkeyAuthentication yes" >> "$SSHD_CONFIG"
         fi
         
+        # ============================================
+        # 10.1. НАСТРОЙКА ПОРТА ЧЕРЕЗ SYSTEMD SOCKET (Ubuntu 24.04+)
+        # ============================================
+        # В Ubuntu 24.04+ используется systemd socket activation,
+        # и порт определяется в ssh.socket, а не в sshd_config
+        print_info "Проверка systemd socket activation..."
+        
+        if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+            print_info "Обнаружен systemd socket activation (Ubuntu 24.04+)"
+            
+            SSH_SOCKET_OVERRIDE="/etc/systemd/system/ssh.socket.d/override.conf"
+            
+            if [ -f "$SSH_SOCKET_OVERRIDE" ] && grep -q "ListenStream=$SSH_PORT" "$SSH_SOCKET_OVERRIDE"; then
+                print_info "Порт $SSH_PORT уже настроен в ssh.socket"
+            else
+                print_info "Настраиваем порт $SSH_PORT в ssh.socket..."
+                
+                # Создаём директорию для override
+                mkdir -p /etc/systemd/system/ssh.socket.d
+                
+                # Создаём override файл
+                # Первая пустая ListenStream= сбрасывает дефолтный порт 22
+                cat > "$SSH_SOCKET_OVERRIDE" << SOCKET_EOF
+[Socket]
+ListenStream=
+ListenStream=$SSH_PORT
+SOCKET_EOF
+                
+                print_success "Создан override: $SSH_SOCKET_OVERRIDE"
+                
+                # Перезагружаем systemd
+                systemctl daemon-reload
+                print_info "systemd daemon перезагружен"
+                
+                # Перезапускаем socket
+                systemctl restart ssh.socket
+                print_success "ssh.socket перезапущен"
+                
+                # Ждём и проверяем результат
+                sleep 2
+                if ss -tuln | grep -q ":$SSH_PORT "; then
+                    print_success "SSH слушает порт $SSH_PORT"
+                else
+                    print_error "SSH НЕ слушает порт $SSH_PORT! Проверьте вручную: ss -tulnp | grep ssh"
+                fi
+            fi
+        else
+            print_info "Socket activation не используется, порт берётся из sshd_config"
+        fi
+        
         # Проверяем синтаксис конфига ПЕРЕД перезапуском
         print_info "Проверка синтаксиса sshd_config..."
         if sshd -t; then
             print_success "Синтаксис корректен. Перезапускаем SSH..."
             systemctl restart ssh
             print_success "SSH перезапущен с новыми настройками"
+            
+            # Финальная проверка порта
+            sleep 2
+            if ss -tuln | grep -q ":$SSH_PORT "; then
+                print_success "ИТОГОВАЯ ПРОВЕРКА: SSH слушает порт $SSH_PORT ✓"
+            else
+                print_error "ИТОГОВАЯ ПРОВЕРКА: SSH НЕ слушает порт $SSH_PORT!"
+                print_error "Проверьте: sudo ss -tulnp | grep ssh"
+            fi
         else
             print_error "ОШИБКА СИНТАКСИСА! Откатываем изменения..."
             cp "$BACKUP_FILE" "$SSHD_CONFIG"
@@ -411,8 +491,111 @@ else
 fi
 
 # ============================================
-# 11. ZSH
+# 11. УСТАНОВКА И НАСТРОЙКА FAIL2BAN
 # ============================================
+print_section "11. FAIL2BAN (защита от brute-force)"
+print_info "Проверка fail2ban..."
+
+if ! command -v fail2ban-client &>/dev/null; then
+    print_info "fail2ban не установлен. Устанавливаем..."
+    apt-get install -y fail2ban
+    print_success "fail2ban установлен"
+else
+    print_info "fail2ban уже установлен"
+fi
+
+FAIL2BAN_JAIL="/etc/fail2ban/jail.local"
+
+# Проверяем, настроен ли уже jail.local
+if [ -f "$FAIL2BAN_JAIL" ] && grep -q "port = $SSH_PORT" "$FAIL2BAN_JAIL"; then
+    print_info "fail2ban уже настроен для порта $SSH_PORT"
+    ask_input "Перенастроить fail2ban? [y/N]: " RECONFIGURE_F2B
+    if [[ ! "$RECONFIGURE_F2B" =~ ^[Yy]$ ]]; then
+        print_info "Пропускаем настройку fail2ban"
+        SKIP_F2B=true
+    fi
+else
+    SKIP_F2B=false
+fi
+
+if [ "$SKIP_F2B" != "true" ]; then
+    print_info "Создание конфигурации fail2ban..."
+    
+    # Создаём резервную копию, если файл существует
+    if [ -f "$FAIL2BAN_JAIL" ]; then
+        cp "$FAIL2BAN_JAIL" "$FAIL2BAN_JAIL.backup.$(date +%Y%m%d_%H%M%S)"
+        print_info "Резервная копия старого jail.local создана"
+    fi
+    
+    # Создаём конфигурацию jail.local
+    cat > "$FAIL2BAN_JAIL" << F2B_EOF
+# ============================================
+# Fail2ban конфигурация для защиты от brute-force
+# Создано автоматически скриптом tunevps.sh
+# ============================================
+
+[DEFAULT]
+# Игнорировать локальные IP (никогда не блокировать себя)
+# Добавьте свой статический IP, если он есть:
+# ignoreip = 127.0.0.1/8 ::1 YOUR_STATIC_IP/32
+ignoreip = 127.0.0.1/8 ::1
+
+# Время блокировки (в секундах): 3600 = 1 час
+bantime = 3600
+
+# Временное окно для подсчёта попыток (в секундах): 600 = 10 минут
+findtime = 600
+
+# Максимум попыток перед блокировкой
+maxretry = 3
+
+# Увеличивать время блокировки при повторных атаках
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = 86400
+
+# ============================================
+# Защита SSH
+# ============================================
+[sshd]
+enabled = true
+port = $SSH_PORT
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 3600
+findtime = 600
+
+# Агрессивный режим для повторных нарушителей
+mode = aggressive
+F2B_EOF
+    
+    print_success "Конфигурация fail2ban создана: $FAIL2BAN_JAIL"
+    
+    # Включаем и запускаем fail2ban
+    print_info "Активация fail2ban..."
+    systemctl enable fail2ban
+    systemctl restart fail2ban
+    
+    # Ждём запуска и проверяем статус
+    sleep 3
+    if systemctl is-active --quiet fail2ban; then
+        print_success "fail2ban запущен и активен"
+        echo ""
+        print_info "Статус fail2ban:"
+        fail2ban-client status
+        echo ""
+        print_info "Статус jail sshd:"
+        fail2ban-client status sshd || true
+    else
+        print_error "fail2ban не запустился! Проверьте: sudo journalctl -u fail2ban -n 30"
+    fi
+fi
+
+# ============================================
+# 12. ZSH
+# ============================================
+print_section "12. ZSH"
 print_info "Проверка Zsh..."
 CURRENT_SHELL=$(getent passwd "$CURRENT_USER" | cut -d: -f7)
 if [[ "$CURRENT_SHELL" == *"zsh"* ]]; then
@@ -424,8 +607,9 @@ else
 fi
 
 # ============================================
-# 12. OH MY ZSH
+# 13. OH MY ZSH
 # ============================================
+print_section "13. OH MY ZSH"
 print_info "Проверка Oh My Zsh..."
 if [ ! -d "$USER_HOME/.oh-my-zsh" ]; then
     print_info "Установка Oh My Zsh..."
@@ -442,8 +626,9 @@ else
 fi
 
 # ============================================
-# 13. POWERLEVEL10K
+# 14. POWERLEVEL10K
 # ============================================
+print_section "14. POWERLEVEL10K"
 print_info "Проверка Powerlevel10k..."
 ZSH_CUSTOM_DIR="$USER_HOME/.oh-my-zsh/custom"
 if [ ! -d "$ZSH_CUSTOM_DIR/themes/powerlevel10k" ]; then
@@ -459,8 +644,9 @@ else
 fi
 
 # ============================================
-# 14. ПЛАГИНЫ OMZ
+# 15. ПЛАГИНЫ OMZ
 # ============================================
+print_section "15. ПЛАГИНЫ OMZ"
 print_info "Проверка плагинов Oh My Zsh..."
 clone_plugin() {
     local name=$1
@@ -483,8 +669,9 @@ clone_plugin "zsh-completions" "https://github.com/zsh-users/zsh-completions"
 print_success "Плагины проверены"
 
 # ============================================
-# 15. .zshrc
+# 16. .zshrc
 # ============================================
+print_section "16. КОНФИГУРАЦИЯ .zshrc"
 print_info "Создание конфигурации .zshrc..."
 cat > "$USER_HOME/.zshrc" << 'EOF'
 # Enable Powerlevel10k instant prompt
@@ -533,6 +720,10 @@ alias ufwv="sudo ufw status verbose"
 alias ufwn="sudo ufw status numbered"
 alias ufwl="sudo journalctl -u ufw -n 50 --no-pager"
 
+# === Fail2ban ===
+alias f2bs="sudo fail2ban-client status"
+alias f2bssh="sudo fail2ban-client status sshd"
+
 # === FZF (универсальный способ для всех Ubuntu 22/24/26) ===
 source <(fzf --zsh)
 
@@ -545,11 +736,46 @@ EOF
 print_success "Файл .zshrc создан"
 
 # ============================================
-# 16. ПРАВА ДОСТУПА
+# 17. ПРАВА ДОСТУПА
 # ============================================
+print_section "17. ПРАВА ДОСТУПА"
 if [ "$CURRENT_USER" != "root" ]; then
     chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.oh-my-zsh"
     chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc"
+fi
+print_success "Права доступа настроены"
+
+# ============================================
+# 18. ФИНАЛЬНАЯ ПРОВЕРКА
+# ============================================
+print_section "18. ФИНАЛЬНАЯ ПРОВЕРКА"
+
+print_info "Проверка SSH порта..."
+if ss -tuln | grep -q ":$SSH_PORT "; then
+    print_success "SSH слушает порт $SSH_PORT ✓"
+else
+    print_error "SSH НЕ слушает порт $SSH_PORT! ⚠️"
+fi
+
+print_info "Проверка статуса SSH..."
+if systemctl is-active --quiet ssh; then
+    print_success "SSH сервис активен ✓"
+else
+    print_error "SSH сервис НЕ активен! ⚠️"
+fi
+
+print_info "Проверка fail2ban..."
+if systemctl is-active --quiet fail2ban; then
+    print_success "fail2ban активен ✓"
+else
+    print_warning "fail2ban НЕ активен"
+fi
+
+print_info "Проверка UFW..."
+if ufw status | grep -q "Status: active"; then
+    print_success "UFW активен ✓"
+else
+    print_warning "UFW НЕ активен"
 fi
 
 # ============================================
@@ -569,8 +795,15 @@ echo "  3. При первом входе запустите настройку 
 echo "  4. Установите шрифт MesloLGS NF на ваш локальный компьютер:"
 echo "     https://github.com/romkatv/powerlevel10k#fonts"
 echo ""
+echo "Полезные алиасы для управления безопасностью:"
+echo "  f2bs    - статус fail2ban"
+echo "  f2bssh  - статус jail sshd (заблокированные IP)"
+echo "  ufwv    - статус файрвола"
+echo "  ufwn    - правила файрвола с номерами"
+echo ""
 if [[ -f "$BACKUP_FILE" ]] 2>/dev/null; then
     print_warning "Резервная копия sshd_config: $BACKUP_FILE"
 fi
 print_warning "Вход под root по SSH теперь ЗАПРЕЩЁН!"
+print_warning "fail2ban автоматически блокирует атакующих после 3 неудачных попыток"
 echo ""

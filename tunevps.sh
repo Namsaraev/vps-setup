@@ -71,7 +71,7 @@ print_success "Русская локаль установлена"
 # ============================================
 print_info "Установка базовых утилит..."
 apt-get install -y \
-    git curl wget unzip jq htop tmux net-tools dnsutils \
+    nano vim git curl wget unzip jq htop tmux net-tools dnsutils \
     bat eza fd-find ripgrep zoxide fzf \
     python3 python3-pip python3-venv build-essential \
     btop mtr iperf3 zsh

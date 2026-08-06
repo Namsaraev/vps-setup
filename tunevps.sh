@@ -505,17 +505,20 @@ HARDENING_EOF
             
             SSH_SOCKET_OVERRIDE="/etc/systemd/system/ssh.socket.d/override.conf"
             
-            if [ -f "$SSH_SOCKET_OVERRIDE" ] && grep -q "ListenStream=$SSH_PORT" "$SSH_SOCKET_OVERRIDE"; then
-                print_info "Порт $SSH_PORT уже настроен в ssh.socket"
+            if [ -f "$SSH_SOCKET_OVERRIDE" ] && grep -q "ListenStream=0.0.0.0:$SSH_PORT" "$SSH_SOCKET_OVERRIDE"; then
+                print_info "Порт $SSH_PORT уже настроен в ssh.socket (IPv4 + IPv6)"
             else
-                print_info "Настраиваем порт $SSH_PORT в ssh.socket..."
+                print_info "Настраиваем порт $SSH_PORT в ssh.socket (IPv4 + IPv6)..."
                 
                 mkdir -p /etc/systemd/system/ssh.socket.d
                 
+                # ВАЖНО: Указываем оба адреса - IPv4 и IPv6
+                # Без явного указания systemd может создать только IPv6 сокет
                 cat > "$SSH_SOCKET_OVERRIDE" << SOCKET_EOF
 [Socket]
 ListenStream=
-ListenStream=$SSH_PORT
+ListenStream=0.0.0.0:$SSH_PORT
+ListenStream=[::]:$SSH_PORT
 SOCKET_EOF
                 
                 print_success "Создан override: $SSH_SOCKET_OVERRIDE"
@@ -527,10 +530,19 @@ SOCKET_EOF
                 print_success "ssh.socket перезапущен"
                 
                 sleep 2
-                if ss -tuln | grep -q ":$SSH_PORT "; then
-                    print_success "SSH слушает порт $SSH_PORT"
+                
+                # Проверяем IPv4
+                if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
+                    print_success "SSH слушает порт $SSH_PORT на IPv4 ✓"
                 else
-                    print_error "SSH НЕ слушает порт $SSH_PORT! Проверьте: ss -tulnp | grep ssh"
+                    print_error "SSH НЕ слушает порт $SSH_PORT на IPv4!"
+                fi
+                
+                # Проверяем IPv6
+                if ss -tuln | grep -q "\[::\]:$SSH_PORT "; then
+                    print_success "SSH слушает порт $SSH_PORT на IPv6 ✓"
+                else
+                    print_warning "SSH НЕ слушает порт $SSH_PORT на IPv6"
                 fi
             fi
         else
@@ -547,8 +559,27 @@ SOCKET_EOF
             print_success "SSH перезапущен с новыми настройками"
             
             sleep 2
-            if ss -tuln | grep -q ":$SSH_PORT "; then
-                print_success "ИТОГОВАЯ ПРОВЕРКА: SSH слушает порт $SSH_PORT ✓"
+            
+            # Финальная проверка IPv4 и IPv6
+            IPV4_OK=false
+            IPV6_OK=false
+            
+            if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
+                IPV4_OK=true
+            fi
+            
+            if ss -tuln | grep -q "\[::\]:$SSH_PORT "; then
+                IPV6_OK=true
+            fi
+            
+            if [ "$IPV4_OK" = true ] && [ "$IPV6_OK" = true ]; then
+                print_success "ИТОГОВАЯ ПРОВЕРКА: SSH слушает порт $SSH_PORT на IPv4 и IPv6 ✓"
+            elif [ "$IPV4_OK" = true ]; then
+                print_success "ИТОГОВАЯ ПРОВЕРКА: SSH слушает порт $SSH_PORT на IPv4 ✓"
+                print_warning "IPv6 не настроен (не критично)"
+            elif [ "$IPV6_OK" = true ]; then
+                print_error "ИТОГОВАЯ ПРОВЕРКА: SSH слушает ТОЛЬКО IPv6!"
+                print_error "Вход по IPv4 будет невозможен! Проверьте override.conf"
             else
                 print_error "ИТОГОВАЯ ПРОВЕРКА: SSH НЕ слушает порт $SSH_PORT!"
                 print_error "Проверьте: sudo ss -tulnp | grep ssh"
@@ -842,11 +873,18 @@ print_success "Права доступа настроены"
 # ============================================
 print_section "18. ФИНАЛЬНАЯ ПРОВЕРКА"
 
-print_info "Проверка SSH порта..."
-if ss -tuln | grep -q ":$SSH_PORT "; then
-    print_success "SSH слушает порт $SSH_PORT ✓"
+print_info "Проверка SSH порта (IPv4)..."
+if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
+    print_success "SSH слушает порт $SSH_PORT на IPv4 ✓"
 else
-    print_error "SSH НЕ слушает порт $SSH_PORT! ⚠️"
+    print_error "SSH НЕ слушает порт $SSH_PORT на IPv4! ⚠️"
+fi
+
+print_info "Проверка SSH порта (IPv6)..."
+if ss -tuln | grep -q "\[::\]:$SSH_PORT "; then
+    print_success "SSH слушает порт $SSH_PORT на IPv6 ✓"
+else
+    print_warning "SSH НЕ слушает порт $SSH_PORT на IPv6"
 fi
 
 print_info "Проверка статуса SSH..."

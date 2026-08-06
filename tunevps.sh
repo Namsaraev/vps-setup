@@ -89,7 +89,7 @@ print_success "Система обновлена"
 print_section "2. ЧАСОВОЙ ПОЯС"
 print_info "Настройка часового пояса: Asia/Irkutsk"
 timedatectl set-timezone Asia/Irkutsk
-print_success "Часовой пояс установлен: $(timedatectl | grep 'Time zone')"
+print_success "Часовой пояс установлен: $(LC_ALL=C timedatectl | grep 'Time zone')"
 
 # ============================================
 # 3. ЛОКАЛЬ
@@ -295,9 +295,10 @@ if ! command -v ufw &>/dev/null; then
     apt-get install -y ufw
 fi
 
-if ufw status | grep -q "Status: active"; then
+# ВАЖНО: используем LC_ALL=C для английского вывода независимо от локали
+if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
     print_info "UFW уже активен — пропускаем настройку"
-    ufw status verbose
+    LC_ALL=C ufw status verbose
 else
     print_warning "UFW не активен или не настроен"
     ask_input "Настроить UFW с базовыми правилами? [Y/n]: " SETUP_UFW
@@ -316,7 +317,7 @@ else
         ufw allow 5201/udp comment 'iperf3'
         
         print_info "Текущие правила UFW:"
-        ufw status verbose 2>/dev/null || true
+        LC_ALL=C ufw status verbose 2>/dev/null || true
         
         echo ""
         print_warning "ВНИМАНИЕ: UFW будет активирован. Убедитесь, что ваш SSH порт ($SSH_PORT) открыт!"
@@ -327,7 +328,7 @@ else
             print_success "UFW активирован"
             echo ""
             print_info "Финальный статус UFW:"
-            ufw status verbose
+            LC_ALL=C ufw status verbose
         else
             print_warning "UFW настроен, но не активирован. Активируйте позже: sudo ufw enable"
         fi
@@ -912,13 +913,16 @@ else
 fi
 
 print_info "Проверка статуса ssh.socket (должен быть замаскирован)..."
-SOCKET_STATE=$(systemctl is-enabled ssh.socket 2>/dev/null || echo "unknown")
+# || true чтобы не падало с ошибкой при ненулевом exit code
+SOCKET_STATE=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
 if [[ "$SOCKET_STATE" == "masked" ]]; then
-    print_success "ssh.socket замаскирован ✓"
+    print_success "ssh.socket замаскирован ✓ (socket activation полностью отключён)"
 elif [[ "$SOCKET_STATE" == "disabled" ]]; then
     print_warning "ssh.socket отключён, но не замаскирован"
+elif [[ "$SOCKET_STATE" == "enabled" || "$SOCKET_STATE" == "static" ]]; then
+    print_error "ssh.socket ВКЛЮЧЁН! Это может вызывать проблемы с портом SSH"
 else
-    print_warning "ssh.socket в состоянии: $SOCKET_STATE"
+    print_info "ssh.socket в состоянии: ${SOCKET_STATE:-неизвестно}"
 fi
 
 print_info "Проверка настроек SSH..."
@@ -937,10 +941,12 @@ else
 fi
 
 print_info "Проверка UFW..."
-if ufw status | grep -q "Status: active"; then
+# ВАЖНО: используем LC_ALL=C для английского вывода независимо от локали
+if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
     print_success "UFW активен ✓"
 else
     print_warning "UFW НЕ активен"
+    print_info "Для активации выполните: sudo ufw --force enable"
 fi
 
 # ============================================

@@ -2,6 +2,9 @@
 
 set -e
 
+# Отключаем интерактивные запросы debconf (КРИТИЧЕСКИ ВАЖНО для автоматизации)
+export DEBIAN_FRONTEND=noninteractive
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -32,9 +35,9 @@ echo ""
 
 # 1. ОБНОВЛЕНИЕ СИСТЕМЫ
 print_info "Обновление системы..."
-apt update -y
-apt upgrade -y
-apt autoremove -y
+apt-get update -y
+apt-get upgrade -y
+apt-get autoremove -y
 print_success "Система обновлена"
 
 # 2. ЧАСОВОЙ ПОЯС
@@ -44,14 +47,14 @@ print_success "Часовой пояс установлен: $(timedatectl | gre
 
 # 3. ЛОКАЛЬ
 print_info "Настройка русской локали..."
-apt install language-pack-ru -y
+apt-get install -y language-pack-ru
 locale-gen ru_RU.UTF-8
 update-locale LANG=ru_RU.UTF-8
 print_success "Русская локаль установлена"
 
 # 4. БАЗОВЫЕ УТИЛИТЫ
 print_info "Установка базовых утилит..."
-apt install -y \
+apt-get install -y \
     git curl wget unzip jq htop tmux net-tools dnsutils \
     bat eza fd-find ripgrep zoxide fzf \
     python3 python3-pip python3-venv build-essential \

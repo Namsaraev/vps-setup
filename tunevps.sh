@@ -365,7 +365,6 @@ else
     echo "    - PasswordAuthentication no (ВХОД ТОЛЬКО ПО КЛЮЧУ!)"
     echo "    - PermitEmptyPasswords no (запрет пустых паролей)"
     echo "    - PubkeyAuthentication yes (аутентификация по ключам)"
-    echo "    - ChallengeResponseAuthentication no"
     echo "    - KbdInteractiveAuthentication no"
     echo "    - MaxAuthTries 3 (лимит попыток входа)"
     echo "    - LogLevel VERBOSE (подробные логи для fail2ban)"
@@ -427,7 +426,6 @@ else
 # Hardening settings (создано скриптом tunevps.sh)
 # Минимальный набор для безопасности, не мешающий работе
 PasswordAuthentication no
-ChallengeResponseAuthentication no
 KbdInteractiveAuthentication no
 HARDENING_EOF
             print_success "Override файл создан"
@@ -463,8 +461,18 @@ HARDENING_EOF
         fi
         
         # Отключение лишних методов аутентификации
-        set_ssh_param "ChallengeResponseAuthentication" "no"
+        # KbdInteractiveAuthentication — современный параметр (OpenSSH 8.4+)
         set_ssh_param "KbdInteractiveAuthentication" "no"
+        
+        # ChallengeResponseAuthentication — устаревший в OpenSSH 9+
+        # Добавляем только для старых версий
+        SSH_MAJOR_VERSION=$(sshd -V 2>&1 | head -1 | grep -oP 'OpenSSH_\K[0-9]+' || echo "9")
+        if [ "$SSH_MAJOR_VERSION" -lt 9 ]; then
+            print_info "Обнаружен OpenSSH $SSH_MAJOR_VERSION.x — добавляем ChallengeResponseAuthentication"
+            set_ssh_param "ChallengeResponseAuthentication" "no"
+        else
+            print_info "Обнаружен OpenSSH $SSH_MAJOR_VERSION.x — ChallengeResponseAuthentication устарел, пропускаем"
+        fi
         
         # Защита от brute-force
         set_ssh_param "MaxAuthTries" "3"
@@ -591,13 +599,32 @@ if [ "$SKIP_F2B" != "true" ]; then
         print_info "Резервная копия старого jail.local создана"
     fi
     
+    # ============================================
+    # АВТООПРЕДЕЛЕНИЕ BACKEND ДЛЯ ЛОГОВ
+    # ============================================
+    # Проверяем, существует ли /var/log/auth.log
+    # Если нет — используем systemd journal (актуально для новых Ubuntu)
+    if [ -f "/var/log/auth.log" ] && [ -s "/var/log/auth.log" ]; then
+        F2B_BACKEND="auto"
+        F2B_LOGPATH="logpath = /var/log/auth.log"
+        print_info "Используем файл логов: /var/log/auth.log"
+    else
+        F2B_BACKEND="systemd"
+        F2B_LOGPATH="# logpath не нужен, используется systemd journal"
+        print_info "Файл auth.log отсутствует. Используем systemd journal"
+    fi
+    
     cat > "$FAIL2BAN_JAIL" << F2B_EOF
 # ============================================
 # Fail2ban конфигурация для защиты от brute-force
 # Создано автоматически скриптом tunevps.sh
+# Совместимо с Ubuntu 24.04 и 26.04
 # ============================================
 
 [DEFAULT]
+# Backend для чтения логов (auto = fail2ban сам выберет)
+backend = $F2B_BACKEND
+
 # Игнорировать локальные IP (никогда не блокировать себя)
 # Добавьте свой статический IP, если он есть:
 # ignoreip = 127.0.0.1/8 ::1 YOUR_STATIC_IP/32
@@ -624,7 +651,7 @@ bantime.maxtime = 86400
 enabled = true
 port = $SSH_PORT
 filter = sshd
-logpath = /var/log/auth.log
+$F2B_LOGPATH
 maxretry = 3
 bantime = 3600
 findtime = 600

@@ -354,7 +354,13 @@ PASS_AUTH_SET=$(grep -E "^PasswordAuthentication no$" "$SSHD_CONFIG" || true)
 EMPTY_PASS_SET=$(grep -E "^PermitEmptyPasswords no$" "$SSHD_CONFIG" || true)
 PUBKEY_SET=$(grep -E "^PubkeyAuthentication yes$" "$SSHD_CONFIG" || true)
 
-if [[ -n "$SSH_PORT_SET" && -n "$ROOT_LOGIN_SET" && -n "$PASS_AUTH_SET" && -n "$EMPTY_PASS_SET" && -n "$PUBKEY_SET" ]]; then
+# Дополнительно проверяем, что SSH реально слушает нужный порт на IPv4
+SSH_LISTENING_IPV4=false
+if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
+    SSH_LISTENING_IPV4=true
+fi
+
+if [[ -n "$SSH_PORT_SET" && -n "$ROOT_LOGIN_SET" && -n "$PASS_AUTH_SET" && -n "$EMPTY_PASS_SET" && -n "$PUBKEY_SET" && "$SSH_LISTENING_IPV4" = true ]]; then
     print_info "SSH уже настроен правильно — пропускаем"
 else
     print_warning "SSH требует настройки безопасности"
@@ -496,65 +502,76 @@ HARDENING_EOF
         print_success "Настройки SSH применены (минимальный набор)"
         
         # ============================================
-        # 10.3. НАСТРОЙКА ПОРТА ЧЕРЕЗ SYSTEMD SOCKET (Ubuntu 24.04+)
+        # 10.3. НАСТРОЙКА МЕХАНИЗМА ЗАПУСКА SSH
         # ============================================
-        print_info "Проверка systemd socket activation..."
+        # В Ubuntu 24.04+ используется systemd socket activation,
+        # который может конфликтовать с настройками в sshd_config
+        # (особенно с автоматически генерируемым addresses.conf).
+        # Самое надёжное решение - отключить socket activation
+        # и использовать классический сервис SSH.
+        print_info "Настройка механизма запуска SSH..."
         
-        if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
-            print_info "Обнаружен systemd socket activation (Ubuntu 24.04+)"
+        if systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then
+            print_info "Обнаружен systemd socket activation — отключаем его для надёжности"
             
-            SSH_SOCKET_OVERRIDE="/etc/systemd/system/ssh.socket.d/override.conf"
+            # Останавливаем и отключаем socket
+            systemctl stop ssh.socket 2>/dev/null || true
+            systemctl disable ssh.socket 2>/dev/null || true
             
-            if [ -f "$SSH_SOCKET_OVERRIDE" ] && grep -q "ListenStream=0.0.0.0:$SSH_PORT" "$SSH_SOCKET_OVERRIDE"; then
-                print_info "Порт $SSH_PORT уже настроен в ssh.socket (IPv4 + IPv6)"
+            # Маскируем socket, чтобы он не мог быть активирован автоматически
+            # (например, при обновлении системы или перезагрузке)
+            systemctl mask ssh.socket
+            print_success "ssh.socket остановлен, отключён и замаскирован"
+            
+            # Удаляем наш предыдущий override, если он был
+            if [ -f "/etc/systemd/system/ssh.socket.d/override.conf" ]; then
+                rm -f /etc/systemd/system/ssh.socket.d/override.conf
+                print_info "Удалён старый override для ssh.socket"
+            fi
+            
+            # Включаем и запускаем классический сервис SSH
+            systemctl enable ssh.service
+            systemctl restart ssh.service
+            print_success "Классический сервис SSH активирован"
+            
+            # Перезагружаем systemd
+            systemctl daemon-reload
+            
+            sleep 2
+            
+            # Проверяем IPv4
+            if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
+                print_success "SSH слушает порт $SSH_PORT на IPv4 ✓"
             else
-                print_info "Настраиваем порт $SSH_PORT в ssh.socket (IPv4 + IPv6)..."
-                
-                mkdir -p /etc/systemd/system/ssh.socket.d
-                
-                # ВАЖНО: Указываем оба адреса - IPv4 и IPv6
-                # Без явного указания systemd может создать только IPv6 сокет
-                cat > "$SSH_SOCKET_OVERRIDE" << SOCKET_EOF
-[Socket]
-ListenStream=
-ListenStream=0.0.0.0:$SSH_PORT
-ListenStream=[::]:$SSH_PORT
-SOCKET_EOF
-                
-                print_success "Создан override: $SSH_SOCKET_OVERRIDE"
-                
-                systemctl daemon-reload
-                print_info "systemd daemon перезагружен"
-                
-                systemctl restart ssh.socket
-                print_success "ssh.socket перезапущен"
-                
-                sleep 2
-                
-                # Проверяем IPv4
-                if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
-                    print_success "SSH слушает порт $SSH_PORT на IPv4 ✓"
-                else
-                    print_error "SSH НЕ слушает порт $SSH_PORT на IPv4!"
-                fi
-                
-                # Проверяем IPv6
-                if ss -tuln | grep -q "\[::\]:$SSH_PORT "; then
-                    print_success "SSH слушает порт $SSH_PORT на IPv6 ✓"
-                else
-                    print_warning "SSH НЕ слушает порт $SSH_PORT на IPv6"
-                fi
+                print_error "SSH НЕ слушает порт $SSH_PORT на IPv4!"
+            fi
+            
+            # Проверяем IPv6
+            if ss -tuln | grep -q "\[::\]:$SSH_PORT "; then
+                print_success "SSH слушает порт $SSH_PORT на IPv6 ✓"
+            else
+                print_warning "SSH НЕ слушает порт $SSH_PORT на IPv6"
             fi
         else
-            print_info "Socket activation не используется, порт берётся из sshd_config"
+            print_info "Socket activation не используется — порт берётся из sshd_config"
+            
+            # Просто перезапускаем SSH для применения настроек
+            systemctl restart ssh.service
+            sleep 2
+            
+            if ss -tuln | grep -q ":$SSH_PORT "; then
+                print_success "SSH слушает порт $SSH_PORT ✓"
+            else
+                print_error "SSH НЕ слушает порт $SSH_PORT!"
+            fi
         fi
         
         # ============================================
-        # 10.4. ПРОВЕРКА СИНТАКСИСА И ПЕРЕЗАПУСК
+        # 10.4. ПРОВЕРКА СИНТАКСИСА И ФИНАЛЬНЫЙ ПЕРЕЗАПУСК
         # ============================================
         print_info "Проверка синтаксиса sshd_config..."
         if sshd -t; then
-            print_success "Синтаксис корректен. Перезапускаем SSH..."
+            print_success "Синтаксис корректен. Финальный перезапуск SSH..."
             systemctl restart ssh
             print_success "SSH перезапущен с новыми настройками"
             
@@ -579,7 +596,7 @@ SOCKET_EOF
                 print_warning "IPv6 не настроен (не критично)"
             elif [ "$IPV6_OK" = true ]; then
                 print_error "ИТОГОВАЯ ПРОВЕРКА: SSH слушает ТОЛЬКО IPv6!"
-                print_error "Вход по IPv4 будет невозможен! Проверьте override.conf"
+                print_error "Вход по IPv4 будет невозможен! Проверьте настройки"
             else
                 print_error "ИТОГОВАЯ ПРОВЕРКА: SSH НЕ слушает порт $SSH_PORT!"
                 print_error "Проверьте: sudo ss -tulnp | grep ssh"
@@ -892,6 +909,16 @@ if systemctl is-active --quiet ssh; then
     print_success "SSH сервис активен ✓"
 else
     print_error "SSH сервис НЕ активен! ⚠️"
+fi
+
+print_info "Проверка статуса ssh.socket (должен быть замаскирован)..."
+SOCKET_STATE=$(systemctl is-enabled ssh.socket 2>/dev/null || echo "unknown")
+if [[ "$SOCKET_STATE" == "masked" ]]; then
+    print_success "ssh.socket замаскирован ✓"
+elif [[ "$SOCKET_STATE" == "disabled" ]]; then
+    print_warning "ssh.socket отключён, но не замаскирован"
+else
+    print_warning "ssh.socket в состоянии: $SOCKET_STATE"
 fi
 
 print_info "Проверка настроек SSH..."

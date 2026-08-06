@@ -146,7 +146,6 @@ SET_PASSWORD=false
 if id -u "$NEW_USER" &>/dev/null; then
     print_info "Пользователь $NEW_USER уже существует"
     
-    # Проверяем, задан ли пароль
     PASS_STATUS=$(passwd -S "$NEW_USER" | awk '{print $2}')
     if [[ "$PASS_STATUS" == "P" ]]; then
         print_info "Пароль для $NEW_USER уже задан"
@@ -338,41 +337,61 @@ else
 fi
 
 # ============================================
-# 10. НАСТРОЙКА SSH (БЕЗОПАСНОСТЬ)
+# 10. НАСТРОЙКА SSH (МИНИМАЛЬНАЯ БЕЗОПАСНОСТЬ)
 # ============================================
 print_section "10. НАСТРОЙКА SSH"
 print_info "Проверка настроек SSH..."
 print_info "Версия Ubuntu: $UBUNTU_VERSION ($UBUNTU_CODENAME)"
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 BACKUP_FILE="/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
 
 # Проверяем, применены ли уже все нужные настройки
 SSH_PORT_SET=$(grep -E "^Port $SSH_PORT$" "$SSHD_CONFIG" || true)
 ROOT_LOGIN_SET=$(grep -E "^PermitRootLogin no$" "$SSHD_CONFIG" || true)
+PASS_AUTH_SET=$(grep -E "^PasswordAuthentication no$" "$SSHD_CONFIG" || true)
 EMPTY_PASS_SET=$(grep -E "^PermitEmptyPasswords no$" "$SSHD_CONFIG" || true)
 PUBKEY_SET=$(grep -E "^PubkeyAuthentication yes$" "$SSHD_CONFIG" || true)
 
-if [[ -n "$SSH_PORT_SET" && -n "$ROOT_LOGIN_SET" && -n "$EMPTY_PASS_SET" && -n "$PUBKEY_SET" ]]; then
+if [[ -n "$SSH_PORT_SET" && -n "$ROOT_LOGIN_SET" && -n "$PASS_AUTH_SET" && -n "$EMPTY_PASS_SET" && -n "$PUBKEY_SET" ]]; then
     print_info "SSH уже настроен правильно — пропускаем"
 else
     print_warning "SSH требует настройки безопасности"
     echo ""
-    print_warning "⚠️  БУДУТ ПРИМЕНЕНЫ СЛЕДУЮЩИЕ ИЗМЕНЕНИЯ:"
+    print_warning "⚠️  БУДУТ ПРИМЕНЕНЫ СЛЕДУЮЩИЕ ИЗМЕНЕНИЯ (минимальный набор):"
     echo "    - Port $SSH_PORT (смена стандартного порта 22)"
     echo "    - PermitRootLogin no (запрет входа под root)"
+    echo "    - PasswordAuthentication no (ВХОД ТОЛЬКО ПО КЛЮЧУ!)"
     echo "    - PermitEmptyPasswords no (запрет пустых паролей)"
-    echo "    - PubkeyAuthentication yes (вход по ключам)"
+    echo "    - PubkeyAuthentication yes (аутентификация по ключам)"
+    echo "    - ChallengeResponseAuthentication no"
+    echo "    - KbdInteractiveAuthentication no"
+    echo "    - MaxAuthTries 3 (лимит попыток входа)"
+    echo "    - LogLevel VERBOSE (подробные логи для fail2ban)"
+    echo "    - PermitUserEnvironment no (безопасность)"
+    echo ""
+    print_info "SSH-туннели остаются разрешёнными (AllowTcpForwarding yes)"
+    print_info "Сессии НЕ будут разрываться по таймауту"
     echo ""
     print_error "❗ После применения вы НЕ СМОЖЕТЕ зайти под root по SSH!"
+    print_error "❗ Вход будет возможен ТОЛЬКО по SSH-ключу для пользователя $NEW_USER"
     echo ""
     
     # Проверка наличия ключа у pin
+    KEEP_PASSWORD_AUTH=false
     if [ -f "/home/$NEW_USER/.ssh/authorized_keys" ] && [ -s "/home/$NEW_USER/.ssh/authorized_keys" ]; then
-        print_success "SSH-ключ для $NEW_USER обнаружен. Можно безопасно отключать root-вход."
+        KEY_COUNT=$(wc -l < "/home/$NEW_USER/.ssh/authorized_keys")
+        print_success "SSH-ключ для $NEW_USER обнаружен ($KEY_COUNT шт.). Можно безопасно отключать пароли."
     else
-        print_error "⚠️  У пользователя $NEW_USER НЕТ SSH-ключа!"
-        print_error "После отключения root-входа вы сможете зайти только по паролю пользователя $NEW_USER"
+        print_error "⚠️⚠️⚠️  У пользователя $NEW_USER НЕТ SSH-ключа!"
+        print_error "Если отключить PasswordAuthentication, вы ПОЛНОСТЬЮ ПОТЕРЯЕТЕ доступ!"
+        echo ""
+        ask_input "Всё равно отключить вход по паролю? (НЕ РЕКОМЕНДУЕТСЯ) [y/N]: " FORCE_NO_PASS
+        if [[ ! "$FORCE_NO_PASS" =~ ^[Yy]$ ]]; then
+            print_warning "PasswordAuthentication останется включённым. Добавьте ключ и запустите скрипт снова."
+            KEEP_PASSWORD_AUTH=true
+        fi
     fi
     
     echo ""
@@ -383,42 +402,94 @@ else
         cp "$SSHD_CONFIG" "$BACKUP_FILE"
         print_info "Резервная копия создана: $BACKUP_FILE"
         
-        # Применяем настройки через sed
+        # ============================================
+        # 10.1. ОБРАБОТКА ФАЙЛОВ В sshd_config.d
+        # ============================================
+        # В Ubuntu 24.04+ cloud-init может создавать файлы, переопределяющие настройки
+        if [ -d "$SSHD_CONFIG_DIR" ]; then
+            print_info "Проверка файлов в $SSHD_CONFIG_DIR..."
+            
+            for conf_file in "$SSHD_CONFIG_DIR"/*.conf; do
+                if [ -f "$conf_file" ]; then
+                    if grep -qE "^PasswordAuthentication yes" "$conf_file" 2>/dev/null; then
+                        print_warning "Найден файл с PasswordAuthentication yes: $conf_file"
+                        cp "$conf_file" "$conf_file.backup.$(date +%Y%m%d_%H%M%S)"
+                        sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' "$conf_file"
+                        print_success "Исправлено: $conf_file"
+                    fi
+                fi
+            done
+            
+            # Создаём наш override файл с приоритетом
+            CUSTOM_SSH_CONF="$SSHD_CONFIG_DIR/99-hardening.conf"
+            print_info "Создание override файла: $CUSTOM_SSH_CONF"
+            cat > "$CUSTOM_SSH_CONF" << HARDENING_EOF
+# Hardening settings (создано скриптом tunevps.sh)
+# Минимальный набор для безопасности, не мешающий работе
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+HARDENING_EOF
+            print_success "Override файл создан"
+        fi
+        
+        # ============================================
+        # 10.2. ПРИМЕНЕНИЕ НАСТРОЕК В sshd_config
+        # ============================================
         print_info "Применяем настройки SSH в sshd_config..."
         
-        # Порт (в sshd_config - для совместимости)
-        if grep -qE "^#?Port " "$SSHD_CONFIG"; then
-            sed -i "s/^#\?Port .*/Port $SSH_PORT/" "$SSHD_CONFIG"
-        else
-            echo "Port $SSH_PORT" >> "$SSHD_CONFIG"
+        # Функция для безопасной установки параметра
+        set_ssh_param() {
+            local param="$1"
+            local value="$2"
+            if grep -qE "^#?$param " "$SSHD_CONFIG"; then
+                sed -i "s/^#\?$param .*/$param $value/" "$SSHD_CONFIG"
+            else
+                echo "$param $value" >> "$SSHD_CONFIG"
+            fi
+        }
+        
+        # === МИНИМАЛЬНЫЙ НАБОР НАСТРОЕК БЕЗОПАСНОСТИ ===
+        
+        # Основные настройки
+        set_ssh_param "Port" "$SSH_PORT"
+        set_ssh_param "PermitRootLogin" "no"
+        set_ssh_param "PermitEmptyPasswords" "no"
+        set_ssh_param "PubkeyAuthentication" "yes"
+        
+        # Отключение паролей (если не решили оставить)
+        if [ "$KEEP_PASSWORD_AUTH" != "true" ]; then
+            set_ssh_param "PasswordAuthentication" "no"
         fi
         
-        # PermitRootLogin no
-        if grep -qE "^#?PermitRootLogin " "$SSHD_CONFIG"; then
-            sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin no/" "$SSHD_CONFIG"
-        else
-            echo "PermitRootLogin no" >> "$SSHD_CONFIG"
-        fi
+        # Отключение лишних методов аутентификации
+        set_ssh_param "ChallengeResponseAuthentication" "no"
+        set_ssh_param "KbdInteractiveAuthentication" "no"
         
-        # PermitEmptyPasswords no
-        if grep -qE "^#?PermitEmptyPasswords " "$SSHD_CONFIG"; then
-            sed -i "s/^#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/" "$SSHD_CONFIG"
-        else
-            echo "PermitEmptyPasswords no" >> "$SSHD_CONFIG"
-        fi
+        # Защита от brute-force
+        set_ssh_param "MaxAuthTries" "3"
         
-        # PubkeyAuthentication yes
-        if grep -qE "^#?PubkeyAuthentication " "$SSHD_CONFIG"; then
-            sed -i "s/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/" "$SSHD_CONFIG"
-        else
-            echo "PubkeyAuthentication yes" >> "$SSHD_CONFIG"
-        fi
+        # Подробные логи для fail2ban
+        set_ssh_param "LogLevel" "VERBOSE"
+        
+        # Безопасность (не мешает работе)
+        set_ssh_param "PermitUserEnvironment" "no"
+        
+        # === ЧТО МЫ НЕ ТРОГАЕМ (оставляем по умолчанию) ===
+        # AllowTcpForwarding - разрешены SSH-туннели (нужны вам)
+        # PermitTunnel - разрешены туннели
+        # AllowAgentForwarding - разрешён agent forwarding
+        # X11Forwarding - оставляем как есть
+        # ClientAliveInterval - НЕ устанавливаем (сессии не рвутся)
+        # ClientAliveCountMax - НЕ устанавливаем
+        # LoginGraceTime - оставляем по умолчанию
+        # MaxSessions - оставляем по умолчанию
+        
+        print_success "Настройки SSH применены (минимальный набор)"
         
         # ============================================
-        # 10.1. НАСТРОЙКА ПОРТА ЧЕРЕЗ SYSTEMD SOCKET (Ubuntu 24.04+)
+        # 10.3. НАСТРОЙКА ПОРТА ЧЕРЕЗ SYSTEMD SOCKET (Ubuntu 24.04+)
         # ============================================
-        # В Ubuntu 24.04+ используется systemd socket activation,
-        # и порт определяется в ssh.socket, а не в sshd_config
         print_info "Проверка systemd socket activation..."
         
         if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
@@ -431,11 +502,8 @@ else
             else
                 print_info "Настраиваем порт $SSH_PORT в ssh.socket..."
                 
-                # Создаём директорию для override
                 mkdir -p /etc/systemd/system/ssh.socket.d
                 
-                # Создаём override файл
-                # Первая пустая ListenStream= сбрасывает дефолтный порт 22
                 cat > "$SSH_SOCKET_OVERRIDE" << SOCKET_EOF
 [Socket]
 ListenStream=
@@ -444,34 +512,32 @@ SOCKET_EOF
                 
                 print_success "Создан override: $SSH_SOCKET_OVERRIDE"
                 
-                # Перезагружаем systemd
                 systemctl daemon-reload
                 print_info "systemd daemon перезагружен"
                 
-                # Перезапускаем socket
                 systemctl restart ssh.socket
                 print_success "ssh.socket перезапущен"
                 
-                # Ждём и проверяем результат
                 sleep 2
                 if ss -tuln | grep -q ":$SSH_PORT "; then
                     print_success "SSH слушает порт $SSH_PORT"
                 else
-                    print_error "SSH НЕ слушает порт $SSH_PORT! Проверьте вручную: ss -tulnp | grep ssh"
+                    print_error "SSH НЕ слушает порт $SSH_PORT! Проверьте: ss -tulnp | grep ssh"
                 fi
             fi
         else
             print_info "Socket activation не используется, порт берётся из sshd_config"
         fi
         
-        # Проверяем синтаксис конфига ПЕРЕД перезапуском
+        # ============================================
+        # 10.4. ПРОВЕРКА СИНТАКСИСА И ПЕРЕЗАПУСК
+        # ============================================
         print_info "Проверка синтаксиса sshd_config..."
         if sshd -t; then
             print_success "Синтаксис корректен. Перезапускаем SSH..."
             systemctl restart ssh
             print_success "SSH перезапущен с новыми настройками"
             
-            # Финальная проверка порта
             sleep 2
             if ss -tuln | grep -q ":$SSH_PORT "; then
                 print_success "ИТОГОВАЯ ПРОВЕРКА: SSH слушает порт $SSH_PORT ✓"
@@ -506,7 +572,6 @@ fi
 
 FAIL2BAN_JAIL="/etc/fail2ban/jail.local"
 
-# Проверяем, настроен ли уже jail.local
 if [ -f "$FAIL2BAN_JAIL" ] && grep -q "port = $SSH_PORT" "$FAIL2BAN_JAIL"; then
     print_info "fail2ban уже настроен для порта $SSH_PORT"
     ask_input "Перенастроить fail2ban? [y/N]: " RECONFIGURE_F2B
@@ -521,13 +586,11 @@ fi
 if [ "$SKIP_F2B" != "true" ]; then
     print_info "Создание конфигурации fail2ban..."
     
-    # Создаём резервную копию, если файл существует
     if [ -f "$FAIL2BAN_JAIL" ]; then
         cp "$FAIL2BAN_JAIL" "$FAIL2BAN_JAIL.backup.$(date +%Y%m%d_%H%M%S)"
         print_info "Резервная копия старого jail.local создана"
     fi
     
-    # Создаём конфигурацию jail.local
     cat > "$FAIL2BAN_JAIL" << F2B_EOF
 # ============================================
 # Fail2ban конфигурация для защиты от brute-force
@@ -572,12 +635,10 @@ F2B_EOF
     
     print_success "Конфигурация fail2ban создана: $FAIL2BAN_JAIL"
     
-    # Включаем и запускаем fail2ban
     print_info "Активация fail2ban..."
     systemctl enable fail2ban
     systemctl restart fail2ban
     
-    # Ждём запуска и проверяем статус
     sleep 3
     if systemctl is-active --quiet fail2ban; then
         print_success "fail2ban запущен и активен"
@@ -724,6 +785,10 @@ alias ufwl="sudo journalctl -u ufw -n 50 --no-pager"
 alias f2bs="sudo fail2ban-client status"
 alias f2bssh="sudo fail2ban-client status sshd"
 
+# === SSH безопасность ===
+alias sshlog="sudo journalctl -u ssh -n 50 --no-pager"
+alias sshcheck="sudo sshd -t && echo 'SSH config OK'"
+
 # === FZF (универсальный способ для всех Ubuntu 22/24/26) ===
 source <(fzf --zsh)
 
@@ -764,6 +829,14 @@ else
     print_error "SSH сервис НЕ активен! ⚠️"
 fi
 
+print_info "Проверка настроек SSH..."
+PASS_AUTH_FINAL=$(grep -E "^PasswordAuthentication" "$SSHD_CONFIG" | tail -1 || true)
+if [[ "$PASS_AUTH_FINAL" == *"no"* ]]; then
+    print_success "PasswordAuthentication отключён ✓"
+else
+    print_warning "PasswordAuthentication всё ещё включён ⚠️"
+fi
+
 print_info "Проверка fail2ban..."
 if systemctl is-active --quiet fail2ban; then
     print_success "fail2ban активен ✓"
@@ -796,14 +869,23 @@ echo "  4. Установите шрифт MesloLGS NF на ваш локаль�
 echo "     https://github.com/romkatv/powerlevel10k#fonts"
 echo ""
 echo "Полезные алиасы для управления безопасностью:"
-echo "  f2bs    - статус fail2ban"
-echo "  f2bssh  - статус jail sshd (заблокированные IP)"
-echo "  ufwv    - статус файрвола"
-echo "  ufwn    - правила файрвола с номерами"
+echo "  f2bs      - статус fail2ban"
+echo "  f2bssh    - статус jail sshd (заблокированные IP)"
+echo "  ufwv      - статус файрвола"
+echo "  ufwn      - правила файрвола с номерами"
+echo "  sshlog    - последние логи SSH"
+echo "  sshcheck  - проверка синтаксиса sshd_config"
+echo ""
+echo "Что разрешено на сервере:"
+echo "  ✅ SSH-туннели (AllowTcpForwarding yes)"
+echo "  ✅ Сессии живут бесконечно (нет таймаутов)"
+echo "  ✅ tmux/screen для долгоживущих задач"
+echo "  ✅ Agent forwarding"
 echo ""
 if [[ -f "$BACKUP_FILE" ]] 2>/dev/null; then
     print_warning "Резервная копия sshd_config: $BACKUP_FILE"
 fi
-print_warning "Вход под root по SSH теперь ЗАПРЕЩЁН!"
+print_error "⚠️  ВХОД ПО ПАРОЛЮ ОТКЛЮЧЁН! Только по SSH-ключу!"
+print_error "⚠️  Вход под root по SSH ЗАПРЕЩЁН!"
 print_warning "fail2ban автоматически блокирует атакующих после 3 неудачных попыток"
 echo ""

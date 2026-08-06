@@ -22,6 +22,22 @@ print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# Функция для интерактивного ввода (работает даже через pipe)
+ask_input() {
+    local prompt="$1"
+    local var_name="$2"
+    echo -n "$prompt" > /dev/tty
+    read -r "$var_name" < /dev/tty
+}
+
+# Функция для скрытого ввода пароля
+ask_password() {
+    local prompt="$1"
+    local var_name="$2"
+    read -s -p "$prompt" "$var_name" < /dev/tty
+    echo "" > /dev/tty
+}
+
 # Автоматический перезапуск через sudo
 if [ "$EUID" -ne 0 ]; then
     print_info "Требуются права root. Перезапускаем скрипт через sudo..."
@@ -71,7 +87,7 @@ print_success "Русская локаль установлена"
 # ============================================
 print_info "Установка базовых утилит..."
 apt-get install -y \
-    nano vim git curl wget unzip jq htop tmux net-tools dnsutils \
+    nano git curl wget unzip jq htop tmux net-tools dnsutils \
     bat eza fd-find ripgrep zoxide fzf \
     python3 python3-pip python3-venv build-essential \
     btop mtr iperf3 zsh
@@ -101,12 +117,29 @@ fi
 # 7. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ С ПАРОЛЕМ
 # ============================================
 print_info "Проверка пользователя $NEW_USER..."
+
+SET_PASSWORD=false
+
 if id -u "$NEW_USER" &>/dev/null; then
-    print_info "Пользователь $NEW_USER уже существует — пропускаем создание"
+    print_info "Пользователь $NEW_USER уже существует"
+    
+    # Проверяем, задан ли пароль
+    PASS_STATUS=$(passwd -S "$NEW_USER" | awk '{print $2}')
+    if [[ "$PASS_STATUS" == "P" ]]; then
+        print_info "Пароль для $NEW_USER уже задан"
+        ask_input "Заменить пароль для $NEW_USER? [y/N]: " CHANGE_PASS
+        if [[ "$CHANGE_PASS" =~ ^[Yy]$ ]]; then
+            SET_PASSWORD=true
+        else
+            print_info "Пароль оставляем без изменений"
+        fi
+    else
+        print_warning "Пароль для $NEW_USER НЕ задан!"
+        SET_PASSWORD=true
+    fi
 else
     print_warning "Пользователь $NEW_USER не найден в системе"
-    echo -n "Создать пользователя $NEW_USER и добавить в группу sudo? [Y/n]: "
-    read CREATE_USER
+    ask_input "Создать пользователя $NEW_USER и добавить в группу sudo? [Y/n]: " CREATE_USER
     
     if [[ "$CREATE_USER" =~ ^[Yy]$ ]] || [[ -z "$CREATE_USER" ]]; then
         # Создаём пользователя без пароля (зададим ниже)
@@ -114,29 +147,30 @@ else
         # Добавляем в группу sudo
         usermod -aG sudo "$NEW_USER"
         print_success "Пользователь $NEW_USER создан и добавлен в группу sudo"
-        
-        # Запрашиваем пароль сразу
-        echo ""
-        print_info "Теперь задайте пароль для пользователя $NEW_USER"
-        while true; do
-            read -s -p "Введите пароль для $NEW_USER: " USER_PASSWORD
-            echo
-            read -s -p "Повторите пароль: " USER_PASSWORD_CONFIRM
-            echo
-            
-            if [ -z "$USER_PASSWORD" ]; then
-                print_error "Пароль не может быть пустым. Попробуйте снова."
-            elif [ "$USER_PASSWORD" != "$USER_PASSWORD_CONFIRM" ]; then
-                print_error "Пароли не совпадают. Попробуйте снова."
-            else
-                echo "$NEW_USER:$USER_PASSWORD" | chpasswd
-                print_success "Пароль для $NEW_USER установлен"
-                break
-            fi
-        done
+        SET_PASSWORD=true
     else
         print_warning "Пропускаем создание пользователя $NEW_USER"
     fi
+fi
+
+# Установка/замена пароля
+if [ "$SET_PASSWORD" = true ]; then
+    echo ""
+    print_info "Установка пароля для пользователя $NEW_USER"
+    while true; do
+        ask_password "Введите пароль для $NEW_USER: " USER_PASSWORD
+        ask_password "Повторите пароль: " USER_PASSWORD_CONFIRM
+        
+        if [ -z "$USER_PASSWORD" ]; then
+            print_error "Пароль не может быть пустым. Попробуйте снова."
+        elif [ "$USER_PASSWORD" != "$USER_PASSWORD_CONFIRM" ]; then
+            print_error "Пароли не совпадают. Попробуйте снова."
+        else
+            echo "$NEW_USER:$USER_PASSWORD" | chpasswd
+            print_success "Пароль для $NEW_USER установлен"
+            break
+        fi
+    done
 fi
 
 # ============================================
@@ -153,31 +187,49 @@ else
     
     # Проверяем, есть ли уже ключи
     if [ -f "$PIN_AUTH_KEYS" ] && [ -s "$PIN_AUTH_KEYS" ]; then
-        print_info "SSH-ключ для $NEW_USER уже настроен"
-        echo -n "Добавить ещё один ключ? [y/N]: "
-        read ADD_MORE
-        if [[ ! "$ADD_MORE" =~ ^[Yy]$ ]]; then
-            print_info "Пропускаем добавление ключа"
-            SKIP_KEY=true
-        fi
+        KEY_COUNT=$(wc -l < "$PIN_AUTH_KEYS")
+        print_info "SSH-ключ для $NEW_USER уже настроен ($KEY_COUNT шт.)"
+        echo ""
+        echo "Что сделать с SSH-ключом?"
+        echo "  1) Добавить ещё один ключ (к существующим)"
+        echo "  2) Удалить все ключи и добавить новый"
+        echo "  3) Оставить как есть (пропустить)"
+        ask_input "Ваш выбор [1/2/3]: " KEY_ACTION
+        
+        case "$KEY_ACTION" in
+            1)
+                print_info "Добавляем новый ключ к существующим"
+                ;;
+            2)
+                print_warning "Удаляем все существующие ключи"
+                rm -f "$PIN_AUTH_KEYS"
+                ;;
+            3)
+                print_info "Пропускаем настройку SSH-ключа"
+                SKIP_KEY=true
+                ;;
+            *)
+                print_info "Пропускаем настройку SSH-ключа"
+                SKIP_KEY=true
+                ;;
+        esac
     fi
     
     if [ "$SKIP_KEY" != "true" ]; then
         echo ""
-        print_warning "⚠️  ВАЖНО: Добавьте SSH-ключ для $NEW_USER, чтобы не потерять доступ после отключения root-входа"
+        print_warning "⚠️  ВАЖНО: Добавьте SSH-ключ для $NEW_USER, чтобы не потерять доступ"
         echo ""
         echo "Выберите способ добавления ключа:"
         echo "  1) Вставить публичный ключ вручную (скопируйте содержимое id_ed25519.pub)"
         echo "  2) Указать путь к файлу ключа на сервере"
-        echo "  3) Пропустить (если ключ уже настроен)"
-        echo -n "Ваш выбор [1/2/3]: "
-        read KEY_METHOD
+        echo "  3) Пропустить"
+        ask_input "Ваш выбор [1/2/3]: " KEY_METHOD
         
         case "$KEY_METHOD" in
             1)
                 echo ""
                 print_info "Вставьте ваш публичный ключ одной строкой (начинается с ssh-ed25519 или ssh-rsa):"
-                read PUBLIC_KEY
+                read -r PUBLIC_KEY < /dev/tty
                 if [ -n "$PUBLIC_KEY" ]; then
                     mkdir -p "$PIN_SSH_DIR"
                     echo "$PUBLIC_KEY" >> "$PIN_AUTH_KEYS"
@@ -190,8 +242,7 @@ else
                 fi
                 ;;
             2)
-                echo -n "Введите путь к файлу публичного ключа: "
-                read KEY_PATH
+                ask_input "Введите путь к файлу публичного ключа: " KEY_PATH
                 if [ -f "$KEY_PATH" ]; then
                     mkdir -p "$PIN_SSH_DIR"
                     cat "$KEY_PATH" >> "$PIN_AUTH_KEYS"
@@ -230,8 +281,7 @@ if ufw status | grep -q "Status: active"; then
     ufw status verbose
 else
     print_warning "UFW не активен или не настроен"
-    echo -n "Настроить UFW с базовыми правилами? [Y/n]: "
-    read SETUP_UFW
+    ask_input "Настроить UFW с базовыми правилами? [Y/n]: " SETUP_UFW
     
     if [[ "$SETUP_UFW" =~ ^[Yy]$ ]] || [[ -z "$SETUP_UFW" ]]; then
         print_info "Настройка политик по умолчанию..."
@@ -246,14 +296,19 @@ else
         ufw allow 5201/tcp comment 'iperf3'
         ufw allow 5201/udp comment 'iperf3'
         
+        print_info "Текущие правила UFW:"
+        ufw status verbose 2>/dev/null || true
+        
+        echo ""
         print_warning "ВНИМАНИЕ: UFW будет активирован. Убедитесь, что ваш SSH порт ($SSH_PORT) открыт!"
-        echo -n "Активировать UFW сейчас? [Y/n]: "
-        read ENABLE_UFW
+        ask_input "Активировать UFW сейчас? [Y/n]: " ENABLE_UFW
         
         if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]] || [[ -z "$ENABLE_UFW" ]]; then
             # --force чтобы не было интерактивного вопроса про SSH
             ufw --force enable
             print_success "UFW активирован"
+            echo ""
+            print_info "Финальный статус UFW:"
             ufw status verbose
         else
             print_warning "UFW настроен, но не активирован. Активируйте позже: sudo ufw enable"
@@ -289,7 +344,6 @@ else
     echo "    - PubkeyAuthentication yes (вход по ключам)"
     echo ""
     print_error "❗ После применения вы НЕ СМОЖЕТЕ зайти под root по SSH!"
-    print_error "❗ Убедитесь, что у пользователя $NEW_USER настроен SSH-ключ или вы знаете его пароль"
     echo ""
     
     # Дополнительная проверка: есть ли ключ у pin перед отключением root
@@ -301,8 +355,7 @@ else
     fi
     
     echo ""
-    echo -n "Применить настройки SSH? [Y/n]: "
-    read APPLY_SSH
+    ask_input "Применить настройки SSH? [Y/n]: " APPLY_SSH
     
     if [[ "$APPLY_SSH" =~ ^[Yy]$ ]] || [[ -z "$APPLY_SSH" ]]; then
         # Создаём резервную копию

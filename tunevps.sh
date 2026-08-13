@@ -866,7 +866,33 @@ alias sshlog="sudo journalctl -u ssh -n 50 --no-pager"
 alias sshcheck="sudo sshd -t && echo 'SSH config OK'"
 
 # === FZF (универсальный способ для всех Ubuntu 22/24/26) ===
-source <(fzf --zsh)
+_fzf_init() {
+  local fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
+  
+  # Если fzf >= 0.48.0, используем встроенную интеграцию
+  if [[ $(echo "$fzf_ver 0.48.0" | tr ' ' '\n' | sort -V | head -n1) = "0.48.0" ]]; then
+    eval "$(fzf --zsh)"
+    return
+  fi
+  
+  # Иначе пробуем файлы примеров в разных местах
+  for dir in /usr/share/fzf /usr/share/doc/fzf/examples /usr/local/share/fzf; do
+    if [[ -f "$dir/key-bindings.zsh" ]]; then
+      source "$dir/key-bindings.zsh"
+      [[ -f "$dir/completion.zsh" ]] && source "$dir/completion.zsh"
+      return
+    fi
+  done
+  
+  # Если ничего не найдено - скачиваем напрямую
+  local fzf_tmp=$(mktemp)
+  if curl -fsSL https://raw.githubusercontent.com/junegunn/fzf/master/shell/key-bindings.zsh -o "$fzf_tmp" 2>/dev/null; then
+    source "$fzf_tmp"
+  fi
+  rm -f "$fzf_tmp"
+}
+_fzf_init
+unset -f _fzf_init
 
 # === Zoxide (умный cd) ===
 eval "$(zoxide init zsh)"

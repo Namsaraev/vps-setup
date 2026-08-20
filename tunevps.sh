@@ -99,6 +99,9 @@ print_info "Настройка русской локали..."
 apt-get install -y language-pack-ru
 locale-gen ru_RU.UTF-8
 update-locale LANG=ru_RU.UTF-8
+# Опционально: настраиваем отдельные категории
+update-locale LC_MESSAGES=ru_RU.UTF-8  # Сообщения на русском
+update-locale LC_TIME=ru_RU.UTF-8      # Формат времени русский
 print_success "Русская локаль установлена"
 
 # ============================================

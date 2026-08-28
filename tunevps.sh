@@ -1,5 +1,4 @@
 #!/bin/bash
-set -e
 export DEBIAN_FRONTEND=noninteractive
 
 # ============================================
@@ -41,6 +40,12 @@ ask_password() {
     echo "" > /dev/tty
 }
 
+pause() {
+    local prompt="${1:-Нажмите Enter для продолжения...}"
+    echo -n "$prompt" > /dev/tty
+    read -r < /dev/tty
+}
+
 # ============================================
 # АВТО-ПОВЫШЕНИЕ ДО ROOT
 # ============================================
@@ -63,9 +68,11 @@ fi
 
 # Определение minimized системы
 IS_MINIMIZED=false
-if dpkg-query -W -f='${Status}' ubuntu-minimal 2>/dev/null | grep -q "install ok installed"; then
-    if ! dpkg-query -W -f='${Status}' ubuntu-standard 2>/dev/null | grep -q "install ok installed"; then
-        IS_MINIMIZED=true
+if command -v dpkg-query >/dev/null 2>&1; then
+    if dpkg-query -W -f='${Status}' ubuntu-minimal 2>/dev/null | grep -q "install ok installed"; then
+        if ! dpkg-query -W -f='${Status}' ubuntu-standard 2>/dev/null | grep -q "install ok installed"; then
+            IS_MINIMIZED=true
+        fi
     fi
 fi
 
@@ -74,7 +81,7 @@ ARCH=$(uname -m)
 print_info "ОС: $PRETTY_NAME"
 print_info "Версия: $UBUNTU_VERSION ($UBUNTU_CODENAME)"
 print_info "Архитектура: $ARCH"
-print_info "Вариант: $([ "$IS_MINIMIZED" = true ] && echo "MINIMIZED" || echo "Standard")"
+print_info "Вариант: $([ "$IS_MINIMIZED" = true ] && echo "MINIMIZED ⚠️" || echo "Standard ✓")"
 
 CURRENT_USER="${SUDO_USER:-root}"
 if [ "$CURRENT_USER" = "root" ]; then
@@ -95,7 +102,7 @@ show_menu() {
 ╠══════════════════════════════════════════════════════╣
 ║                                                      ║
 ║  1) Первое обновление системы                         ║
-║     └─ apt update/upgrade + вопрос о reboot          ║
+║     └─ unminimize (если нужно) + apt update/upgrade  ║
 ║                                                      ║
 ║  2) Настройка рабочего пространства                  ║
 ║     └─ Утилиты, Zsh, SSH, UFW, пользователь pin      ║
@@ -110,29 +117,81 @@ show_menu() {
 ╚══════════════════════════════════════════════════════╝
 EOF
     echo -e "${NC}"
+    if [ "$IS_MINIMIZED" = true ]; then
+        print_warning "⚠️  ОБНАРУЖЕНА MINIMIZED СИСТЕМА — начните с пункта 1!"
+    fi
 }
 
 # ============================================
-# ЧАСТЬ 1: ПЕРВОЕ ОБНОВЛЕНИЕ
+# ЧАСТЬ 1: ПЕРВОЕ ОБНОВЛЕНИЕ + UNMINIMIZE
 # ============================================
 part1_update() {
     print_section "ЧАСТЬ 1: ПЕРВОЕ ОБНОВЛЕНИЕ СИСТЕМЫ"
-    
+
+    # === ПРОВЕРКА MINIMIZED ===
+    if [ "$IS_MINIMIZED" = true ]; then
+        print_warning "⚠️  ОБНАРУЖЕНА MINIMIZED ВЕРСИЯ UBUNTU!"
+        print_warning "    Эта версия содержит минимальный набор пакетов"
+        print_warning "    и может вызывать проблемы с работой скрипта."
+        echo ""
+        print_info "Рекомендуется восстановить полную версию Ubuntu"
+        print_info "Это установит ~100 базовых пакетов (man, less, wget, etc.)"
+        print_info "Займёт 2-5 минут и ~400 МБ дискового пространства"
+        echo ""
+        ask_input "Выполнить unminimize для восстановления полной Ubuntu? [Y/n]: " DO_UNMINIMIZE
+
+        if [[ "$DO_UNMINIMIZE" =~ ^[Nn]$ ]]; then
+            print_warning "Пропускаем unminimize"
+            print_error "ВНИМАНИЕ: Скрипт может работать некорректно на minimized системе!"
+            print_error "Рекомендуется запустить 'sudo unminimize' вручную"
+        else
+            print_info "Обновление apt для получения пакета unminimize..."
+            apt-get update -y
+
+            # Устанавливаем unminimize, если его нет
+            if ! command -v unminimize >/dev/null 2>&1; then
+                print_info "Установка пакета unminimize..."
+                apt-get install -y unminimize || {
+                    print_error "Не удалось установить unminimize"
+                    return 1
+                }
+            fi
+
+            print_info "Восстановление полной Ubuntu (это займёт 2-5 минут)..."
+            # yes передаёт "y" на все вопросы unminimize
+            set +e
+            yes | unminimize 2>&1 | tee /tmp/unminimize.log
+            UNMINIMIZE_EXIT=${PIPESTATUS[1]}
+            set -e
+
+            if [ "$UNMINIMIZE_EXIT" -eq 0 ]; then
+                print_success "Система восстановлена до полной Ubuntu ✓"
+                IS_MINIMIZED=false
+            else
+                print_error "unminimize завершился с кодом $UNMINIMIZE_EXIT"
+                print_warning "Проверьте лог: cat /tmp/unminimize.log"
+            fi
+        fi
+    else
+        print_success "Система уже является полной Ubuntu ✓"
+    fi
+
+    # === ОБНОВЛЕНИЕ ПАКЕТОВ ===
     print_info "Обновление списков пакетов..."
     apt-get update -y
-    
-    print_info "Обновление системы..."
+
+    print_info "Обновление системы (это может занять время)..."
     apt-get upgrade -y
-    
+
     print_info "Удаление ненужных пакетов..."
     apt-get autoremove -y
-    
+
     print_success "Система обновлена!"
-    
+
     echo ""
     print_warning "Рекомендуется перезагрузить сервер для применения всех обновлений"
     ask_input "Перезагрузить сервер сейчас? [Y/n]: " REBOOT_NOW
-    
+
     if [[ "$REBOOT_NOW" =~ ^[Nn]$ ]]; then
         print_info "Перезагрузка отменена. Не забудьте перезагрузить позже!"
     else
@@ -147,52 +206,89 @@ part1_update() {
 # ============================================
 part2_setup() {
     print_section "ЧАСТЬ 2: НАСТРОЙКА РАБОЧЕГО ПРОСТРАНСТВА"
-    
+
+    # === ПРОВЕРКА MINIMIZED ===
+    if [ "$IS_MINIMIZED" = true ]; then
+        print_error "⚠️  ОБНАРУЖЕНА MINIMIZED ВЕРСИЯ UBUNTU!"
+        print_error "    Скрипт может работать некорректно."
+        echo ""
+        print_warning "Рекомендуется:"
+        print_warning "  1. Выйти из скрипта"
+        print_warning "  2. Запустить пункт 1 (Первое обновление)"
+        print_warning "  3. Выполнить unminimize"
+        print_warning "  4. Перезагрузить сервер"
+        print_warning "  5. Запустить скрипт снова"
+        echo ""
+        ask_input "Продолжить настройку на minimized системе? (НЕ РЕКОМЕНДУЕТСЯ) [y/N]: " CONTINUE_MINIMIZED
+
+        if [[ ! "$CONTINUE_MINIMIZED" =~ ^[Yy]$ ]]; then
+            print_info "Отмена. Вернитесь в меню и выберите пункт 1"
+            return 1
+        fi
+
+        print_warning "Продолжаем на minimized системе (могут быть ошибки)..."
+    fi
+
     # --- 2.1 Часовой пояс ---
     print_section "2.1 ЧАСОВОЙ ПОЯС"
     timedatectl set-timezone Asia/Irkutsk
     print_success "Часовой пояс: $(LC_ALL=C timedatectl | grep 'Time zone')"
-    
+
     # --- 2.2 Локаль ---
     print_section "2.2 ЛОКАЛЬ"
-    apt-get install -y language-pack-ru locales
+    apt-get install -y language-pack-ru locales || apt-get install -y locales
     locale-gen ru_RU.UTF-8
     locale-gen en_US.UTF-8
-    
-    sed -i '/^LC_ALL/d' /etc/default/locale
-    sed -i '/^LC_ALL/d' /etc/environment
-    
+
+    sed -i '/^LC_ALL/d' /etc/default/locale 2>/dev/null || true
+    sed -i '/^LC_ALL/d' /etc/environment 2>/dev/null || true
+
     update-locale LANG=ru_RU.UTF-8
     update-locale LC_MESSAGES=ru_RU.UTF-8
     update-locale LC_TIME=ru_RU.UTF-8
     print_success "Русская локаль установлена"
-    
+
     # --- 2.3 Восстановление minimized ---
     if [ "$IS_MINIMIZED" = true ]; then
-        print_warning "Обнаружена MINIMIZED система. Устанавливаем базовые пакеты..."
-        apt-get install -y ubuntu-standard man-db bsdmainutils
-        print_success "Базовые пакеты восстановлены"
+        print_warning "Установка базовых пакетов для minimized..."
+        apt-get install -y ubuntu-standard man-db bsdmainutils || true
+        print_success "Базовые пакеты установлены"
     fi
-    
+
     # --- 2.4 Базовые утилиты ---
     print_section "2.4 БАЗОВЫЕ УТИЛИТЫ"
     apt-get install -y \
         nano git curl wget unzip jq htop tmux net-tools dnsutils \
-        bat eza fd-find ripgrep zoxide fzf \
+        bat eza fd-find ripgrep \
         python3 python3-pip python3-venv build-essential \
-        btop mtr iperf3 zsh \
+        btop mtr iperf3 zsh sysbench \
         software-properties-common apt-transport-https ca-certificates gnupg \
         bsdmainutils ncdu iotop
-    
+
     print_success "Базовые утилиты установлены"
-    
-    # --- 2.5 Системные улучшения ---
-    print_section "2.5 СИСТЕМНЫЕ УЛУЧШЕНИЯ"
-    
+
+    # --- 2.5 Установка FZF ---
+    print_section "2.5 УСТАНОВКА FZF"
+    apt-get install -y fzf || true
+    print_success "FZF установлен"
+
+    # --- 2.6 Установка Zoxide (официальный способ) ---
+    print_section "2.6 УСТАНОВКА ZOXIDE"
+    if ! command -v zoxide >/dev/null 2>&1; then
+        print_info "Установка zoxide через официальный установщик..."
+        curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash -s -- --install-dir /usr/local/bin
+        print_success "zoxide установлен в /usr/local/bin"
+    else
+        print_info "zoxide уже установлен"
+    fi
+
+    # --- 2.7 Системные улучшения ---
+    print_section "2.7 СИСТЕМНЫЕ УЛУЧШЕНИЯ"
+
     # Энтропия
-    apt-get install -y haveged || apt-get install -y rng-tools5 || true
+    apt-get install -y haveged 2>/dev/null || apt-get install -y rng-tools5 2>/dev/null || true
     print_success "Энтропия настроена"
-    
+
     # Авто-обновления безопасности
     apt-get install -y unattended-upgrades
     cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AUTOUPGRADE'
@@ -202,12 +298,12 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 AUTOUPGRADE
     print_success "Авто-обновления безопасности включены"
-    
+
     # needrestart
     apt-get install -y needrestart
-    sed -i 's/#$nrconf{restart} =.*/$nrconf{restart} = "a";/' /etc/needrestart/needrestart.conf 2>/dev/null || true
+    sed -i 's/#\$nrconf{restart} =.*/\$nrconf{restart} = "a";/' /etc/needrestart/needrestart.conf 2>/dev/null || true
     print_success "needrestart настроен"
-    
+
     # sysctl tuning
     print_info "Настройка sysctl (BBR + безопасность)..."
     cat > /etc/sysctl.d/99-vps-tuning.conf << 'SYSCTL'
@@ -240,7 +336,7 @@ kernel.pid_max = 65536
 SYSCTL
     sysctl --system > /dev/null 2>&1
     print_success "sysctl настроен"
-    
+
     # Swap
     if [ "$(swapon --show | wc -l)" -eq 0 ]; then
         RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
@@ -254,23 +350,23 @@ SYSCTL
             print_success "Swap ${SWAP_SIZE} создан"
         fi
     fi
-    
-    # --- 2.6 Симлинки ---
-    print_section "2.6 СИМЛИНКИ"
+
+    # --- 2.8 Симлинки ---
+    print_section "2.8 СИМЛИНКИ"
     ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
     ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
     print_success "Симлинки bat/fd созданы"
-    
-    # --- 2.7 Sudoers ---
-    print_section "2.7 SUDOERS"
+
+    # --- 2.9 Sudoers ---
+    print_section "2.9 SUDOERS"
     SUDOERS_LINE="$CURRENT_USER ALL=(ALL) NOPASSWD: /usr/sbin/ufw, /usr/bin/journalctl, /usr/bin/systemctl"
     if ! grep -qF "$SUDOERS_LINE" /etc/sudoers 2>/dev/null; then
         echo "$SUDOERS_LINE" | EDITOR='tee -a' visudo > /dev/null
         print_success "Sudoers настроен"
     fi
-    
-    # --- 2.8 Создание пользователя pin ---
-    print_section "2.8 СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ $NEW_USER"
+
+    # --- 2.10 Создание пользователя pin ---
+    print_section "2.10 СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ $NEW_USER"
     SET_PASSWORD=false
     if id -u "$NEW_USER" &>/dev/null; then
         print_info "Пользователь $NEW_USER уже существует"
@@ -295,7 +391,7 @@ SYSCTL
             SET_PASSWORD=true
         fi
     fi
-    
+
     if [ "$SET_PASSWORD" = true ]; then
         while true; do
             ask_password "Введите пароль для $NEW_USER: " USER_PASSWORD
@@ -311,14 +407,14 @@ SYSCTL
             fi
         done
     fi
-    
-    # --- 2.9 SSH-ключ ---
-    print_section "2.9 SSH-КЛЮЧ"
+
+    # --- 2.11 SSH-ключ ---
+    print_section "2.11 SSH-КЛЮЧ"
     if [ -d "/home/$NEW_USER" ]; then
         PIN_SSH_DIR="/home/$NEW_USER/.ssh"
         PIN_AUTH_KEYS="$PIN_SSH_DIR/authorized_keys"
         SKIP_KEY=false
-        
+
         if [ -f "$PIN_AUTH_KEYS" ] && [ -s "$PIN_AUTH_KEYS" ]; then
             KEY_COUNT=$(wc -l < "$PIN_AUTH_KEYS")
             print_info "SSH-ключ уже настроен ($KEY_COUNT шт.)"
@@ -334,7 +430,7 @@ SYSCTL
                 *) SKIP_KEY=true ;;
             esac
         fi
-        
+
         if [ "$SKIP_KEY" != "true" ]; then
             echo ""
             echo "Выберите способ добавления ключа:"
@@ -342,7 +438,7 @@ SYSCTL
             echo "  2) Путь к файлу"
             echo "  3) Пропустить"
             ask_input "Ваш выбор [1/2/3]: " KEY_METHOD
-            
+
             case "$KEY_METHOD" in
                 1)
                     print_info "Вставьте публичный ключ:"
@@ -370,13 +466,13 @@ SYSCTL
             esac
         fi
     fi
-    
-    # --- 2.10 UFW ---
-    print_section "2.10 UFW FIREWALL"
-    if ! command -v ufw &>/dev/null; then
+
+    # --- 2.12 UFW ---
+    print_section "2.12 UFW FIREWALL"
+    if ! command -v ufw >/dev/null 2>&1; then
         apt-get install -y ufw
     fi
-    
+
     if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
         print_info "UFW уже активен"
     else
@@ -390,7 +486,7 @@ SYSCTL
             ufw allow "$SSH_PORT/tcp" comment 'SSH'
             ufw allow 5201/tcp comment 'iperf3'
             ufw allow 5201/udp comment 'iperf3'
-            
+
             print_warning "UFW будет активирован. SSH порт $SSH_PORT открыт!"
             ask_input "Активировать UFW? [Y/n]: " ENABLE_UFW
             if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]] || [[ -z "$ENABLE_UFW" ]]; then
@@ -399,24 +495,24 @@ SYSCTL
             fi
         fi
     fi
-    
-    # --- 2.11 SSH hardening ---
-    print_section "2.11 SSH НАСТРОЙКИ"
+
+    # --- 2.13 SSH hardening ---
+    print_section "2.13 SSH НАСТРОЙКИ"
     SSHD_CONFIG="/etc/ssh/sshd_config"
     SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
     BACKUP_FILE="/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
-    
+
     SSH_PORT_SET=$(grep -E "^Port $SSH_PORT$" "$SSHD_CONFIG" || true)
     ROOT_LOGIN_SET=$(grep -E "^PermitRootLogin no$" "$SSHD_CONFIG" || true)
     PASS_AUTH_SET=$(grep -E "^PasswordAuthentication no$" "$SSHD_CONFIG" || true)
     EMPTY_PASS_SET=$(grep -E "^PermitEmptyPasswords no$" "$SSHD_CONFIG" || true)
     PUBKEY_SET=$(grep -E "^PubkeyAuthentication yes$" "$SSHD_CONFIG" || true)
-    
+
     SSH_LISTENING_IPV4=false
     if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
         SSH_LISTENING_IPV4=true
     fi
-    
+
     if [[ -n "$SSH_PORT_SET" && -n "$ROOT_LOGIN_SET" && -n "$PASS_AUTH_SET" && -n "$EMPTY_PASS_SET" && -n "$PUBKEY_SET" && "$SSH_LISTENING_IPV4" = true ]]; then
         print_info "SSH уже настроен"
     else
@@ -430,7 +526,7 @@ SYSCTL
         echo "  - PubkeyAuthentication yes"
         echo "  - MaxAuthTries 3"
         echo ""
-        
+
         KEEP_PASSWORD_AUTH=false
         if [ ! -f "/home/$NEW_USER/.ssh/authorized_keys" ] || [ ! -s "/home/$NEW_USER/.ssh/authorized_keys" ]; then
             print_error "⚠️ У $NEW_USER НЕТ SSH-ключа!"
@@ -439,11 +535,11 @@ SYSCTL
                 KEEP_PASSWORD_AUTH=true
             fi
         fi
-        
+
         ask_input "Применить настройки SSH? [Y/n]: " APPLY_SSH
         if [[ "$APPLY_SSH" =~ ^[Yy]$ ]] || [[ -z "$APPLY_SSH" ]]; then
             cp "$SSHD_CONFIG" "$BACKUP_FILE"
-            
+
             if [ -d "$SSHD_CONFIG_DIR" ]; then
                 for conf_file in "$SSHD_CONFIG_DIR"/*.conf; do
                     if [ -f "$conf_file" ] && grep -qE "^PasswordAuthentication yes" "$conf_file" 2>/dev/null; then
@@ -451,14 +547,14 @@ SYSCTL
                         sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' "$conf_file"
                     fi
                 done
-                
+
                 CUSTOM_SSH_CONF="$SSHD_CONFIG_DIR/99-hardening.conf"
                 cat > "$CUSTOM_SSH_CONF" << HARDENING_EOF
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 HARDENING_EOF
             fi
-            
+
             set_ssh_param() {
                 local param="$1"
                 local value="$2"
@@ -468,7 +564,7 @@ HARDENING_EOF
                     echo "$param $value" >> "$SSHD_CONFIG"
                 fi
             }
-            
+
             set_ssh_param "Port" "$SSH_PORT"
             set_ssh_param "PermitRootLogin" "no"
             set_ssh_param "PermitEmptyPasswords" "no"
@@ -477,11 +573,11 @@ HARDENING_EOF
             set_ssh_param "MaxAuthTries" "3"
             set_ssh_param "LogLevel" "VERBOSE"
             set_ssh_param "PermitUserEnvironment" "no"
-            
+
             if [ "$KEEP_PASSWORD_AUTH" != "true" ]; then
                 set_ssh_param "PasswordAuthentication" "no"
             fi
-            
+
             # Отключение socket activation
             if systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then
                 systemctl stop ssh.socket 2>/dev/null || true
@@ -493,7 +589,7 @@ HARDENING_EOF
             else
                 systemctl restart ssh.service
             fi
-            
+
             sleep 2
             if sshd -t; then
                 print_success "SSH настроен"
@@ -503,17 +599,17 @@ HARDENING_EOF
             fi
         fi
     fi
-    
-    # --- 2.12 Zsh ---
-    print_section "2.12 ZSH"
+
+    # --- 2.14 Zsh ---
+    print_section "2.14 ZSH"
     CURRENT_SHELL=$(getent passwd "$CURRENT_USER" | cut -d: -f7)
     if [[ "$CURRENT_SHELL" != *"zsh"* ]]; then
         chsh -s "$(which zsh)" "$CURRENT_USER"
         print_success "Zsh установлен"
     fi
-    
-    # --- 2.13 Oh My Zsh ---
-    print_section "2.13 OH MY ZSH"
+
+    # --- 2.15 Oh My Zsh ---
+    print_section "2.15 OH MY ZSH"
     if [ ! -d "$USER_HOME/.oh-my-zsh" ]; then
         export RUNZSH=no KEEP_ZSHRC=no
         if [ "$CURRENT_USER" = "root" ]; then
@@ -523,9 +619,9 @@ HARDENING_EOF
         fi
         print_success "Oh My Zsh установлен"
     fi
-    
-    # --- 2.14 Powerlevel10k ---
-    print_section "2.14 POWERLEVEL10K"
+
+    # --- 2.16 Powerlevel10k ---
+    print_section "2.16 POWERLEVEL10K"
     ZSH_CUSTOM_DIR="$USER_HOME/.oh-my-zsh/custom"
     if [ ! -d "$ZSH_CUSTOM_DIR/themes/powerlevel10k" ]; then
         if [ "$CURRENT_USER" = "root" ]; then
@@ -535,9 +631,9 @@ HARDENING_EOF
         fi
         print_success "Powerlevel10k установлен"
     fi
-    
-    # --- 2.15 Плагины ---
-    print_section "2.15 ПЛАГИНЫ"
+
+    # --- 2.17 Плагины ---
+    print_section "2.17 ПЛАГИНЫ"
     clone_plugin() {
         local name=$1 url=$2
         if [ ! -d "$ZSH_CUSTOM_DIR/plugins/$name" ]; then
@@ -551,17 +647,48 @@ HARDENING_EOF
     clone_plugin "zsh-autosuggestions" "https://github.com/zsh-users/zsh-autosuggestions"
     clone_plugin "zsh-syntax-highlighting" "https://github.com/zsh-users/zsh-syntax-highlighting.git"
     clone_plugin "zsh-completions" "https://github.com/zsh-users/zsh-completions"
-    
-    # --- 2.16 .zshrc ---
-    print_section "2.16 .zshrc"
-    cat > "$USER_HOME/.zshrc" << 'EOF'
-if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
-  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+
+    # --- 2.18 .zshrc ---
+    print_section "2.18 .zshrc"
+
+    # Определяем путь к локальным бинарникам
+    if [ "$CURRENT_USER" = "root" ]; then
+        LOCAL_BIN_PATH="/root/.local/bin"
+    else
+        LOCAL_BIN_PATH="/home/$CURRENT_USER/.local/bin"
+    fi
+
+    # Генерируем .zshrc через Python для точного контроля над содержимым
+    python3 - "$USER_HOME" "$LOCAL_BIN_PATH" << 'PYEOF'
+import sys
+user_home = sys.argv[1]
+local_bin = sys.argv[2]
+
+zshrc = f'''# ============================================================
+# КРИТИЧЕСКИ ВАЖНО: PATH должен быть задан ДО всего остального!
+# Без этого на minimized системах команды не находятся
+# ============================================================
+export PATH="{local_bin}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# Enable Powerlevel10k instant prompt
+if [[ -r "${{XDG_CACHE_HOME:-$HOME/.cache}}/p10k-instant-prompt-${{(%):-%n}}.zsh" ]]; then
+  source "${{XDG_CACHE_HOME:-$HOME/.cache}}/p10k-instant-prompt-${{(%):-%n}}.zsh"
 fi
 
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
-plugins=(git zsh-autosuggestions zsh-syntax-highlighting zsh-completions zoxide fzf sudo extract)
+
+# ВАЖНО: БЕЗ плагина fzf из OMZ! Он ломает minimized Ubuntu
+plugins=(
+  git
+  zsh-autosuggestions
+  zsh-syntax-highlighting
+  zsh-completions
+  sudo
+  extract
+  docker
+)
+
 source $ZSH/oh-my-zsh.sh
 
 # === Алиасы ===
@@ -571,7 +698,6 @@ alias ll="eza -la --icons --git"
 alias lt="eza --tree --icons --level=2"
 alias grep="rg"
 alias fd="fd"
-alias cd="z"
 alias top="btop"
 alias ports="ss -tulnp"
 alias myip="curl -s ifconfig.me"
@@ -581,54 +707,92 @@ alias ufwn="sudo ufw status numbered"
 alias ufwl="sudo journalctl -u ufw -n 50 --no-pager"
 alias sshlog="sudo journalctl -u ssh -n 50 --no-pager"
 alias sshcheck="sudo sshd -t && echo 'SSH config OK'"
-
-# === Утилиты мониторинга ===
 alias iotop="sudo iotop"
 alias ncdu="ncdu --color dark"
 
-# === FZF (универсальный способ) ===
-setup_fzf() {
+# === FZF — УНИВЕРСАЛЬНЫЙ способ ===
+setup_fzf() {{
   command -v fzf >/dev/null 2>&1 || return 0
-  
+
   local fzf_ver
-  fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
-  
-  if [[ -n "$fzf_ver" ]] && printf '%s\n%s' "0.48.0" "$fzf_ver" | sort -V | head -n1 | grep -q "^0.48.0$"; then
+  fzf_ver=$(fzf --version 2>/dev/null | awk '{{print $1}}')
+
+  if [[ -n "$fzf_ver" ]] && printf '%s\\n%s' "0.48.0" "$fzf_ver" | sort -V | head -n1 | grep -q "^0.48.0$"; then
     eval "$(fzf --zsh 2>/dev/null)" && return 0
   fi
-  
+
   local fzf_paths=(
     "/usr/share/doc/fzf/examples/key-bindings.zsh"
     "/usr/share/fzf/key-bindings.zsh"
     "/usr/local/share/fzf/key-bindings.zsh"
   )
-  for path in "${fzf_paths[@]}"; do
+  for path in "${{fzf_paths[@]}}"; do
     if [[ -f "$path" ]]; then
       source "$path" 2>/dev/null
-      local comp="${path%/*}/completion.zsh"
+      local comp="${{path%/*}}/completion.zsh"
       [[ -f "$comp" ]] && source "$comp" 2>/dev/null
       return 0
     fi
   done
-  
+
   local tmp
-  tmp=$(mktemp)
-  if curl -fsSL https://raw.githubusercontent.com/junegunn/fzf/refs/heads/master/shell/key-bindings.zsh -o "$tmp" 2>/dev/null; then
-    source "$tmp" 2>/dev/null
-  fi
-  rm -f "$tmp"
-}
+  tmp=$(/bin/mktemp 2>/dev/null || echo "/tmp/fzf_kb_$$")
+  /usr/bin/curl -fsSL https://raw.githubusercontent.com/junegunn/fzf/master/shell/key-bindings.zsh -o "$tmp" 2>/dev/null && source "$tmp" 2>/dev/null
+  /bin/rm -f "$tmp" 2>/dev/null
+}}
 setup_fzf
 unfunction setup_fzf 2>/dev/null || unset -f setup_fzf
 
-eval "$(zoxide init zsh)"
+# === Zoxide ===
+if command -v zoxide >/dev/null 2>&1; then
+  eval "$(zoxide init zsh)"
+else
+  alias z="cd"
+fi
+
+# === Powerlevel10k config ===
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
-EOF
-    
+'''
+
+with open(f"{user_home}/.zshrc", "w", newline='\n') as f:
+    f.write(zshrc)
+PYEOF
+
     chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc" 2>/dev/null || true
     chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.oh-my-zsh" 2>/dev/null || true
-    print_success ".zshrc создан"
-    
+    print_success ".zshrc создан с правильным PATH"
+
+    # --- 2.19 Права доступа ---
+    print_section "2.19 ПРАВА ДОСТУПА"
+    if [ "$CURRENT_USER" != "root" ]; then
+        chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.oh-my-zsh"
+        chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc"
+    fi
+    print_success "Права доступа настроены"
+
+    # --- 2.20 Финальная проверка ---
+    print_section "2.20 ФИНАЛЬНАЯ ПРОВЕРКА"
+    if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
+        print_success "SSH слушает порт $SSH_PORT на IPv4 ✓"
+    else
+        print_warning "SSH НЕ слушает порт $SSH_PORT на IPv4"
+    fi
+
+    if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+        print_success "UFW активен ✓"
+    fi
+
+    if [ -f "/home/$NEW_USER/.ssh/authorized_keys" ] && [ -s "/home/$NEW_USER/.ssh/authorized_keys" ]; then
+        print_success "SSH-ключ для $NEW_USER настроен ✓"
+    else
+        print_warning "SSH-ключ для $NEW_USER не настроен"
+    fi
+
+    if [ "$IS_MINIMIZED" = true ]; then
+        print_warning "⚠️  Система осталась в minimized состоянии"
+        print_warning "    Рекомендуется запустить unminimize вручную"
+    fi
+
     print_success "ЧАСТЬ 2 ЗАВЕРШЕНА!"
 }
 
@@ -637,31 +801,31 @@ EOF
 # ============================================
 part3_tests() {
     print_section "ЧАСТЬ 3: ТЕСТЫ И ДИАГНОСТИКА"
-    
+
     cat << 'EOF'
 ╔══════════════════════════════════════════════════════╗
 ║              🧪 Выберите тест:                       ║
 ╠══════════════════════════════════════════════════════╣
 ║  1) 📊 Мой iPerf3 Monitor                            ║
-║  2) 🌍 IP Region                                     ║
+║  2) 🌍 IP Region (только IPv4)                       ║
 ║  3) 🔒 Censorcheck (геоблок)                         ║
 ║  4) 🇷🇺 Censorcheck (РФ DPI)                         ║
 ║  5) 🚀 iPerf3 до российских серверов                 ║
-║  6) 📈 YABS                                          ║
+║  6) 📈 YABS (только IPv4)                            ║
 ║  7) 🚫 Проверка IP на блокировки                     ║
 ║  8) ⚡ Bench.sh                                       ║
 ║  9) 🎯 IPQuality                                     ║
 ║ 10) 💻 Sysbench CPU                                  ║
-║ 11) 🔁 Запустить все                                 ║
+║ 11) 🔁 Запустить основные                            ║
 ║  0) Назад                                            ║
 ╚══════════════════════════════════════════════════════╝
 EOF
-    
+
     ask_input "Ваш выбор: " TEST_CHOICE
-    
+
     case "$TEST_CHOICE" in
         1) run_my_iperf ;;
-        2) bash <(wget -qO- https://ipregion.vrnt.xyz) ;;
+        2) bash <(wget -qO- https://ipregion.vrnt.xyz) -4 ;;
         3) bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock ;;
         4) bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi ;;
         5) bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) ;;
@@ -674,8 +838,8 @@ EOF
         0) return ;;
         *) print_error "Неверный выбор" ;;
     esac
-    
-    ask_input "Нажмите Enter..."
+
+    pause
 }
 
 run_my_iperf() {
@@ -689,8 +853,8 @@ run_my_iperf() {
 }
 
 run_all_tests() {
-    print_info "Запуск всех тестов..."
-    bash <(wget -qO- https://ipregion.vrnt.xyz)
+    print_info "Запуск основных тестов..."
+    bash <(wget -qO- https://ipregion.vrnt.xyz) -4
     bash <(curl -Ls IP.Check.Place) -l en
     curl -sL yabs.sh | bash -s -- -4
 }
@@ -701,23 +865,23 @@ run_all_tests() {
 while true; do
     show_menu
     ask_input "Выберите действие [0-4]: " CHOICE
-    
+
     case "$CHOICE" in
         1) part1_update ;;
         2) part2_setup ;;
         3) part3_tests ;;
-        4) 
+        4)
             part1_update
             print_warning "После перезагрузки запустите скрипт снова и выберите пункт 2"
             exit 0
             ;;
-        0) 
-            print_info "Выход"
+        0)
+            print_info "Выход. До свидания!"
             exit 0
             ;;
         *) print_error "Неверный выбор" ;;
     esac
-    
+
     echo ""
-    ask_input "Нажмите Enter..."
+    pause
 done

@@ -110,9 +110,7 @@ else
 fi
 
 # ============================================
-# ВАЖНО: ЯВНЫЙ ВЫБОР ПОЛЬЗОВАТЕЛЯ
-# Решает проблему при запуске через pipe (curl | bash),
-# когда SUDO_USER теряется
+# ЯВНЫЙ ВЫБОР ПОЛЬЗОВАТЕЛЯ
 # ============================================
 print_section "ОПРЕДЕЛЕНИЕ ПОЛЬЗОВАТЕЛЯ"
 
@@ -208,7 +206,6 @@ EOF
 part1_update() {
     print_section "ЧАСТЬ 1: ПЕРВОЕ ОБНОВЛЕНИЕ СИСТЕМЫ"
 
-    # === ПРОВЕРКА MINIMIZED ===
     if [ "$IS_MINIMIZED" = true ]; then
         print_warning "⚠️  ОБНАРУЖЕНА MINIMIZED ВЕРСИЯ UBUNTU!"
         print_warning "    Эта версия содержит минимальный набор пакетов"
@@ -252,7 +249,6 @@ part1_update() {
         print_success "Система уже является полной Ubuntu ✓"
     fi
 
-    # === ОБНОВЛЕНИЕ ПАКЕТОВ ===
     print_info "Обновление списков пакетов..."
     apt-get update -y
 
@@ -288,7 +284,6 @@ part2_setup() {
         return 1
     fi
 
-    # === ПРОВЕРКА MINIMIZED ===
     if [ "$IS_MINIMIZED" = true ]; then
         print_error "⚠️  ОБНАРУЖЕНА MINIMIZED ВЕРСИЯ UBUNTU!"
         print_error "    Скрипт может работать некорректно."
@@ -348,7 +343,7 @@ part2_setup() {
 
     print_success "Базовые утилиты установлены"
 
-    # --- 2.5 Установка Zoxide (ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
+    # --- 2.5 Установка Zoxide (надёжный способ) ---
     print_section "2.5 УСТАНОВКА ZOXIDE"
     if ! command -v zoxide >/dev/null 2>&1; then
         print_info "Установка zoxide..."
@@ -362,7 +357,6 @@ part2_setup() {
             sudo -u "$CURRENT_USER" bash -c 'curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash' 2>/dev/null
         fi
 
-        # Установщик ставит в ~/.local/bin, копируем в /usr/local/bin для всех
         if [ "$CURRENT_USER" = "root" ]; then
             [ -f "/root/.local/bin/zoxide" ] && cp /root/.local/bin/zoxide /usr/local/bin/zoxide && chmod +x /usr/local/bin/zoxide
         else
@@ -412,7 +406,6 @@ part2_setup() {
         else
             print_error "zoxide НЕ установлен!"
             print_warning "Установите вручную: https://github.com/ajeetdsouza/zoxide"
-            print_warning "Или выполните: cargo install zoxide --locked"
         fi
     else
         print_info "zoxide уже установлен: $(zoxide --version)"
@@ -421,11 +414,9 @@ part2_setup() {
     # --- 2.6 Системные улучшения ---
     print_section "2.6 СИСТЕМНЫЕ УЛУЧШЕНИЯ"
 
-    # Энтропия для VPS
     apt-get install -y haveged 2>/dev/null || apt-get install -y rng-tools5 2>/dev/null || true
     print_success "Энтропия настроена"
 
-    # Авто-обновления безопасности
     apt-get install -y unattended-upgrades
     cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AUTOUPGRADE'
 APT::Periodic::Update-Package-Lists "1";
@@ -435,7 +426,6 @@ APT::Periodic::AutocleanInterval "7";
 AUTOUPGRADE
     print_success "Авто-обновления безопасности включены"
 
-    # needrestart
     apt-get install -y needrestart
     sed -i 's/#\$nrconf{restart} =.*/\$nrconf{restart} = "a";/' /etc/needrestart/needrestart.conf 2>/dev/null || true
     print_success "needrestart настроен"
@@ -481,7 +471,6 @@ SYSCTL
     sysctl --system > /dev/null 2>&1
     print_success "sysctl настроен (BBR + безопасность + лимиты)"
 
-    # Лимиты открытых файлов для пользователей
     cat > /etc/security/limits.d/99-vps.conf << 'LIMITS'
 *    soft nofile 524288
 *    hard nofile 1048576
@@ -797,10 +786,6 @@ HARDENING_EOF
 
             print_success "Настройки SSH применены"
 
-            # ============================================
-            # НАДЁЖНОЕ ПЕРЕКЛЮЧЕНИЕ НА КЛАССИЧЕСКИЙ SSH
-            # С ПОЛНЫМ daemon-reload И ПАУЗАМИ
-            # ============================================
             print_info "Настройка механизма запуска SSH..."
 
             if systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then
@@ -901,19 +886,44 @@ HARDENING_EOF
         print_info "Oh My Zsh уже установлен"
     fi
 
-    # --- 2.17 Powerlevel10k ---
+    # --- 2.17 Powerlevel10k (ИСПРАВЛЕНО: клонирование с подмодулями) ---
     print_section "2.17 POWERLEVEL10K"
     ZSH_CUSTOM_DIR="$USER_HOME/.oh-my-zsh/custom"
     if [ ! -d "$ZSH_CUSTOM_DIR/themes/powerlevel10k" ]; then
-        print_info "Установка Powerlevel10k..."
+        print_info "Установка Powerlevel10k (с подмодулем gitstatus)..."
+        # ВАЖНО: --recurse-submodules --shallow-submodules чтобы скачался подмодуль
+        # с бинарником/скриптами установки, иначе при первом входе появится сообщение
+        # "[powerlevel10k] fetching gitstatusd .. [ok]", которое прерывает мастер настройки
         if [ "$CURRENT_USER" = "root" ]; then
-            git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "$ZSH_CUSTOM_DIR/themes/powerlevel10k"
+            git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/romkatv/powerlevel10k.git "$ZSH_CUSTOM_DIR/themes/powerlevel10k"
         else
-            sudo -u "$CURRENT_USER" git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "$ZSH_CUSTOM_DIR/themes/powerlevel10k"
+            sudo -u "$CURRENT_USER" git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/romkatv/powerlevel10k.git "$ZSH_CUSTOM_DIR/themes/powerlevel10k"
         fi
         print_success "Powerlevel10k установлен"
     else
         print_info "Powerlevel10k уже установлен"
+    fi
+
+    # --- 2.17.1 Предварительная установка бинарника gitstatusd (НОВАЯ СЕКЦИЯ) ---
+    print_section "2.17.1 ПРЕДВАРИТЕЛЬНАЯ УСТАНОВКА GITSTATUSD"
+    GITSTATUS_INSTALL="$ZSH_CUSTOM_DIR/themes/powerlevel10k/gitstatus/install"
+    if [ -f "$GITSTATUS_INSTALL" ]; then
+        print_info "Предварительная загрузка бинарника gitstatusd..."
+        # Запускаем установщик от имени целевого пользователя, чтобы бинарник
+        # попал в его кэш. Тогда при первом входе сообщение "fetching gitstatusd"
+        # НЕ появится и мастер настройки запустится автоматически.
+        if [ "$CURRENT_USER" = "root" ]; then
+            HOME="$USER_HOME" bash "$GITSTATUS_INSTALL" >/dev/null 2>&1 && \
+                print_success "gitstatusd установлен заранее ✓" || \
+                print_warning "Не удалось установить заранее (скачается при первом входе)"
+        else
+            sudo -u "$CURRENT_USER" HOME="$USER_HOME" bash "$GITSTATUS_INSTALL" >/dev/null 2>&1 && \
+                print_success "gitstatusd установлен заранее ✓" || \
+                print_warning "Не удалось установить заранее (скачается при первом входе)"
+        fi
+    else
+        print_warning "Скрипт установки не найден (подмодуль не скачан)."
+        print_warning "При первом входе может появиться сообщение о загрузке."
     fi
 
     # --- 2.18 Плагины ---
@@ -940,7 +950,6 @@ HARDENING_EOF
     print_section "2.19 .zshrc"
     print_info "Создание конфигурации .zshrc..."
 
-    # Определяем путь к локальным бинарникам
     if [ "$CURRENT_USER" = "root" ]; then
         LOCAL_BIN_PATH="/root/.local/bin"
     else
@@ -949,17 +958,16 @@ HARDENING_EOF
 
     # ============================================
     # ГЕНЕРАЦИЯ .zshrc
-    # КРИТИЧЕСКИ ВАЖНО:
-    # 1. PATH устанавливается ДО instant prompt p10k
-    # 2. setup_fzf НЕ использует переменную `path` (специальная в zsh!)
+    # 1. PATH устанавливается ДО всего остального
+    # 2. НЕ используем переменную `path` (специальная в zsh!)
     # 3. zoxide проверяется перед использованием
-    # 4. Подавляем warning p10k через POWERLEVEL9K_INSTANT_PROMPT=quiet
+    # 4. Подавляем warning p10k о консольном выводе
     # ============================================
     TMP_ZSHRC=$(mktemp)
     cat > "$TMP_ZSHRC" << 'ZSHRC_TEMPLATE'
 # ============================================================
 # КРИТИЧЕСКИ ВАЖНО: PATH устанавливается В САМОМ НАЧАЛЕ!
-# ДО instant prompt p10k, ДО всего остального
+# ДО всего остального, включая instant prompt
 # ============================================================
 export PATH="__LOCAL_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
@@ -968,7 +976,8 @@ if ! command -v uname >/dev/null 2>&1; then
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 fi
 
-# Подавляем warning p10k о console output (ДОБАВЛЕНО)
+# Подавляем предупреждение мгновенного промпта о консольном выводе
+# ВАЖНО: это только предупреждение, мастер настройки продолжает работать
 typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet
 
 # Powerlevel10k instant prompt (ПОСЛЕ установки PATH!)
@@ -980,8 +989,6 @@ export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
 
 # ВАЖНО: БЕЗ плагина fzf из OMZ!
-# Плагин OMZ вызывает fzf_setup_using_debian, которая ломается
-# на minimized Ubuntu и Oracle Cloud (нет файлов примеров)
 plugins=(
   git
   zsh-autosuggestions
@@ -1028,7 +1035,6 @@ alias ncdu="ncdu --color dark"
 
 # === FZF — ИСПРАВЛЕННАЯ ВЕРСИЯ ===
 # КРИТИЧЕСКИ ВАЖНО: НЕ используем переменную `path` — она специальная в zsh!
-# Используем безопасные имена: fzf_file, fzf_search_paths, fzf_tmp, fzf_comp
 setup_fzf() {
   command -v fzf >/dev/null 2>&1 || return 0
 
@@ -1091,9 +1097,7 @@ ZSHRC_TEMPLATE
     chmod 644 "$USER_HOME/.zshrc"
     print_success ".zshrc создан для $CURRENT_USER"
 
-    # ============================================
-    # 2.20 ФИНАЛЬНАЯ ПРОВЕРКА
-    # ============================================
+    # --- 2.20 Финальная проверка ---
     print_section "2.20 ФИНАЛЬНАЯ ПРОВЕРКА"
 
     if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
@@ -1136,11 +1140,16 @@ ZSHRC_TEMPLATE
         print_warning "UFW НЕ активен"
     fi
 
-    # Проверка zoxide
     if command -v zoxide >/dev/null 2>&1 || [ -x /usr/local/bin/zoxide ]; then
         print_success "zoxide установлен ✓"
     else
         print_warning "zoxide НЕ установлен — алиас z будет работать как cd"
+    fi
+
+    if [ -d "$ZSH_CUSTOM_DIR/themes/powerlevel10k/gitstatus" ]; then
+        print_success "Подмодуль gitstatus скачан ✓"
+    else
+        print_warning "Подмодуль gitstatus не найден"
     fi
 
     if [ "$IS_MINIMIZED" = true ]; then
@@ -1158,7 +1167,8 @@ ZSHRC_TEMPLATE
     echo ""
     echo "  1. Выйдите из текущей сессии: exit"
     echo "  2. Зайдите снова: ssh -p $SSH_PORT $CURRENT_USER@YOUR_IP"
-    echo "  3. При первом входе запустите: p10k configure"
+    echo "  3. При первом входе должен автоматически запуститься: p10k configure"
+    echo "     Если не запустился — выполните вручную: p10k configure"
     echo "  4. Установите шрифт MesloLGS NF на клиент"
     echo ""
     print_error "⚠️  ВХОД ПО ПАРОЛЮ ОТКЛЮЧЁН! Только по SSH-ключу!"
@@ -1213,7 +1223,7 @@ EOF
 
 run_my_iperf() {
     print_info "Загрузка iperf_real_monitor.sh..."
-    if curl -fsSL https://raw.githubusercontent.com/Namsaraev/vps-setup/main/iperf_real_monitor.sh -o /tmp/iperf_real_monitor.sh 2>/dev/null; then
+    if curl -fsSL https://raw.githubusercontent.com/Namsamaev/vps-setup/main/iperf_real_monitor.sh -o /tmp/iperf_real_monitor.sh 2>/dev/null; then
         chmod +x /tmp/iperf_real_monitor.sh
         bash /tmp/iperf_real_monitor.sh
     else

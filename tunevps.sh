@@ -349,7 +349,6 @@ part2_setup() {
         print_info "Установка zoxide..."
         ZOXIDE_INSTALLED=false
 
-        # Способ 1: официальный установщик (без --install-dir, т.к. флаг удалён)
         print_info "Способ 1: официальный установщик..."
         if [ "$CURRENT_USER" = "root" ]; then
             curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash 2>/dev/null
@@ -370,7 +369,6 @@ part2_setup() {
             print_warning "Способ 1 не сработал, пробуем способ 2..."
         fi
 
-        # Способ 2: прямое скачивание бинарника с GitHub releases
         if [ "$ZOXIDE_INSTALLED" = false ]; then
             print_info "Способ 2: скачивание бинарника с GitHub..."
             ZOXIDE_VERSION="0.9.6"
@@ -398,7 +396,6 @@ part2_setup() {
             fi
         fi
 
-        # Финальная проверка
         if command -v zoxide >/dev/null 2>&1; then
             print_success "zoxide проверен: $(zoxide --version)"
         elif [ -x /usr/local/bin/zoxide ]; then
@@ -886,14 +883,11 @@ HARDENING_EOF
         print_info "Oh My Zsh уже установлен"
     fi
 
-    # --- 2.17 Powerlevel10k (ИСПРАВЛЕНО: клонирование с подмодулями) ---
+    # --- 2.17 Powerlevel10k (клонирование с подмодулями) ---
     print_section "2.17 POWERLEVEL10K"
     ZSH_CUSTOM_DIR="$USER_HOME/.oh-my-zsh/custom"
     if [ ! -d "$ZSH_CUSTOM_DIR/themes/powerlevel10k" ]; then
         print_info "Установка Powerlevel10k (с подмодулем gitstatus)..."
-        # ВАЖНО: --recurse-submodules --shallow-submodules чтобы скачался подмодуль
-        # с бинарником/скриптами установки, иначе при первом входе появится сообщение
-        # "[powerlevel10k] fetching gitstatusd .. [ok]", которое прерывает мастер настройки
         if [ "$CURRENT_USER" = "root" ]; then
             git clone --depth=1 --recurse-submodules --shallow-submodules https://github.com/romkatv/powerlevel10k.git "$ZSH_CUSTOM_DIR/themes/powerlevel10k"
         else
@@ -904,26 +898,35 @@ HARDENING_EOF
         print_info "Powerlevel10k уже установлен"
     fi
 
-    # --- 2.17.1 Предварительная установка бинарника gitstatusd (НОВАЯ СЕКЦИЯ) ---
-    print_section "2.17.1 ПРЕДВАРИТЕЛЬНАЯ УСТАНОВКА GITSTATUSD"
-    GITSTATUS_INSTALL="$ZSH_CUSTOM_DIR/themes/powerlevel10k/gitstatus/install"
-    if [ -f "$GITSTATUS_INSTALL" ]; then
-        print_info "Предварительная загрузка бинарника gitstatusd..."
-        # Запускаем установщик от имени целевого пользователя, чтобы бинарник
-        # попал в его кэш. Тогда при первом входе сообщение "fetching gitstatusd"
-        # НЕ появится и мастер настройки запустится автоматически.
-        if [ "$CURRENT_USER" = "root" ]; then
-            HOME="$USER_HOME" bash "$GITSTATUS_INSTALL" >/dev/null 2>&1 && \
-                print_success "gitstatusd установлен заранее ✓" || \
-                print_warning "Не удалось установить заранее (скачается при первом входе)"
-        else
-            sudo -u "$CURRENT_USER" HOME="$USER_HOME" bash "$GITSTATUS_INSTALL" >/dev/null 2>&1 && \
-                print_success "gitstatusd установлен заранее ✓" || \
-                print_warning "Не удалось установить заранее (скачается при первом входе)"
-        fi
+    # --- 2.17.1 ПРЕДЗАГРУЗКА БИНАРНИКА GITSTATUSD (УСИЛЕННАЯ ВЕРСИЯ) ---
+    print_section "2.17.1 ПРЕДЗАГРУЗКА GITSTATUSD"
+    print_info "Запускаем тему в изолированном окружении для скачивания бинарника..."
+    # Создаём временный ZDOTDIR с минимальным конфигом, который ТОЛЬКО
+    # загружает тему. Это заставит тему скачать бинарник в кэш пользователя.
+    # Отключаем мастер настройки и мгновенный промпт для чистоты.
+    TMP_ZDOT=$(mktemp -d)
+    cat > "$TMP_ZDOT/.zshrc" << 'TMPZSH'
+export POWERLEVEL9K_DISABLE_CONFIGURATION_WIZARD=true
+typeset -g POWERLEVEL9K_INSTANT_PROMPT=off
+export ZSH="$HOME/.oh-my-zsh"
+ZSH_THEME="powerlevel10k/powerlevel10k"
+plugins=(git)
+source $ZSH/oh-my-zsh.sh
+TMPZSH
+
+    if [ "$CURRENT_USER" = "root" ]; then
+        ZDOTDIR="$TMP_ZDOT" timeout 90 zsh -i -c 'sleep 1; exit' >/dev/null 2>&1 || true
     else
-        print_warning "Скрипт установки не найден (подмодуль не скачан)."
-        print_warning "При первом входе может появиться сообщение о загрузке."
+        sudo -u "$CURRENT_USER" ZDOTDIR="$TMP_ZDOT" timeout 90 zsh -i -c 'sleep 1; exit' >/dev/null 2>&1 || true
+    fi
+    rm -rf "$TMP_ZDOT"
+
+    # Проверяем, появился ли бинарник в кэше
+    GITSTATUS_CACHE="$USER_HOME/.cache/gitstatus"
+    if [ -d "$GITSTATUS_CACHE" ] && [ -n "$(ls -A "$GITSTATUS_CACHE" 2>/dev/null)" ]; then
+        print_success "gitstatusd предзагружен в кэш ✓"
+    else
+        print_warning "gitstatusd не найден в кэше (скачается при первом входе)"
     fi
 
     # --- 2.18 Плагины ---
@@ -961,7 +964,8 @@ HARDENING_EOF
     # 1. PATH устанавливается ДО всего остального
     # 2. НЕ используем переменную `path` (специальная в zsh!)
     # 3. zoxide проверяется перед использованием
-    # 4. Подавляем warning p10k о консольном выводе
+    # 4. НЕ ставим POWERLEVEL9K_DISABLE_CONFIGURATION_WIZARD,
+    #    чтобы мастер настройки запускался автоматически при первом входе
     # ============================================
     TMP_ZSHRC=$(mktemp)
     cat > "$TMP_ZSHRC" << 'ZSHRC_TEMPLATE'
@@ -977,7 +981,7 @@ if ! command -v uname >/dev/null 2>&1; then
 fi
 
 # Подавляем предупреждение мгновенного промпта о консольном выводе
-# ВАЖНО: это только предупреждение, мастер настройки продолжает работать
+# (это только предупреждение, мастер настройки продолжает работать)
 typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet
 
 # Powerlevel10k instant prompt (ПОСЛЕ установки PATH!)
@@ -1041,12 +1045,10 @@ setup_fzf() {
   local fzf_ver
   fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
 
-  # Если fzf >= 0.48.0 — встроенная интеграция
   if [[ -n "$fzf_ver" ]] && printf '%s\n%s' "0.48.0" "$fzf_ver" | sort -V | head -n1 | grep -q "^0.48.0$"; then
     eval "$(fzf --zsh 2>/dev/null)" && return 0
   fi
 
-  # Массив путей для поиска
   local fzf_search_paths=(
     "/usr/share/doc/fzf/examples/key-bindings.zsh"
     "/usr/share/fzf/key-bindings.zsh"
@@ -1064,7 +1066,6 @@ setup_fzf() {
     fi
   done
 
-  # Fallback: скачиваем с GitHub
   local fzf_tmp
   fzf_tmp=$(mktemp 2>/dev/null || echo "/tmp/fzf_kb_$$")
   curl -fsSL https://raw.githubusercontent.com/junegunn/fzf/master/shell/key-bindings.zsh -o "$fzf_tmp" 2>/dev/null && source "$fzf_tmp" 2>/dev/null
@@ -1074,7 +1075,6 @@ setup_fzf
 unfunction setup_fzf 2>/dev/null || unset -f setup_fzf
 
 # === Zoxide (умный cd) ===
-# ИСПРАВЛЕНО: проверяем наличие ДО использования!
 if command -v zoxide >/dev/null 2>&1; then
   eval "$(zoxide init zsh)"
 else
@@ -1085,11 +1085,9 @@ fi
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
 ZSHRC_TEMPLATE
 
-    # Заменяем плейсхолдер на реальный путь
     sed "s|__LOCAL_BIN__|${LOCAL_BIN_PATH}|g" "$TMP_ZSHRC" > "$USER_HOME/.zshrc"
     rm -f "$TMP_ZSHRC"
 
-    # Права доступа
     if [ "$CURRENT_USER" != "root" ]; then
         chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.oh-my-zsh" 2>/dev/null || true
         chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc" 2>/dev/null || true
@@ -1152,6 +1150,12 @@ ZSHRC_TEMPLATE
         print_warning "Подмодуль gitstatus не найден"
     fi
 
+    if [ -d "$USER_HOME/.cache/gitstatus" ] && [ -n "$(ls -A "$USER_HOME/.cache/gitstatus" 2>/dev/null)" ]; then
+        print_success "Бинарник gitstatusd в кэше ✓"
+    else
+        print_warning "Бинарник gitstatusd не в кэше (скачается при первом входе)"
+    fi
+
     if [ "$IS_MINIMIZED" = true ]; then
         print_warning "⚠️  Система осталась в minimized состоянии"
     fi
@@ -1167,7 +1171,7 @@ ZSHRC_TEMPLATE
     echo ""
     echo "  1. Выйдите из текущей сессии: exit"
     echo "  2. Зайдите снова: ssh -p $SSH_PORT $CURRENT_USER@YOUR_IP"
-    echo "  3. При первом входе должен автоматически запуститься: p10k configure"
+    echo "  3. Мастер настройки должен запуститься автоматически."
     echo "     Если не запустился — выполните вручную: p10k configure"
     echo "  4. Установите шрифт MesloLGS NF на клиент"
     echo ""
@@ -1223,7 +1227,7 @@ EOF
 
 run_my_iperf() {
     print_info "Загрузка iperf_real_monitor.sh..."
-    if curl -fsSL https://raw.githubusercontent.com/Namsamaev/vps-setup/main/iperf_real_monitor.sh -o /tmp/iperf_real_monitor.sh 2>/dev/null; then
+    if curl -fsSL https://raw.githubusercontent.com/Namsaraev/vps-setup/main/iperf_real_monitor.sh -o /tmp/iperf_real_monitor.sh 2>/dev/null; then
         chmod +x /tmp/iperf_real_monitor.sh
         bash /tmp/iperf_real_monitor.sh
     else

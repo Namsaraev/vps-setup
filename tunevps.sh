@@ -66,14 +66,43 @@ else
     exit 1
 fi
 
-# Определение minimized системы
-IS_MINIMIZED=false
-if command -v dpkg-query >/dev/null 2>&1; then
-    if dpkg-query -W -f='${Status}' ubuntu-minimal 2>/dev/null | grep -q "install ok installed"; then
-        if ! dpkg-query -W -f='${Status}' ubuntu-standard 2>/dev/null | grep -q "install ok installed"; then
-            IS_MINIMIZED=true
+# ============================================
+# УЛУЧШЕННОЕ ОПРЕДЕЛЕНИЕ MINIMIZED (4 признака)
+# ============================================
+detect_minimized() {
+    # Признак 1: файл excludes в dpkg (главный маркер минимизации Oracle/Ubuntu)
+    if [ -f /etc/dpkg/dpkg.cfg.d/excludes ]; then
+        if grep -qE "path-exclude" /etc/dpkg/dpkg.cfg.d/excludes 2>/dev/null; then
+            return 0
         fi
     fi
+
+    # Признак 2: файл маркера минимизации
+    if [ -f /etc/dpkg/origins/ubuntu-minimized ]; then
+        return 0
+    fi
+
+    # Признак 3: отсутствуют базовые утилиты (man И less одновременно)
+    if ! command -v man >/dev/null 2>&1 && ! command -v less >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Признак 4: через dpkg (классический метод)
+    if command -v dpkg-query >/dev/null 2>&1; then
+        if dpkg-query -W -f='${Status}' ubuntu-minimal 2>/dev/null | grep -q "install ok installed"; then
+            if ! dpkg-query -W -f='${Status}' ubuntu-standard 2>/dev/null | grep -q "install ok installed"; then
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+if detect_minimized; then
+    IS_MINIMIZED=true
+else
+    IS_MINIMIZED=false
 fi
 
 ARCH=$(uname -m)
@@ -81,7 +110,17 @@ ARCH=$(uname -m)
 print_info "ОС: $PRETTY_NAME"
 print_info "Версия: $UBUNTU_VERSION ($UBUNTU_CODENAME)"
 print_info "Архитектура: $ARCH"
-print_info "Вариант: $([ "$IS_MINIMIZED" = true ] && echo "MINIMIZED ⚠️" || echo "Standard ✓")"
+
+# Диагностика minimized для пользователя
+if [ "$IS_MINIMIZED" = true ]; then
+    print_warning "Вариант: MINIMIZED ⚠️"
+    [ -f /etc/dpkg/dpkg.cfg.d/excludes ] && print_info "  ├─ Найден /etc/dpkg/dpkg.cfg.d/excludes"
+    [ -f /etc/dpkg/origins/ubuntu-minimized ] && print_info "  ├─ Найден маркер минимизации"
+    ! command -v man >/dev/null 2>&1 && print_info "  ├─ Отсутствует команда man"
+    ! command -v less >/dev/null 2>&1 && print_info "  └─ Отсутствует команда less"
+else
+    print_success "Вариант: Standard (полная система) ✓"
+fi
 
 CURRENT_USER="${SUDO_USER:-root}"
 if [ "$CURRENT_USER" = "root" ]; then
@@ -663,45 +702,90 @@ HARDENING_EOF
 
             print_success "Настройки SSH применены"
 
-            # Отключение socket activation
+            # ============================================
+            # НАДЁЖНОЕ ПЕРЕКЛЮЧЕНИЕ НА КЛАССИЧЕСКИЙ SSH
+            # С ПОЛНЫМ daemon-reload И ПАУЗАМИ
+            # ============================================
             print_info "Настройка механизма запуска SSH..."
+
             if systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then
                 print_info "Обнаружен systemd socket activation — отключаем"
+
+                # Шаг 1: Полная остановка и отключение socket
+                print_info "Шаг 1: Остановка и отключение ssh.socket..."
                 systemctl stop ssh.socket 2>/dev/null || true
                 systemctl disable ssh.socket 2>/dev/null || true
-                systemctl mask ssh.socket
-                systemctl enable ssh.service
-                systemctl restart ssh.service
-                systemctl daemon-reload
-                print_success "ssh.socket замаскирован, классический сервис активирован"
-            else
-                systemctl restart ssh.service
-            fi
+                sleep 1
 
-            sleep 2
+                # Шаг 2: Удаляем ВСЕ автогенерируемые override от cloud-init
+                # Именно они вызывают конфликты порта!
+                print_info "Шаг 2: Удаление автогенерируемых override от cloud-init..."
+                if [ -d /run/systemd/generator/ssh.socket.d ]; then
+                    rm -rf /run/systemd/generator/ssh.socket.d
+                    print_success "Удалён /run/systemd/generator/ssh.socket.d"
+                fi
+                if [ -d /etc/systemd/system/ssh.socket.d ]; then
+                    rm -rf /etc/systemd/system/ssh.socket.d
+                    print_success "Удалён /etc/systemd/system/ssh.socket.d"
+                fi
+
+                # Шаг 3: Маскируем socket
+                print_info "Шаг 3: Маскировка ssh.socket..."
+                systemctl mask ssh.socket
+                print_success "ssh.socket замаскирован"
+
+                # Шаг 4: ПОЛНЫЙ СБРОС состояния systemd
+                print_info "Шаг 4: Полный сброс состояния systemd..."
+                systemctl daemon-reload
+                systemctl reset-failed 2>/dev/null || true
+                sleep 1
+
+                # Шаг 5: Полная остановка сервиса перед запуском
+                print_info "Шаг 5: Полная остановка ssh.service..."
+                systemctl stop ssh.service 2>/dev/null || true
+                sleep 2
+
+                # Шаг 6: Включение и запуск классического сервиса
+                print_info "Шаг 6: Включение и запуск ssh.service..."
+                systemctl enable ssh.service
+                systemctl start ssh.service
+
+                # Шаг 7: Пауза для полной инициализации
+                print_info "Шаг 7: Ожидание инициализации (5 секунд)..."
+                sleep 5
+
+                # Шаг 8: Финальный daemon-reload
+                print_info "Шаг 8: Финальный daemon-reload..."
+                systemctl daemon-reload
+                sleep 2
+
+                # Шаг 9: Проверка что порт реально слушается
+                print_info "Шаг 9: Проверка порта..."
+                if ss -tuln | grep -q ":$SSH_PORT "; then
+                    print_success "SSH слушает порт $SSH_PORT ✓"
+                else
+                    print_warning "Порт ещё не активен, ждём ещё 5 секунд..."
+                    sleep 5
+                    if ss -tuln | grep -q ":$SSH_PORT "; then
+                        print_success "SSH слушает порт $SSH_PORT ✓"
+                    else
+                        print_error "SSH НЕ слушает порт $SSH_PORT!"
+                        print_error "Попробуйте перезагрузить сервер после завершения скрипта"
+                        print_error "Диагностика: sudo journalctl -u ssh -n 30 --no-pager"
+                    fi
+                fi
+            else
+                print_info "Socket activation не используется — простой перезапуск"
+                systemctl daemon-reload
+                systemctl restart ssh.service
+                sleep 3
+            fi
 
             # Проверка синтаксиса
             if sshd -t; then
-                print_success "Синтаксис корректен. Перезапуск SSH..."
-                systemctl restart ssh
-                sleep 2
-
-                IPV4_OK=false
-                IPV6_OK=false
-                ss -tuln | grep -q "0.0.0.0:$SSH_PORT " && IPV4_OK=true
-                ss -tuln | grep -q "\[::\]:$SSH_PORT " && IPV6_OK=true
-
-                if [ "$IPV4_OK" = true ] && [ "$IPV6_OK" = true ]; then
-                    print_success "SSH слушает порт $SSH_PORT на IPv4 и IPv6 ✓"
-                elif [ "$IPV4_OK" = true ]; then
-                    print_success "SSH слушает порт $SSH_PORT на IPv4 ✓"
-                elif [ "$IPV6_OK" = true ]; then
-                    print_error "SSH слушает ТОЛЬКО IPv6!"
-                else
-                    print_error "SSH НЕ слушает порт $SSH_PORT!"
-                fi
+                print_success "Синтаксис sshd_config корректен ✓"
             else
-                print_error "ОШИБКА СИНТАКСИСА! Откатываем изменения..."
+                print_error "Ошибка синтаксиса! Откат..."
                 cp "$BACKUP_FILE" "$SSHD_CONFIG"
                 print_warning "Восстановлен оригинальный конфиг"
             fi
@@ -781,19 +865,20 @@ HARDENING_EOF
         LOCAL_BIN_PATH="/home/$CURRENT_USER/.local/bin"
     fi
 
-    cat > "$USER_HOME/.zshrc" << EOF
+    # Используем плейсхолдер + sed для надёжной подстановки пути
+    cat > "$USER_HOME/.zshrc" << 'EOF'
 # ============================================================
 # КРИТИЧЕСКИ ВАЖНО: PATH должен быть задан ДО всего остального!
 # Без этого на minimized системах команды не находятся
 # ============================================================
-export PATH="${LOCAL_BIN_PATH}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
+export PATH="__LOCAL_BIN_PATH__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 # Enable Powerlevel10k instant prompt
-if [[ -r "\${XDG_CACHE_HOME:-\$HOME/.cache}/p10k-instant-prompt-\${(%):-%n}.zsh" ]]; then
-  source "\${XDG_CACHE_HOME:-\$HOME/.cache}/p10k-instant-prompt-\${(%):-%n}.zsh"
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
 fi
 
-export ZSH="\$HOME/.oh-my-zsh"
+export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
 
 # ВАЖНО: БЕЗ плагина fzf из OMZ! Он ломает minimized системы
@@ -807,7 +892,7 @@ plugins=(
   docker
 )
 
-source \$ZSH/oh-my-zsh.sh
+source $ZSH/oh-my-zsh.sh
 
 # === Алиасы на современные утилиты ===
 alias cat="bat --paging=never"
@@ -841,45 +926,45 @@ alias sshcheck="sudo sshd -t && echo 'SSH config OK'"
 alias iotop="sudo iotop"
 alias ncdu="ncdu --color dark"
 
-# === FZF — УНИВЕРСАЛЬНЫЙ способ ===
+# === FZF — УНИВЕРСАЛЬНЫЙ способ (работает на всех Ubuntu) ===
 setup_fzf() {
   command -v fzf >/dev/null 2>&1 || return 0
 
   local fzf_ver
-  fzf_ver=\$(fzf --version 2>/dev/null | awk '{print \$1}')
+  fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
 
   # Если fzf >= 0.48.0 — встроенная интеграция
-  if [[ -n "\$fzf_ver" ]] && printf '%s\n%s' "0.48.0" "\$fzf_ver" | sort -V | head -n1 | grep -q "^0.48.0\$"; then
-    eval "\$(fzf --zsh 2>/dev/null)" && return 0
+  if [[ -n "$fzf_ver" ]] && printf '%s\n%s' "0.48.0" "$fzf_ver" | sort -V | head -n1 | grep -q "^0.48.0$"; then
+    eval "$(fzf --zsh 2>/dev/null)" && return 0
   fi
 
-  # Пробуем файлы примеров
+  # Пробуем файлы примеров в разных местах
   local fzf_paths=(
     "/usr/share/doc/fzf/examples/key-bindings.zsh"
     "/usr/share/fzf/key-bindings.zsh"
     "/usr/local/share/fzf/key-bindings.zsh"
   )
-  for path in "\${fzf_paths[@]}"; do
-    if [[ -f "\$path" ]]; then
-      source "\$path" 2>/dev/null
-      local comp="\${path%/*}/completion.zsh"
-      [[ -f "\$comp" ]] && source "\$comp" 2>/dev/null
+  for path in "${fzf_paths[@]}"; do
+    if [[ -f "$path" ]]; then
+      source "$path" 2>/dev/null
+      local comp="${path%/*}/completion.zsh"
+      [[ -f "$comp" ]] && source "$comp" 2>/dev/null
       return 0
     fi
   done
 
   # Fallback: скачиваем с GitHub (абсолютные пути для надёжности)
   local tmp
-  tmp=\$(/bin/mktemp 2>/dev/null || echo "/tmp/fzf_kb_\$\$")
-  /usr/bin/curl -fsSL https://raw.githubusercontent.com/junegunn/fzf/master/shell/key-bindings.zsh -o "\$tmp" 2>/dev/null && source "\$tmp" 2>/dev/null
-  /bin/rm -f "\$tmp" 2>/dev/null
+  tmp=$(/bin/mktemp 2>/dev/null || echo "/tmp/fzf_kb_$$")
+  /usr/bin/curl -fsSL https://raw.githubusercontent.com/junegunn/fzf/master/shell/key-bindings.zsh -o "$tmp" 2>/dev/null && source "$tmp" 2>/dev/null
+  /bin/rm -f "$tmp" 2>/dev/null
 }
 setup_fzf
 unfunction setup_fzf 2>/dev/null || unset -f setup_fzf
 
 # === Zoxide (умный cd) ===
 if command -v zoxide >/dev/null 2>&1; then
-  eval "\$(zoxide init zsh)"
+  eval "$(zoxide init zsh)"
 else
   alias z="cd"
 fi
@@ -888,7 +973,9 @@ fi
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
 EOF
 
-    print_success ".zshrc создан"
+    # Подставляем реальный путь вместо плейсхолдера
+    sed -i "s|__LOCAL_BIN_PATH__|${LOCAL_BIN_PATH}|g" "$USER_HOME/.zshrc"
+    print_success ".zshrc создан с правильным PATH"
 
     # --- 2.21 Права доступа ---
     print_section "2.21 ПРАВА ДОСТУПА"
@@ -901,28 +988,24 @@ EOF
     # --- 2.22 Финальная проверка ---
     print_section "2.22 ФИНАЛЬНАЯ ПРОВЕРКА"
 
-    # SSH порт
     if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
         print_success "SSH слушает порт $SSH_PORT на IPv4 ✓"
     else
         print_error "SSH НЕ слушает порт $SSH_PORT на IPv4! ⚠️"
     fi
 
-    # IPv6
     if ss -tuln | grep -q "\[::\]:$SSH_PORT "; then
         print_success "SSH слушает порт $SSH_PORT на IPv6 ✓"
     else
         print_warning "SSH НЕ слушает порт $SSH_PORT на IPv6"
     fi
 
-    # SSH сервис
     if systemctl is-active --quiet ssh; then
         print_success "SSH сервис активен ✓"
     else
         print_error "SSH сервис НЕ активен! ⚠️"
     fi
 
-    # ssh.socket
     SOCKET_STATE=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
     if [[ "$SOCKET_STATE" == "masked" ]]; then
         print_success "ssh.socket замаскирован ✓"
@@ -932,7 +1015,6 @@ EOF
         print_error "ssh.socket ВКЛЮЧЁН!"
     fi
 
-    # PasswordAuthentication
     PASS_AUTH_FINAL=$(grep -E "^PasswordAuthentication" "$SSHD_CONFIG" | tail -1 || true)
     if [[ "$PASS_AUTH_FINAL" == *"no"* ]]; then
         print_success "PasswordAuthentication отключён ✓"
@@ -940,7 +1022,6 @@ EOF
         print_warning "PasswordAuthentication включён ⚠️"
     fi
 
-    # UFW
     if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
         print_success "UFW активен ✓"
     else
@@ -953,7 +1034,6 @@ EOF
 
     print_success "ЧАСТЬ 2 ЗАВЕРШЕНА!"
 
-    # Финальное сообщение
     echo ""
     echo "=========================================="
     print_success "Настройка завершена!"

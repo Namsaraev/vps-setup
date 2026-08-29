@@ -68,25 +68,19 @@ fi
 
 # ============================================
 # УЛУЧШЕННОЕ ОПРЕДЕЛЕНИЕ MINIMIZED (4 признака)
-# Работает на Oracle Cloud ARM, стандартных VPS,
-# minimized Ubuntu и обычных системах
 # ============================================
 detect_minimized() {
-    # Признак 1: файл excludes в dpkg (главный маркер минимизации Oracle/Ubuntu)
     if [ -f /etc/dpkg/dpkg.cfg.d/excludes ]; then
         if grep -qE "path-exclude" /etc/dpkg/dpkg.cfg.d/excludes 2>/dev/null; then
             return 0
         fi
     fi
-    # Признак 2: файл маркера минимизации
     if [ -f /etc/dpkg/origins/ubuntu-minimized ]; then
         return 0
     fi
-    # Признак 3: отсутствуют базовые утилиты (man И less одновременно)
     if ! command -v man >/dev/null 2>&1 && ! command -v less >/dev/null 2>&1; then
         return 0
     fi
-    # Признак 4: через dpkg (классический метод)
     if command -v dpkg-query >/dev/null 2>&1; then
         if dpkg-query -W -f='${Status}' ubuntu-minimal 2>/dev/null | grep -q "install ok installed"; then
             if ! dpkg-query -W -f='${Status}' ubuntu-standard 2>/dev/null | grep -q "install ok installed"; then
@@ -354,12 +348,72 @@ part2_setup() {
 
     print_success "Базовые утилиты установлены"
 
-    # --- 2.5 Установка Zoxide (официальный способ) ---
+    # --- 2.5 Установка Zoxide (ИСПРАВЛЕННАЯ ВЕРСИЯ) ---
     print_section "2.5 УСТАНОВКА ZOXIDE"
     if ! command -v zoxide >/dev/null 2>&1; then
-        print_info "Установка zoxide через официальный установщик..."
-        curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash -s -- --install-dir /usr/local/bin
-        print_success "zoxide установлен в /usr/local/bin"
+        print_info "Установка zoxide..."
+        ZOXIDE_INSTALLED=false
+
+        # Способ 1: официальный установщик (без --install-dir, т.к. флаг удалён)
+        print_info "Способ 1: официальный установщик..."
+        if [ "$CURRENT_USER" = "root" ]; then
+            curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash 2>/dev/null
+        else
+            sudo -u "$CURRENT_USER" bash -c 'curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | bash' 2>/dev/null
+        fi
+
+        # Установщик ставит в ~/.local/bin, копируем в /usr/local/bin для всех
+        if [ "$CURRENT_USER" = "root" ]; then
+            [ -f "/root/.local/bin/zoxide" ] && cp /root/.local/bin/zoxide /usr/local/bin/zoxide && chmod +x /usr/local/bin/zoxide
+        else
+            [ -f "/home/$CURRENT_USER/.local/bin/zoxide" ] && cp "/home/$CURRENT_USER/.local/bin/zoxide" /usr/local/bin/zoxide && chmod +x /usr/local/bin/zoxide
+        fi
+
+        if command -v zoxide >/dev/null 2>&1 || [ -x /usr/local/bin/zoxide ]; then
+            ZOXIDE_INSTALLED=true
+            print_success "Способ 1: zoxide установлен через официальный установщик"
+        else
+            print_warning "Способ 1 не сработал, пробуем способ 2..."
+        fi
+
+        # Способ 2: прямое скачивание бинарника с GitHub releases
+        if [ "$ZOXIDE_INSTALLED" = false ]; then
+            print_info "Способ 2: скачивание бинарника с GitHub..."
+            ZOXIDE_VERSION="0.9.6"
+            case "$ARCH" in
+                x86_64)  ZOXIDE_ARCH="x86_64-unknown-linux-musl" ;;
+                aarch64) ZOXIDE_ARCH="aarch64-unknown-linux-musl" ;;
+                arm64)   ZOXIDE_ARCH="aarch64-unknown-linux-musl" ;;
+                *)       ZOXIDE_ARCH="x86_64-unknown-linux-musl" ;;
+            esac
+            ZOXIDE_URL="https://github.com/ajeetdsouza/zoxide/releases/download/v${ZOXIDE_VERSION}/zoxide-${ZOXIDE_VERSION}-${ZOXIDE_ARCH}.tar.gz"
+            print_info "URL: $ZOXIDE_URL"
+
+            if curl -fsSL "$ZOXIDE_URL" -o /tmp/zoxide.tar.gz 2>/dev/null; then
+                if tar xzf /tmp/zoxide.tar.gz -C /usr/local/bin zoxide 2>/dev/null; then
+                    chmod +x /usr/local/bin/zoxide
+                    rm -f /tmp/zoxide.tar.gz
+                    ZOXIDE_INSTALLED=true
+                    print_success "Способ 2: zoxide установлен из бинарника"
+                else
+                    rm -f /tmp/zoxide.tar.gz
+                    print_error "Не удалось распаковать архив"
+                fi
+            else
+                print_error "Не удалось скачать архив"
+            fi
+        fi
+
+        # Финальная проверка
+        if command -v zoxide >/dev/null 2>&1; then
+            print_success "zoxide проверен: $(zoxide --version)"
+        elif [ -x /usr/local/bin/zoxide ]; then
+            print_success "zoxide установлен в /usr/local/bin: $(/usr/local/bin/zoxide --version)"
+        else
+            print_error "zoxide НЕ установлен!"
+            print_warning "Установите вручную: https://github.com/ajeetdsouza/zoxide"
+            print_warning "Или выполните: cargo install zoxide --locked"
+        fi
     else
         print_info "zoxide уже установлен: $(zoxide --version)"
     fi
@@ -895,9 +949,11 @@ HARDENING_EOF
 
     # ============================================
     # ГЕНЕРАЦИЯ .zshrc
-    # КРИТИЧЕСКИ ВАЖНО: PATH устанавливается ДО instant prompt
-    # и setup_fzf НЕ использует переменную `path` (она специальная в zsh!)
-    # Без абсолютных путей (используем $PATH корректно)
+    # КРИТИЧЕСКИ ВАЖНО:
+    # 1. PATH устанавливается ДО instant prompt p10k
+    # 2. setup_fzf НЕ использует переменную `path` (специальная в zsh!)
+    # 3. zoxide проверяется перед использованием
+    # 4. Подавляем warning p10k через POWERLEVEL9K_INSTANT_PROMPT=quiet
     # ============================================
     TMP_ZSHRC=$(mktemp)
     cat > "$TMP_ZSHRC" << 'ZSHRC_TEMPLATE'
@@ -911,6 +967,9 @@ export PATH="__LOCAL_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sb
 if ! command -v uname >/dev/null 2>&1; then
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 fi
+
+# Подавляем warning p10k о console output (ДОБАВЛЕНО)
+typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet
 
 # Powerlevel10k instant prompt (ПОСЛЕ установки PATH!)
 if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
@@ -967,10 +1026,8 @@ alias sshcheck="sudo sshd -t && echo 'SSH config OK'"
 alias iotop="sudo iotop"
 alias ncdu="ncdu --color dark"
 
-# === FZF — ИСПРАВЛЕННАЯ ВЕРСИЯ (без абсолютных путей) ===
+# === FZF — ИСПРАВЛЕННАЯ ВЕРСИЯ ===
 # КРИТИЧЕСКИ ВАЖНО: НЕ используем переменную `path` — она специальная в zsh!
-# В zsh `path` автоматически синхронизирована с `PATH`, и её перезапись
-# в цикле for ломает PATH для всей сессии.
 # Используем безопасные имена: fzf_file, fzf_search_paths, fzf_tmp, fzf_comp
 setup_fzf() {
   command -v fzf >/dev/null 2>&1 || return 0
@@ -1011,14 +1068,12 @@ setup_fzf
 unfunction setup_fzf 2>/dev/null || unset -f setup_fzf
 
 # === Zoxide (умный cd) ===
+# ИСПРАВЛЕНО: проверяем наличие ДО использования!
 if command -v zoxide >/dev/null 2>&1; then
   eval "$(zoxide init zsh)"
 else
   alias z="cd"
 fi
-
-# Подавляем warning p10k о console output
-typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet
 
 # === Powerlevel10k config ===
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
@@ -1034,7 +1089,7 @@ ZSHRC_TEMPLATE
         chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc" 2>/dev/null || true
     fi
     chmod 644 "$USER_HOME/.zshrc"
-    print_success ".zshrc создан для $CURRENT_USER (без абсолютных путей)"
+    print_success ".zshrc создан для $CURRENT_USER"
 
     # ============================================
     # 2.20 ФИНАЛЬНАЯ ПРОВЕРКА
@@ -1079,6 +1134,13 @@ ZSHRC_TEMPLATE
         print_success "UFW активен ✓"
     else
         print_warning "UFW НЕ активен"
+    fi
+
+    # Проверка zoxide
+    if command -v zoxide >/dev/null 2>&1 || [ -x /usr/local/bin/zoxide ]; then
+        print_success "zoxide установлен ✓"
+    else
+        print_warning "zoxide НЕ установлен — алиас z будет работать как cd"
     fi
 
     if [ "$IS_MINIMIZED" = true ]; then

@@ -401,33 +401,116 @@ configure_shell() {
   done
 
   cat > "$USER_HOME/.zshrc" <<'EOF'
+# PATH — до P10K и Oh My Zsh.
 export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet
 if [[ -r "$HOME/.cache/p10k-instant-prompt-$USER.zsh" ]]; then
   source "$HOME/.cache/p10k-instant-prompt-$USER.zsh"
 fi
+
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
-plugins=(git zsh-autosuggestions zsh-syntax-highlighting zsh-completions sudo extract)
+plugins=(
+  git
+  zsh-autosuggestions
+  zsh-completions
+  sudo
+  extract
+  zsh-syntax-highlighting
+)
 source "$ZSH/oh-my-zsh.sh"
 
-# Первый интерактивный вход запускает мастер P10K, если конфигурации ещё нет.
+# Первый интерактивный вход запускает мастер P10K.
 if [[ -o interactive && ! -r "$HOME/.p10k.zsh" ]] && (( $+functions[p10k] )); then
   p10k configure
 fi
 
-alias cat='bat --paging=never'
-alias ls='eza --icons'
-alias ll='eza -la --icons --git'
-alias grep='rg'
-alias fd='fd'
+# === Алиасы для установленных утилит ===
+if (( $+commands[bat] )); then
+  alias cat='bat --paging=never'
+fi
+if (( $+commands[eza] )); then
+  alias ls='eza --icons'
+  alias ll='eza -la --icons --git'
+  alias lt='eza --tree --icons --level=2'
+fi
+if (( $+commands[rg] )); then
+  alias grep='rg'
+fi
+if (( $+commands[fd] )); then
+  alias fd='fd'
+fi
+if (( $+commands[btop] )); then
+  alias top='btop'
+fi
+
+alias ..='cd ..'
+alias ...='cd ../..'
 alias ports='ss -tulnp'
+alias listen='ss -ltnup'
+alias myip='curl -s ifconfig.me'
+alias h='history'
+alias hg='history | grep'
 alias reload='source ~/.zshrc'
-if command -v zoxide >/dev/null 2>&1; then
+alias dfh='df -hT'
+alias mem='free -h'
+alias update='sudo apt update && sudo apt upgrade'
+
+# UFW и SSH
+alias ufwv='sudo ufw status verbose'
+alias ufwn='sudo ufw status numbered'
+alias ufwl='sudo journalctl -u ufw -n 50 --no-pager'
+alias sshlog='sudo journalctl -u ssh -n 50 --no-pager'
+alias sshcheck='sudo sshd -t && echo "SSH config OK"'
+
+# Мониторинг
+alias iotop='sudo iotop'
+alias ncdu='ncdu --color dark'
+
+# === FZF ===
+# Ctrl+R: история команд; Ctrl+T: поиск файлов; Alt+C: переход в каталог.
+setup_fzf() {
+  (( $+commands[fzf] )) || return 0
+
+  # В новых версиях fzf эта команда сразу задаёт Ctrl+R, Ctrl+T и Alt+C.
+  if fzf --zsh >/dev/null 2>&1; then
+    eval "$(fzf --zsh)"
+    return 0
+  fi
+
+  # Совместимость с пакетами fzf из Ubuntu 24.04/26.04.
+  local fzf_paths=(
+    "/usr/share/doc/fzf/examples/key-bindings.zsh"
+    "/usr/share/fzf/key-bindings.zsh"
+    "/usr/local/share/fzf/key-bindings.zsh"
+  )
+  local fzf_file
+  for fzf_file in "${fzf_paths[@]}"; do
+    if [[ -r "$fzf_file" ]]; then
+      source "$fzf_file"
+      local fzf_completion="${fzf_file%/*}/completion.zsh"
+      [[ -r "$fzf_completion" ]] && source "$fzf_completion"
+      return 0
+    fi
+  done
+  print -P "%F{yellow}[WARN]%f fzf установлен, но его zsh key-bindings не найдены"
+}
+setup_fzf
+unfunction setup_fzf 2>/dev/null
+
+if (( $+commands[fd] )); then
+  export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+  export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+fi
+
+# Zoxide добавляет команду z; обычный cd не переопределяется.
+if (( $+commands[zoxide] )); then
   eval "$(zoxide init zsh)"
 fi
+
 [[ ! -r "$HOME/.p10k.zsh" ]] || source "$HOME/.p10k.zsh"
-EOF
+EOFEOF
   chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc"
   chmod 644 "$USER_HOME/.zshrc"
   ok "Zsh и P10K настроены для $CURRENT_USER"

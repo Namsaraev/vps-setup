@@ -133,6 +133,15 @@ install_packages() {
     bat fd-find ripgrep fzf python3 python3-pip python3-venv build-essential \
     btop mtr-tiny iperf3 zsh sysbench ca-certificates gnupg \
     ncdu iotop ufw unattended-upgrades needrestart locales
+  
+  # rng-tools5 только при наличии аппаратного RNG
+  if [ -e /dev/hwrng ]; then
+    info "Обнаружен /dev/hwrng — устанавливаем rng-tools5"
+    apt-get install -y rng-tools5
+  else
+    info "Аппаратный RNG не обнаружен — rng-tools5 не требуется"
+  fi
+  
   for package in eza zoxide; do
     if apt-cache show "$package" >/dev/null 2>&1; then
       apt-get install -y "$package"
@@ -150,6 +159,53 @@ configure_locale_time() {
   locale-gen ru_RU.UTF-8 en_US.UTF-8
   update-locale LANG=ru_RU.UTF-8
   ok "Часовой пояс и локаль настроены"
+}
+
+configure_unattended_upgrades() {
+  section "АВТО-ОБНОВЛЕНИЯ БЕЗОПАСНОСТИ"
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+  
+  # Проверка и включение timer'ов
+  local timers_ok=true
+  for timer in apt-daily.timer apt-daily-upgrade.timer; do
+    if ! systemctl is-enabled "$timer" >/dev/null 2>&1; then
+      systemctl enable "$timer" 2>/dev/null || timers_ok=false
+    fi
+  done
+  
+  if [ "$timers_ok" = true ]; then
+    ok "Авто-обновления безопасности включены"
+  else
+    warn "Не удалось включить некоторые timer'ы; проверьте: systemctl list-timers"
+  fi
+}
+
+configure_needrestart() {
+  section "NEEDRESTART (ПЕРЕЗАПУСК СЛУЖБ ПОСЛЕ ОБНОВЛЕНИЙ)"
+  info "needrestart установлен в режиме отчёта (без автоперезапуска)"
+  info "Это безопасно: службы не будут перезапускаться автоматически"
+  info "Для включения автоматического режима выполните:"
+  info "  sudo sed -i 's/#\\\$nrconf{restart} =.*/\\\$nrconf{restart} = \"a\";/' /etc/needrestart/needrestart.conf"
+  
+  local answer
+  ask "Включить автоматический перезапуск служб после обновлений? [y/N]: " answer
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    warn "ВНИМАНИЕ: Автоматический перезапуск может прервать активные соединения"
+    ask "Вы уверены? Это может остановить SSH, nginx, БД [y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      sed -i 's/#\$nrconf{restart} =.*/\$nrconf{restart} = "a";/' /etc/needrestart/needrestart.conf 2>/dev/null || true
+      ok "Автоматический перезапуск включён"
+    else
+      info "Оставлен режим отчёта"
+    fi
+  else
+    ok "Оставлен режим отчёта (безопасно)"
+  fi
 }
 
 configure_safe_sysctl() {
@@ -276,6 +332,7 @@ configure_pin() {
   chmod 700 "$sshdir"; chmod 600 "$keys"
   ok "Ключ для $PIN_USER установлен"
 }
+
 configure_ufw() {
   section "UFW"
   local answer action source_ip
@@ -378,6 +435,7 @@ EOF
   fi
   sshd -T | grep -E '^(port|passwordauthentication|permitrootlogin|clientaliveinterval) '
 }
+
 as_current_user() {
   sudo -H -u "$CURRENT_USER" env HOME="$USER_HOME" "$@"
 }
@@ -517,16 +575,106 @@ EOF
   info "После нового SSH-входа под $CURRENT_USER мастер P10K стартует автоматически."
 }
 
+final_check() {
+  section "ФИНАЛЬНАЯ ПРОВЕРКА"
+  
+  # SSH порт (проверяем и socket, и service)
+  if ss -ltn | grep -qE "[:.]$SSH_PORT[[:space:]]"; then
+    ok "SSH слушает порт $SSH_PORT ✓"
+  else
+    error "SSH НЕ слушает порт $SSH_PORT! ⚠️"
+  fi
+  
+  # SSH активен (service или socket)
+  if systemctl is-active --quiet ssh.service || systemctl is-active --quiet ssh.socket; then
+    ok "SSH активен (service или socket) ✓"
+  else
+    error "SSH НЕ активен! ⚠️"
+  fi
+  
+  # Проверка синтаксиса sshd_config
+  if sshd -t 2>/dev/null; then
+    ok "Синтаксис sshd_config корректен ✓"
+  else
+    error "Ошибка синтаксиса sshd_config! ⚠️"
+  fi
+  
+  # PasswordAuthentication через sshd -T (итоговая конфигурация)
+  local pass_auth
+  pass_auth=$(sshd -T 2>/dev/null | grep '^passwordauthentication' | awk '{print $2}')
+  if [ "$pass_auth" = "no" ]; then
+    ok "PasswordAuthentication отключён (итоговая конфигурация) ✓"
+  else
+    warn "PasswordAuthentication: $pass_auth ⚠️"
+  fi
+  
+  # BBR
+  local bbr
+  bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "none")
+  if [ "$bbr" = "bbr" ]; then
+    ok "BBR включён ✓"
+  else
+    warn "BBR не включён (текущий: $bbr)"
+  fi
+  
+  # Swap
+  if swapon --show --noheadings | grep -q .; then
+    ok "Swap настроен ✓"
+  else
+    info "Swap не настроен (RAM > ${SWAP_RAM_THRESHOLD_MB}MB)"
+  fi
+  
+  # UFW
+  if command -v ufw >/dev/null 2>&1; then
+    if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
+      ok "UFW активен ✓"
+    else
+      warn "UFW НЕ активен"
+    fi
+  else
+    warn "UFW не установлен"
+  fi
+  
+  # Zoxide
+  if command -v zoxide >/dev/null 2>&1; then
+    ok "zoxide установлен ✓"
+  else
+    warn "zoxide НЕ установлен — алиас z будет работать как cd"
+  fi
+  
+  # Powerlevel10k (проверяем каталог темы)
+  if [ -d "$USER_HOME/.oh-my-zsh/custom/themes/powerlevel10k" ]; then
+    ok "Powerlevel10k установлен ✓"
+  else
+    warn "Powerlevel10k не найден"
+  fi
+  
+  # .zshrc
+  if [ -f "$USER_HOME/.zshrc" ]; then
+    ok ".zshrc создан для $CURRENT_USER ✓"
+  else
+    error ".zshrc НЕ найден! ⚠️"
+  fi
+  
+  # Minimized
+  if [ "$IS_MINIMIZED" = true ]; then
+    warn "⚠️  Система осталась в minimized состоянии"
+  fi
+}
+
 part2_setup() {
   section "ЧАСТЬ 2: ОКРУЖЕНИЕ"
   configure_locale_time
   install_packages
+  configure_unattended_upgrades
+  configure_needrestart
   configure_safe_sysctl
   configure_swap
   configure_pin
   configure_ufw
   configure_ssh
   configure_shell
+  final_check
   ok "Часть 2 завершена"
 }
 
@@ -558,6 +706,7 @@ part3_tests() {
     *) warn "Неверный выбор" ;;
   esac
 }
+
 while true; do
   echo
   echo "1) Первое обновление / unminimize"

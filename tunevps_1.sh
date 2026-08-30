@@ -1,1019 +1,577 @@
-#!/bin/bash
-
-set -e
-
-# Отключаем интерактивные запросы debconf (КРИТИЧЕСКИ ВАЖНО для автоматизации)
+#!/usr/bin/env bash
+# tunevps.sh — первичная настройка Ubuntu VPS
+# Запускайте: sudo bash tunevps.sh
+set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-# ============================================
-# НАСТРОЙКИ (меняйте здесь)
-# ============================================
-SSH_PORT=5829          # Ваш нестандартный порт SSH
-NEW_USER="pin"         # Имя создаваемого пользователя
+SSH_PORT=5829
+PIN_USER="pin"
+SWAP_RAM_THRESHOLD_MB=2048
+SWAP_SIZE="2G"
+P10K_REPOSITORY="https://github.com/romkatv/powerlevel10k.git"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+info() { echo -e "$BLUE[INFO]$NC $*"; }
+ok() { echo -e "$GREEN[OK]$NC $*"; }
+warn() { echo -e "$YELLOW[WARN]$NC $*"; }
+error() { echo -e "$RED[ERROR]$NC $*" >&2; }
+section() { echo -e "\n$CYAN========== $* ==========$NC"; }
 
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-print_section() { echo -e "\n${CYAN}========== $1 ==========${NC}"; }
-
-# Функция для интерактивного ввода (работает даже через pipe)
-ask_input() {
-    local prompt="$1"
-    local var_name="$2"
-    echo -n "$prompt" > /dev/tty
-    read -r "$var_name" < /dev/tty
-}
-
-# Функция для скрытого ввода пароля
+ask() { echo -n "$1" > /dev/tty; read -r "$2" < /dev/tty; }
 ask_password() {
-    local prompt="$1"
-    local var_name="$2"
-    read -s -p "$prompt" "$var_name" < /dev/tty
-    echo "" > /dev/tty
+  local prompt="$1" variable="$2"
+  printf '%s' "$prompt" > /dev/tty
+  IFS= read -r -s "$variable" < /dev/tty
+  printf '\n' > /dev/tty
+}
+set_pin_password() {
+  local password password_confirm
+  while true; do
+    ask_password "Введите пароль для $PIN_USER: " password
+    ask_password "Повторите пароль: " password_confirm
+    if [ -z "$password" ]; then
+      warn "Пароль не может быть пустым"
+    elif [ "$password" != "$password_confirm" ]; then
+      warn "Пароли не совпадают"
+    elif printf '%s:%s\n' "$PIN_USER" "$password" | chpasswd; then
+      unset password password_confirm
+      ok "Пароль для $PIN_USER установлен"
+      return 0
+    else
+      unset password password_confirm
+      error "Не удалось установить пароль; попробуйте ещё раз"
+    fi
+  done
+}
+pause() { local v; ask "Нажмите Enter для продолжения..." v; }
+yes_by_default() { [[ -z "$1" || "$1" =~ ^[Yy]$ ]]; }
+
+if [ "$EUID" -ne 0 ]; then
+  exec sudo bash "$0" "$@"
+fi
+
+# Это именно пользователь, который вызвал sudo, а не root.
+CURRENT_USER="$SUDO_USER"
+[ -n "$CURRENT_USER" ] || CURRENT_USER=root
+if ! id "$CURRENT_USER" >/dev/null 2>&1; then
+  error "Не удалось определить пользователя, запустившего скрипт"
+  exit 1
+fi
+USER_HOME="$(getent passwd "$CURRENT_USER" | cut -d: -f6)"
+if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+  error "Не найдена домашняя директория пользователя $CURRENT_USER"
+  exit 1
+fi
+
+. /etc/os-release
+case "$ID" in
+  ubuntu) ;;
+  *) error "Поддерживается только Ubuntu, обнаружено: $PRETTY_NAME"; exit 1 ;;
+esac
+ARCH="$(uname -m)"
+info "Ubuntu $VERSION_ID ($VERSION_CODENAME), $ARCH"
+info "Окружение будет настроено для $CURRENT_USER: $USER_HOME"
+
+detect_minimized() {
+  # ubuntu-minimized origin может оставаться после unminimize, поэтому
+  # он не является достаточным признаком. Главный критерий — ubuntu-standard.
+  dpkg-query -W -f='${db:Status-Status}' ubuntu-standard 2>/dev/null | grep -qx installed && return 1
+  [ -f /etc/dpkg/dpkg.cfg.d/excludes ] && grep -q 'path-exclude' /etc/dpkg/dpkg.cfg.d/excludes && return 0
+  ! command -v man >/dev/null 2>&1 && ! command -v less >/dev/null 2>&1
+}
+IS_MINIMIZED=false
+detect_minimized && IS_MINIMIZED=true
+
+part1_update() {
+  section "ЧАСТЬ 1: ОБНОВЛЕНИЕ И UNMINIMIZE"
+  if [ "$IS_MINIMIZED" = true ]; then
+    warn "Обнаружена Ubuntu minimized"
+    local answer
+    ask "Преобразовать в обычную Ubuntu через unminimize? [Y/n]: " answer
+    if yes_by_default "$answer"; then
+      apt-get update
+      if ! command -v unminimize >/dev/null 2>&1; then
+        apt-get install -y unminimize
+      fi
+      # При pipefail команда yes получает SIGPIPE, когда unminimize закончил чтение.
+      # Поэтому берём код именно unminimize, а затем проверяем реальное состояние.
+      set +o pipefail
+      yes | unminimize
+      unminimize_status="${PIPESTATUS[1]}"
+      set -o pipefail
+      if [ "$unminimize_status" -eq 0 ] || ! detect_minimized; then
+        IS_MINIMIZED=false
+        ok "unminimize завершён"
+      else
+        error "unminimize завершился с кодом $unminimize_status"
+        warn "Проверьте: dpkg-query -W ubuntu-standard; cat /etc/dpkg/dpkg.cfg.d/excludes"
+        return 1
+      fi
+    fi
+  fi
+
+  apt-get update
+  apt-get upgrade -y
+  apt-get autoremove -y
+  ok "Пакеты обновлены"
+  local answer
+  ask "Перезагрузить сервер сейчас? [Y/n]: " answer
+  if yes_by_default "$answer"; then
+    warn "Перезагрузка через 5 секунд"
+    sleep 5
+    reboot
+  else
+    info "Перезагрузка отложена по вашему выбору"
+  fi
 }
 
-# Автоматический перезапуск через sudo
-if [ "$EUID" -ne 0 ]; then
-    print_info "Требуются права root. Перезапускаем скрипт через sudo..."
-    exec sudo bash "$0" "$@"
-fi
-
-# ============================================
-# ОПРЕДЕЛЕНИЕ ВЕРСИИ UBUNTU
-# ============================================
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    UBUNTU_VERSION="$VERSION_ID"
-    UBUNTU_CODENAME="$VERSION_CODENAME"
-else
-    print_error "Не удалось определить версию ОС. Скрипт поддерживает только Ubuntu."
-    exit 1
-fi
-
-print_info "Скрипт запущен от имени root"
-print_info "Обнаружена ОС: $PRETTY_NAME (версия: $UBUNTU_VERSION, кодовое имя: $UBUNTU_CODENAME)"
-
-CURRENT_USER="${SUDO_USER:-root}"
-if [ "$CURRENT_USER" = "root" ]; then
-    USER_HOME="/root"
-else
-    USER_HOME="/home/$CURRENT_USER"
-fi
-
-print_info "Настройка будет выполнена для пользователя: $CURRENT_USER"
-print_info "SSH порт: $SSH_PORT"
-print_info "Новый пользователь: $NEW_USER"
-echo ""
-
-# ============================================
-# 1. ОБНОВЛЕНИЕ СИСТЕМЫ
-# ============================================
-print_section "1. ОБНОВЛЕНИЕ СИСТЕМЫ"
-print_info "Обновление системы..."
-apt-get update -y
-apt-get upgrade -y
-apt-get autoremove -y
-print_success "Система обновлена"
-
-# ============================================
-# 2. ЧАСОВОЙ ПОЯС
-# ============================================
-print_section "2. ЧАСОВОЙ ПОЯС"
-print_info "Настройка часового пояса: Asia/Irkutsk"
-timedatectl set-timezone Asia/Irkutsk
-print_success "Часовой пояс установлен: $(LC_ALL=C timedatectl | grep 'Time zone')"
-
-# ============================================
-# 3. ЛОКАЛЬ
-# ============================================
-print_section "3. ЛОКАЛЬ"
-print_info "Настройка русской локали..."
-apt-get install -y language-pack-ru
-locale-gen ru_RU.UTF-8
-update-locale LANG=ru_RU.UTF-8
-# Опционально: настраиваем отдельные категории
-update-locale LC_MESSAGES=ru_RU.UTF-8
-update-locale LC_TIME=ru_RU.UTF-8
-print_success "Русская локаль установлена"
-
-# ============================================
-# 4. БАЗОВЫЕ УТИЛИТЫ
-# ============================================
-print_section "4. БАЗОВЫЕ УТИЛИТЫ"
-print_info "Установка базовых утилит..."
-apt-get install -y \
-    nano git curl wget unzip jq htop tmux net-tools dnsutils \
-    bat eza fd-find ripgrep zoxide fzf \
-    python3 python3-pip python3-venv build-essential \
-    btop mtr iperf3 zsh
-print_success "Базовые утилиты установлены"
-
-# ============================================
-# 5. СИМЛИНКИ
-# ============================================
-print_section "5. СИМЛИНКИ"
-print_info "Создание симлинков для bat и fd..."
-ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
-ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
-print_success "Симлинки созданы"
-
-# ============================================
-# 6. SUDOERS (NOPASSWD)
-# ============================================
-print_section "6. SUDOERS"
-print_info "Настройка sudoers для команд без пароля..."
-SUDOERS_LINE="$CURRENT_USER ALL=(ALL) NOPASSWD: /usr/sbin/ufw, /usr/bin/journalctl"
-if grep -q "$SUDOERS_LINE" /etc/sudoers 2>/dev/null; then
-    print_warning "Правило sudoers уже существует"
-else
-    echo "$SUDOERS_LINE" | EDITOR='tee -a' visudo > /dev/null
-    print_success "Sudoers настроен"
-fi
-
-# ============================================
-# 7. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ С ПАРОЛЕМ
-# ============================================
-print_section "7. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ"
-print_info "Проверка пользователя $NEW_USER..."
-
-SET_PASSWORD=false
-
-if id -u "$NEW_USER" &>/dev/null; then
-    print_info "Пользователь $NEW_USER уже существует"
-    
-    PASS_STATUS=$(passwd -S "$NEW_USER" | awk '{print $2}')
-    if [[ "$PASS_STATUS" == "P" ]]; then
-        print_info "Пароль для $NEW_USER уже задан"
-        ask_input "Заменить пароль для $NEW_USER? [y/N]: " CHANGE_PASS
-        if [[ "$CHANGE_PASS" =~ ^[Yy]$ ]]; then
-            SET_PASSWORD=true
-        else
-            print_info "Пароль оставляем без изменений"
-        fi
+install_packages() {
+  section "БАЗОВЫЕ ПАКЕТЫ"
+  apt-get update
+  apt-get install -y nano git curl wget unzip jq htop tmux net-tools dnsutils \
+    bat fd-find ripgrep fzf python3 python3-pip python3-venv build-essential \
+    btop mtr-tiny iperf3 zsh sysbench ca-certificates gnupg \
+    ncdu iotop ufw unattended-upgrades needrestart locales
+  for package in eza zoxide; do
+    if apt-cache show "$package" >/dev/null 2>&1; then
+      apt-get install -y "$package"
     else
-        print_warning "Пароль для $NEW_USER НЕ задан!"
-        SET_PASSWORD=true
+      warn "Пакет $package отсутствует в этом репозитории Ubuntu; пропуск"
     fi
-else
-    print_warning "Пользователь $NEW_USER не найден в системе"
-    ask_input "Создать пользователя $NEW_USER и добавить в группу sudo? [Y/n]: " CREATE_USER
-    
-    if [[ "$CREATE_USER" =~ ^[Yy]$ ]] || [[ -z "$CREATE_USER" ]]; then
-        adduser --disabled-password --gecos "" "$NEW_USER"
-        usermod -aG sudo "$NEW_USER"
-        print_success "Пользователь $NEW_USER создан и добавлен в группу sudo"
-        SET_PASSWORD=true
-    else
-        print_warning "Пропускаем создание пользователя $NEW_USER"
+  done
+  ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
+  ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
+}
+
+configure_locale_time() {
+  section "ВРЕМЯ И ЛОКАЛЬ"
+  timedatectl set-timezone Asia/Irkutsk
+  locale-gen ru_RU.UTF-8 en_US.UTF-8
+  update-locale LANG=ru_RU.UTF-8
+  ok "Часовой пояс и локаль настроены"
+}
+
+configure_safe_sysctl() {
+  section "БЕЗОПАСНЫЕ SYSCTL"
+  cat > /etc/sysctl.d/99-vps-tuning.conf <<'EOF'
+# Совместимо с VPN, policy routing, туннелями и proxy.
+# rp_filter, tcp_fastopen и агрессивные TCP-переменные намеренно не задаются.
+net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+fs.file-max = 1048576
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+EOF
+  if sysctl --system >/dev/null; then
+    ok "Безопасные sysctl применены"
+  else
+    warn "Некоторые sysctl не применились; проверьте: sysctl --system"
+  fi
+  cat > /etc/security/limits.d/99-vps.conf <<'EOF'
+* soft nofile 524288
+* hard nofile 1048576
+root soft nofile 524288
+root hard nofile 1048576
+EOF
+}
+
+configure_swap() {
+  section "SWAP"
+  if swapon --show --noheadings | grep -q .; then
+    info "Swap уже настроен"
+    return
+  fi
+  local ram
+  ram="$(LC_ALL=C free -m | awk '/^Mem:/ {print $2}')"
+  if ! [[ "$ram" =~ ^[0-9]+$ ]]; then
+    error "Не удалось определить объём RAM; swap не изменён"
+    return 1
+  fi
+  if [ "$ram" -gt "$SWAP_RAM_THRESHOLD_MB" ]; then
+    info "RAM больше $SWAP_RAM_THRESHOLD_MB MB — swap не нужен"
+    return
+  fi
+  info "RAM не более $SWAP_RAM_THRESHOLD_MB MB — создаём swap $SWAP_SIZE"
+  rm -f /swapfile
+  if ! fallocate -l "$SWAP_SIZE" /swapfile; then
+    dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
+  fi
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -qE '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  ok "Swap создан"
+}
+
+configure_pin() {
+  section "ПОСТОЯННЫЙ ПОЛЬЗОВАТЕЛЬ $PIN_USER"
+  local home sshdir keys action answer method public_key keyfile is_new=false
+  if id "$PIN_USER" >/dev/null 2>&1; then
+    home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
+    sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"
+    info "$PIN_USER уже существует; ключей: $(test -s "$keys" && wc -l < "$keys" || echo 0)"
+    echo "Enter) Ничего не менять (по умолчанию)"
+    echo "1) Сменить пароль"
+    echo "2) Добавить публичный ключ"
+    echo "3) Заменить все публичные ключи"
+    ask "Ваш выбор: " action
+    case "$action" in
+      "") info "Пользователь $PIN_USER оставлен без изменений"; return ;;
+      1) set_pin_password; return ;;
+      2|3) ;;
+      *) warn "Неизвестный выбор — ничего не меняем"; return ;;
+    esac
+    [ "$action" = 3 ] && rm -f "$keys"
+  else
+    ask "Создать $PIN_USER и добавить в группу sudo? [Y/n]: " answer
+    if ! yes_by_default "$answer"; then
+      warn "Создание $PIN_USER пропущено"
+      return
     fi
-fi
+    adduser --disabled-password --gecos "" "$PIN_USER"
+    usermod -aG sudo "$PIN_USER"
+    home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
+    sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"; is_new=true
+    ok "Пользователь $PIN_USER создан"
+    info "Задайте пароль $PIN_USER (ввод и подтверждение не отображаются):"
+    set_pin_password
+  fi
 
-# Установка/замена пароля
-if [ "$SET_PASSWORD" = true ]; then
-    echo ""
-    print_info "Установка пароля для пользователя $NEW_USER"
-    while true; do
-        ask_password "Введите пароль для $NEW_USER: " USER_PASSWORD
-        ask_password "Повторите пароль: " USER_PASSWORD_CONFIRM
-        
-        if [ -z "$USER_PASSWORD" ]; then
-            print_error "Пароль не может быть пустым. Попробуйте снова."
-        elif [ "$USER_PASSWORD" != "$USER_PASSWORD_CONFIRM" ]; then
-            print_error "Пароли не совпадают. Попробуйте снова."
-        else
-            echo "$NEW_USER:$USER_PASSWORD" | chpasswd
-            print_success "Пароль для $NEW_USER установлен"
-            break
-        fi
-    done
-fi
-
-# ============================================
-# 8. ДОБАВЛЕНИЕ SSH-КЛЮЧА ДЛЯ ПОЛЬЗОВАТЕЛЯ
-# ============================================
-print_section "8. SSH-КЛЮЧ ДЛЯ ПОЛЬЗОВАТЕЛЯ"
-print_info "Проверка SSH-ключа для пользователя $NEW_USER..."
-
-if [ ! -d "/home/$NEW_USER" ]; then
-    print_warning "Пользователь $NEW_USER не существует. Пропускаем настройку SSH-ключа."
-else
-    PIN_SSH_DIR="/home/$NEW_USER/.ssh"
-    PIN_AUTH_KEYS="$PIN_SSH_DIR/authorized_keys"
-    SKIP_KEY=false
-    
-    if [ -f "$PIN_AUTH_KEYS" ] && [ -s "$PIN_AUTH_KEYS" ]; then
-        KEY_COUNT=$(wc -l < "$PIN_AUTH_KEYS")
-        print_info "SSH-ключ для $NEW_USER уже настроен ($KEY_COUNT шт.)"
-        echo ""
-        echo "Что сделать с SSH-ключом?"
-        echo "  1) Добавить ещё один ключ (к существующим)"
-        echo "  2) Удалить все ключи и добавить новый"
-        echo "  3) Оставить как есть (пропустить)"
-        ask_input "Ваш выбор [1/2/3]: " KEY_ACTION
-        
-        case "$KEY_ACTION" in
-            1)
-                print_info "Добавляем новый ключ к существующим"
-                ;;
-            2)
-                print_warning "Удаляем все существующие ключи"
-                rm -f "$PIN_AUTH_KEYS"
-                ;;
-            3)
-                print_info "Пропускаем настройку SSH-ключа"
-                SKIP_KEY=true
-                ;;
-            *)
-                print_info "Пропускаем настройку SSH-ключа"
-                SKIP_KEY=true
-                ;;
-        esac
+  if [ "$is_new" = true ]; then
+    info "Вставьте публичный SSH-ключ для $PIN_USER одной строкой (Enter — пропустить):"
+    read -r public_key < /dev/tty
+    if [ -z "$public_key" ]; then
+      warn "Ключ не добавлен. До отключения паролей добавьте его вручную."
+      return
     fi
-    
-    if [ "$SKIP_KEY" != "true" ]; then
-        echo ""
-        print_warning "⚠️  ВАЖНО: Добавьте SSH-ключ для $NEW_USER, чтобы не потерять доступ"
-        echo ""
-        echo "Выберите способ добавления ключа:"
-        echo "  1) Вставить публичный ключ вручную (скопируйте содержимое id_ed25519.pub)"
-        echo "  2) Указать путь к файлу ключа на сервере"
-        echo "  3) Пропустить"
-        ask_input "Ваш выбор [1/2/3]: " KEY_METHOD
-        
-        case "$KEY_METHOD" in
-            1)
-                echo ""
-                print_info "Вставьте ваш публичный ключ одной строкой (начинается с ssh-ed25519 или ssh-rsa):"
-                read -r PUBLIC_KEY < /dev/tty
-                if [ -n "$PUBLIC_KEY" ]; then
-                    mkdir -p "$PIN_SSH_DIR"
-                    echo "$PUBLIC_KEY" >> "$PIN_AUTH_KEYS"
-                    chown -R "$NEW_USER:$NEW_USER" "$PIN_SSH_DIR"
-                    chmod 700 "$PIN_SSH_DIR"
-                    chmod 600 "$PIN_AUTH_KEYS"
-                    print_success "SSH-ключ добавлен для $NEW_USER"
-                else
-                    print_warning "Ключ не был добавлен (пустой ввод)"
-                fi
-                ;;
-            2)
-                ask_input "Введите путь к файлу публичного ключа: " KEY_PATH
-                if [ -f "$KEY_PATH" ]; then
-                    mkdir -p "$PIN_SSH_DIR"
-                    cat "$KEY_PATH" >> "$PIN_AUTH_KEYS"
-                    chown -R "$NEW_USER:$NEW_USER" "$PIN_SSH_DIR"
-                    chmod 700 "$PIN_SSH_DIR"
-                    chmod 600 "$PIN_AUTH_KEYS"
-                    print_success "SSH-ключ добавлен из $KEY_PATH"
-                else
-                    print_error "Файл не найден: $KEY_PATH"
-                fi
-                ;;
-            3)
-                print_warning "Пропускаем добавление SSH-ключа"
-                ;;
-            *)
-                print_warning "Неверный выбор. Пропускаем добавление SSH-ключа"
-                ;;
-        esac
+    mkdir -p "$sshdir"; printf '%s\n' "$public_key" > "$keys"
+  else
+    echo "1) Вставить публичный ключ"
+    echo "2) Скопировать ключ из файла на сервере"
+    echo "3) Пропустить"
+    ask "Способ добавления ключа [1/2/3]: " method
+    case "$method" in
+      1)
+        info "Вставьте один публичный ключ:"
+        read -r public_key < /dev/tty
+        [ -n "$public_key" ] || { warn "Пустой ключ — пропуск"; return; }
+        mkdir -p "$sshdir"; printf '%s\n' "$public_key" >> "$keys" ;;
+      2)
+        ask "Путь к файлу публичного ключа: " keyfile
+        [ -f "$keyfile" ] || { error "Файл не найден"; return 1; }
+        mkdir -p "$sshdir"; cat "$keyfile" >> "$keys" ;;
+      *) info "Ключ не изменён"; return ;;
+    esac
+  fi
+  chown -R "$PIN_USER:$PIN_USER" "$sshdir"
+  chmod 700 "$sshdir"; chmod 600 "$keys"
+  ok "Ключ для $PIN_USER установлен"
+}
+configure_ufw() {
+  section "UFW"
+  local answer action source_ip
+  if ! ufw status | grep -q 'Status: active'; then
+    ask "Настроить и активировать UFW? [Y/n]: " answer
+    if yes_by_default "$answer"; then
+      ufw default deny incoming
+      ufw default allow outgoing
+      ufw allow "$SSH_PORT/tcp" comment 'SSH'
+      ufw allow 80/tcp comment 'HTTP'
+      ufw allow 443/tcp comment 'HTTPS'
+      ufw --force enable
+      ok "UFW включён: SSH $SSH_PORT, HTTP/HTTPS"
     fi
-fi
+  fi
+  echo "iPerf3: Enter) не менять; 1) открыть всем; 2) открыть одному IP; 3) закрыть общие правила"
+  ask "Правило для порта 5201: " action
+  case "$action" in
+    1) ufw allow 5201/tcp comment 'temporary iperf3'; ufw allow 5201/udp comment 'temporary iperf3'; warn "Закройте 5201 после теста: выберите пункт 3" ;;
+    2)
+      ask "IPv4 или IPv6-адрес клиента: " source_ip
+      if [[ "$source_ip" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+        ufw allow from "$source_ip" to any port 5201 proto tcp
+        ufw allow from "$source_ip" to any port 5201 proto udp
+        ok "iPerf3 разрешён только для $source_ip"
+      else
+        error "Некорректный IP"; fi ;;
+    3) ufw --force delete allow 5201/tcp 2>/dev/null || true; ufw --force delete allow 5201/udp 2>/dev/null || true; ok "Общие правила 5201 удалены" ;;
+    *) info "Правила iPerf3 не изменены" ;;
+  esac
+}
 
-# ============================================
-# 9. НАСТРОЙКА UFW ФАЕРВОЛА
-# ============================================
-print_section "9. НАСТРОЙКА UFW"
-print_info "Проверка файрвола UFW..."
+set_sshd_line() {
+  local name="$1" value="$2"
+  if grep -qE "^#?$name[[:space:]]+" /etc/ssh/sshd_config; then
+    sed -Ei "s|^#?$name[[:space:]]+.*|$name $value|" /etc/ssh/sshd_config
+  else
+    echo "$name $value" >> /etc/ssh/sshd_config
+  fi
+}
 
-if ! command -v ufw &>/dev/null; then
-    print_info "UFW не установлен. Устанавливаем..."
-    apt-get install -y ufw
-fi
+configure_ssh() {
+  section "SSH: ПОРТ, КЛЮЧИ И SOCKET ACTIVATION"
+  local answer
+  echo "Будет включён порт $SSH_PORT, а парольный вход — отключён."
+  echo "root разрешён только по ключу; ClientAliveInterval=0 отключает server-side idle timeout."
+  warn "Не закрывайте текущую сессию до успешной проверки нового входа."
+  ask "Применить настройки SSH? [Y/n]: " answer
+  yes_by_default "$answer" || return
 
-# ВАЖНО: используем LC_ALL=C для английского вывода независимо от локали
-if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
-    print_info "UFW уже активен — пропускаем настройку"
-    LC_ALL=C ufw status verbose
-else
-    print_warning "UFW не активен или не настроен"
-    ask_input "Настроить UFW с базовыми правилами? [Y/n]: " SETUP_UFW
-    
-    if [[ "$SETUP_UFW" =~ ^[Yy]$ ]] || [[ -z "$SETUP_UFW" ]]; then
-        print_info "Настройка политик по умолчанию..."
-        ufw default deny incoming
-        ufw default allow outgoing
-        
-        print_info "Открываем необходимые порты..."
-        ufw allow 80/tcp comment 'HTTP & SSL'
-        ufw allow 443/tcp comment 'HTTPS'
-        ufw allow 8443/tcp comment 'HTTPS'
-        ufw allow "$SSH_PORT/tcp" comment 'SSH'
-        ufw allow 5201/tcp comment 'iperf3'
-        ufw allow 5201/udp comment 'iperf3'
-        
-        print_info "Текущие правила UFW:"
-        LC_ALL=C ufw status verbose 2>/dev/null || true
-        
-        echo ""
-        print_warning "ВНИМАНИЕ: UFW будет активирован. Убедитесь, что ваш SSH порт ($SSH_PORT) открыт!"
-        ask_input "Активировать UFW сейчас? [Y/n]: " ENABLE_UFW
-        
-        if [[ "$ENABLE_UFW" =~ ^[Yy]$ ]] || [[ -z "$ENABLE_UFW" ]]; then
-            ufw --force enable
-            print_success "UFW активирован"
-            echo ""
-            print_info "Финальный статус UFW:"
-            LC_ALL=C ufw status verbose
-        else
-            print_warning "UFW настроен, но не активирован. Активируйте позже: sudo ufw enable"
-        fi
-    else
-        print_warning "Пропускаем настройку UFW"
-    fi
-fi
-
-# ============================================
-# 10. НАСТРОЙКА SSH (МИНИМАЛЬНАЯ БЕЗОПАСНОСТЬ)
-# ============================================
-print_section "10. НАСТРОЙКА SSH"
-print_info "Проверка настроек SSH..."
-print_info "Версия Ubuntu: $UBUNTU_VERSION ($UBUNTU_CODENAME)"
-
-SSHD_CONFIG="/etc/ssh/sshd_config"
-SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
-BACKUP_FILE="/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
-
-# Проверяем, применены ли уже все нужные настройки
-SSH_PORT_SET=$(grep -E "^Port $SSH_PORT$" "$SSHD_CONFIG" || true)
-ROOT_LOGIN_SET=$(grep -E "^PermitRootLogin no$" "$SSHD_CONFIG" || true)
-PASS_AUTH_SET=$(grep -E "^PasswordAuthentication no$" "$SSHD_CONFIG" || true)
-EMPTY_PASS_SET=$(grep -E "^PermitEmptyPasswords no$" "$SSHD_CONFIG" || true)
-PUBKEY_SET=$(grep -E "^PubkeyAuthentication yes$" "$SSHD_CONFIG" || true)
-
-# Дополнительно проверяем, что SSH реально слушает нужный порт на IPv4
-SSH_LISTENING_IPV4=false
-if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
-    SSH_LISTENING_IPV4=true
-fi
-
-if [[ -n "$SSH_PORT_SET" && -n "$ROOT_LOGIN_SET" && -n "$PASS_AUTH_SET" && -n "$EMPTY_PASS_SET" && -n "$PUBKEY_SET" && "$SSH_LISTENING_IPV4" = true ]]; then
-    print_info "SSH уже настроен правильно — пропускаем"
-else
-    print_warning "SSH требует настройки безопасности"
-    echo ""
-    print_warning "⚠️  БУДУТ ПРИМЕНЕНЫ СЛЕДУЮЩИЕ ИЗМЕНЕНИЯ (минимальный набор):"
-    echo "    - Port $SSH_PORT (смена стандартного порта 22)"
-    echo "    - PermitRootLogin no (запрет входа под root)"
-    echo "    - PasswordAuthentication no (ВХОД ТОЛЬКО ПО КЛЮЧУ!)"
-    echo "    - PermitEmptyPasswords no (запрет пустых паролей)"
-    echo "    - PubkeyAuthentication yes (аутентификация по ключам)"
-    echo "    - KbdInteractiveAuthentication no"
-    echo "    - MaxAuthTries 3 (лимит попыток входа)"
-    echo "    - LogLevel VERBOSE (подробные логи для fail2ban)"
-    echo "    - PermitUserEnvironment no (безопасность)"
-    echo ""
-    print_info "SSH-туннели остаются разрешёнными (AllowTcpForwarding yes)"
-    print_info "Сессии НЕ будут разрываться по таймауту"
-    echo ""
-    print_error "❗ После применения вы НЕ СМОЖЕТЕ зайти под root по SSH!"
-    print_error "❗ Вход будет возможен ТОЛЬКО по SSH-ключу для пользователя $NEW_USER"
-    echo ""
-    
-    # Проверка наличия ключа у pin
-    KEEP_PASSWORD_AUTH=false
-    if [ -f "/home/$NEW_USER/.ssh/authorized_keys" ] && [ -s "/home/$NEW_USER/.ssh/authorized_keys" ]; then
-        KEY_COUNT=$(wc -l < "/home/$NEW_USER/.ssh/authorized_keys")
-        print_success "SSH-ключ для $NEW_USER обнаружен ($KEY_COUNT шт.). Можно безопасно отключать пароли."
-    else
-        print_error "⚠️⚠️⚠️  У пользователя $NEW_USER НЕТ SSH-ключа!"
-        print_error "Если отключить PasswordAuthentication, вы ПОЛНОСТЬЮ ПОТЕРЯЕТЕ доступ!"
-        echo ""
-        ask_input "Всё равно отключить вход по паролю? (НЕ РЕКОМЕНДУЕТСЯ) [y/N]: " FORCE_NO_PASS
-        if [[ ! "$FORCE_NO_PASS" =~ ^[Yy]$ ]]; then
-            print_warning "PasswordAuthentication останется включённым. Добавьте ключ и запустите скрипт снова."
-            KEEP_PASSWORD_AUTH=true
-        fi
-    fi
-    
-    echo ""
-    ask_input "Применить настройки SSH? [Y/n]: " APPLY_SSH
-    
-    if [[ "$APPLY_SSH" =~ ^[Yy]$ ]] || [[ -z "$APPLY_SSH" ]]; then
-        # Создаём резервную копию
-        cp "$SSHD_CONFIG" "$BACKUP_FILE"
-        print_info "Резервная копия создана: $BACKUP_FILE"
-        
-        # ============================================
-        # 10.1. ОБРАБОТКА ФАЙЛОВ В sshd_config.d
-        # ============================================
-        # В Ubuntu 24.04+ cloud-init может создавать файлы, переопределяющие настройки
-        if [ -d "$SSHD_CONFIG_DIR" ]; then
-            print_info "Проверка файлов в $SSHD_CONFIG_DIR..."
-            
-            for conf_file in "$SSHD_CONFIG_DIR"/*.conf; do
-                if [ -f "$conf_file" ]; then
-                    if grep -qE "^PasswordAuthentication yes" "$conf_file" 2>/dev/null; then
-                        print_warning "Найден файл с PasswordAuthentication yes: $conf_file"
-                        cp "$conf_file" "$conf_file.backup.$(date +%Y%m%d_%H%M%S)"
-                        sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' "$conf_file"
-                        print_success "Исправлено: $conf_file"
-                    fi
-                fi
-            done
-            
-            # Создаём наш override файл с приоритетом
-            CUSTOM_SSH_CONF="$SSHD_CONFIG_DIR/99-hardening.conf"
-            print_info "Создание override файла: $CUSTOM_SSH_CONF"
-            cat > "$CUSTOM_SSH_CONF" << HARDENING_EOF
-# Hardening settings (создано скриптом tunevps.sh)
-# Минимальный набор для безопасности, не мешающий работе
+  cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
+  set_sshd_line Port "$SSH_PORT"
+  mkdir -p /etc/ssh/sshd_config.d
+  cat > /etc/ssh/sshd_config.d/99-vps-hardening.conf <<'EOF'
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-HARDENING_EOF
-            print_success "Override файл создан"
-        fi
-        
-        # ============================================
-        # 10.2. ПРИМЕНЕНИЕ НАСТРОЕК В sshd_config
-        # ============================================
-        print_info "Применяем настройки SSH в sshd_config..."
-        
-        # Функция для безопасной установки параметра
-        set_ssh_param() {
-            local param="$1"
-            local value="$2"
-            if grep -qE "^#?$param " "$SSHD_CONFIG"; then
-                sed -i "s/^#\?$param .*/$param $value/" "$SSHD_CONFIG"
-            else
-                echo "$param $value" >> "$SSHD_CONFIG"
-            fi
-        }
-        
-        # === МИНИМАЛЬНЫЙ НАБОР НАСТРОЕК БЕЗОПАСНОСТИ ===
-        
-        # Основные настройки
-        set_ssh_param "Port" "$SSH_PORT"
-        set_ssh_param "PermitRootLogin" "no"
-        set_ssh_param "PermitEmptyPasswords" "no"
-        set_ssh_param "PubkeyAuthentication" "yes"
-        
-        # Отключение паролей (если не решили оставить)
-        if [ "$KEEP_PASSWORD_AUTH" != "true" ]; then
-            set_ssh_param "PasswordAuthentication" "no"
-        fi
-        
-        # Отключение лишних методов аутентификации
-        # KbdInteractiveAuthentication — современный параметр (OpenSSH 8.4+)
-        set_ssh_param "KbdInteractiveAuthentication" "no"
-        
-        # ChallengeResponseAuthentication — устаревший в OpenSSH 9+
-        # Добавляем только для старых версий
-        SSH_MAJOR_VERSION=$(sshd -V 2>&1 | head -1 | grep -oP 'OpenSSH_\K[0-9]+' || echo "9")
-        if [ "$SSH_MAJOR_VERSION" -lt 9 ]; then
-            print_info "Обнаружен OpenSSH $SSH_MAJOR_VERSION.x — добавляем ChallengeResponseAuthentication"
-            set_ssh_param "ChallengeResponseAuthentication" "no"
-        else
-            print_info "Обнаружен OpenSSH $SSH_MAJOR_VERSION.x — ChallengeResponseAuthentication устарел, пропускаем"
-        fi
-        
-        # Защита от brute-force
-        set_ssh_param "MaxAuthTries" "3"
-        
-        # Подробные логи для fail2ban
-        set_ssh_param "LogLevel" "VERBOSE"
-        
-        # Безопасность (не мешает работе)
-        set_ssh_param "PermitUserEnvironment" "no"
-        
-        # === ЧТО МЫ НЕ ТРОГАЕМ (оставляем по умолчанию) ===
-        # AllowTcpForwarding - разрешены SSH-туннели (нужны вам)
-        # PermitTunnel - разрешены туннели
-        # AllowAgentForwarding - разрешён agent forwarding
-        # X11Forwarding - оставляем как есть
-        # ClientAliveInterval - НЕ устанавливаем (сессии не рвутся)
-        # ClientAliveCountMax - НЕ устанавливаем
-        # LoginGraceTime - оставляем по умолчанию
-        # MaxSessions - оставляем по умолчанию
-        
-        print_success "Настройки SSH применены (минимальный набор)"
-        
-        # ============================================
-        # 10.3. НАСТРОЙКА МЕХАНИЗМА ЗАПУСКА SSH
-        # ============================================
-        # В Ubuntu 24.04+ используется systemd socket activation,
-        # который может конфликтовать с настройками в sshd_config
-        # (особенно с автоматически генерируемым addresses.conf).
-        # Самое надёжное решение - отключить socket activation
-        # и использовать классический сервис SSH.
-        print_info "Настройка механизма запуска SSH..."
-        
-        if systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket 2>/dev/null; then
-            print_info "Обнаружен systemd socket activation — отключаем его для надёжности"
-            
-            # Останавливаем и отключаем socket
-            systemctl stop ssh.socket 2>/dev/null || true
-            systemctl disable ssh.socket 2>/dev/null || true
-            
-            # Маскируем socket, чтобы он не мог быть активирован автоматически
-            # (например, при обновлении системы или перезагрузке)
-            systemctl mask ssh.socket
-            print_success "ssh.socket остановлен, отключён и замаскирован"
-            
-            # Удаляем наш предыдущий override, если он был
-            if [ -f "/etc/systemd/system/ssh.socket.d/override.conf" ]; then
-                rm -f /etc/systemd/system/ssh.socket.d/override.conf
-                print_info "Удалён старый override для ssh.socket"
-            fi
-            
-            # Включаем и запускаем классический сервис SSH
-            systemctl enable ssh.service
-            systemctl restart ssh.service
-            print_success "Классический сервис SSH активирован"
-            
-            # Перезагружаем systemd
-            systemctl daemon-reload
-            
-            sleep 2
-            
-            # Проверяем IPv4
-            if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
-                print_success "SSH слушает порт $SSH_PORT на IPv4 ✓"
-            else
-                print_error "SSH НЕ слушает порт $SSH_PORT на IPv4!"
-            fi
-            
-            # Проверяем IPv6
-            if ss -tuln | grep -q "\[::\]:$SSH_PORT "; then
-                print_success "SSH слушает порт $SSH_PORT на IPv6 ✓"
-            else
-                print_warning "SSH НЕ слушает порт $SSH_PORT на IPv6"
-            fi
-        else
-            print_info "Socket activation не используется — порт берётся из sshd_config"
-            
-            # Просто перезапускаем SSH для применения настроек
-            systemctl restart ssh.service
-            sleep 2
-            
-            if ss -tuln | grep -q ":$SSH_PORT "; then
-                print_success "SSH слушает порт $SSH_PORT ✓"
-            else
-                print_error "SSH НЕ слушает порт $SSH_PORT!"
-            fi
-        fi
-        
-        # ============================================
-        # 10.4. ПРОВЕРКА СИНТАКСИСА И ФИНАЛЬНЫЙ ПЕРЕЗАПУСК
-        # ============================================
-        print_info "Проверка синтаксиса sshd_config..."
-        if sshd -t; then
-            print_success "Синтаксис корректен. Финальный перезапуск SSH..."
-            systemctl restart ssh
-            print_success "SSH перезапущен с новыми настройками"
-            
-            sleep 2
-            
-            # Финальная проверка IPv4 и IPv6
-            IPV4_OK=false
-            IPV6_OK=false
-            
-            if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
-                IPV4_OK=true
-            fi
-            
-            if ss -tuln | grep -q "\[::\]:$SSH_PORT "; then
-                IPV6_OK=true
-            fi
-            
-            if [ "$IPV4_OK" = true ] && [ "$IPV6_OK" = true ]; then
-                print_success "ИТОГОВАЯ ПРОВЕРКА: SSH слушает порт $SSH_PORT на IPv4 и IPv6 ✓"
-            elif [ "$IPV4_OK" = true ]; then
-                print_success "ИТОГОВАЯ ПРОВЕРКА: SSH слушает порт $SSH_PORT на IPv4 ✓"
-                print_warning "IPv6 не настроен (не критично)"
-            elif [ "$IPV6_OK" = true ]; then
-                print_error "ИТОГОВАЯ ПРОВЕРКА: SSH слушает ТОЛЬКО IPv6!"
-                print_error "Вход по IPv4 будет невозможен! Проверьте настройки"
-            else
-                print_error "ИТОГОВАЯ ПРОВЕРКА: SSH НЕ слушает порт $SSH_PORT!"
-                print_error "Проверьте: sudo ss -tulnp | grep ssh"
-            fi
-        else
-            print_error "ОШИБКА СИНТАКСИСА! Откатываем изменения..."
-            cp "$BACKUP_FILE" "$SSHD_CONFIG"
-            print_warning "Восстановлен оригинальный конфиг из: $BACKUP_FILE"
-            print_error "SSH НЕ был перезапущен. Проверьте конфиг вручную."
-        fi
-    else
-        print_warning "Пропускаем настройку SSH"
-    fi
-fi
+PermitEmptyPasswords no
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+MaxAuthTries 3
+LogLevel VERBOSE
+PermitUserEnvironment no
+ClientAliveInterval 0
+TCPKeepAlive yes
+EOF
+  if ! sshd -t; then
+    error "Ошибка sshd_config. Конфиг не перезапущен."
+    return 1
+  fi
+  if ! sshd -T | awk '$1 == "port" && $2 == 5829 {found=1} END {exit !found}'; then
+    error "sshd не принял порт $SSH_PORT; проверьте /etc/ssh/sshd_config и *.d"
+    return 1
+  fi
 
-# ============================================
-# 11. УСТАНОВКА И НАСТРОЙКА FAIL2BAN
-# ============================================
-print_section "11. FAIL2BAN (защита от brute-force)"
-print_info "Проверка fail2ban..."
+  # Явный override сохраняет socket activation, но очищает ListenStream :22
+  # и задаёт только 5829. Работает на Ubuntu 24.04 и на системах без генератора.
+  mkdir -p /etc/systemd/system/ssh.socket.d
+  cat > /etc/systemd/system/ssh.socket.d/99-vps-port.conf <<EOF
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:$SSH_PORT
+ListenStream=[::]:$SSH_PORT
+EOF
 
-if ! command -v fail2ban-client &>/dev/null; then
-    print_info "fail2ban не установлен. Устанавливаем..."
-    apt-get install -y fail2ban
-    print_success "fail2ban установлен"
-else
-    print_info "fail2ban уже установлен"
-fi
-
-FAIL2BAN_JAIL="/etc/fail2ban/jail.local"
-
-if [ -f "$FAIL2BAN_JAIL" ] && grep -q "port = $SSH_PORT" "$FAIL2BAN_JAIL"; then
-    print_info "fail2ban уже настроен для порта $SSH_PORT"
-    ask_input "Перенастроить fail2ban? [y/N]: " RECONFIGURE_F2B
-    if [[ ! "$RECONFIGURE_F2B" =~ ^[Yy]$ ]]; then
-        print_info "Пропускаем настройку fail2ban"
-        SKIP_F2B=true
-    fi
-else
-    SKIP_F2B=false
-fi
-
-if [ "$SKIP_F2B" != "true" ]; then
-    print_info "Создание конфигурации fail2ban..."
-    
-    if [ -f "$FAIL2BAN_JAIL" ]; then
-        cp "$FAIL2BAN_JAIL" "$FAIL2BAN_JAIL.backup.$(date +%Y%m%d_%H%M%S)"
-        print_info "Резервная копия старого jail.local создана"
-    fi
-    
-    # ============================================
-    # АВТООПРЕДЕЛЕНИЕ BACKEND ДЛЯ ЛОГОВ
-    # ============================================
-    # Проверяем, существует ли /var/log/auth.log
-    # Если нет — используем systemd journal (актуально для новых Ubuntu)
-    if [ -f "/var/log/auth.log" ] && [ -s "/var/log/auth.log" ]; then
-        F2B_BACKEND="auto"
-        F2B_LOGPATH="logpath = /var/log/auth.log"
-        print_info "Используем файл логов: /var/log/auth.log"
-    else
-        F2B_BACKEND="systemd"
-        F2B_LOGPATH="# logpath не нужен, используется systemd journal"
-        print_info "Файл auth.log отсутствует. Используем systemd journal"
-    fi
-    
-    cat > "$FAIL2BAN_JAIL" << F2B_EOF
-# ============================================
-# Fail2ban конфигурация для защиты от brute-force
-# Создано автоматически скриптом tunevps.sh
-# Совместимо с Ubuntu 24.04 и 26.04
-# ============================================
-
-[DEFAULT]
-# Backend для чтения логов (auto = fail2ban сам выберет)
-backend = $F2B_BACKEND
-
-# Игнорировать локальные IP (никогда не блокировать себя)
-# Добавьте свой статический IP, если он есть:
-# ignoreip = 127.0.0.1/8 ::1 YOUR_STATIC_IP/32
-ignoreip = 127.0.0.1/8 ::1
-
-# Время блокировки (в секундах): 3600 = 1 час
-bantime = 3600
-
-# Временное окно для подсчёта попыток (в секундах): 600 = 10 минут
-findtime = 600
-
-# Максимум попыток перед блокировкой
-maxretry = 3
-
-# Увеличивать время блокировки при повторных атаках
-bantime.increment = true
-bantime.factor = 2
-bantime.maxtime = 86400
-
-# ============================================
-# Защита SSH
-# ============================================
-[sshd]
-enabled = true
-port = $SSH_PORT
-filter = sshd
-$F2B_LOGPATH
-maxretry = 3
-bantime = 3600
-findtime = 600
-
-# Агрессивный режим для повторных нарушителей
-mode = aggressive
-F2B_EOF
-    
-    print_success "Конфигурация fail2ban создана: $FAIL2BAN_JAIL"
-    
-    print_info "Активация fail2ban..."
-    systemctl enable fail2ban
-    systemctl restart fail2ban
-    
-    sleep 3
-    if systemctl is-active --quiet fail2ban; then
-        print_success "fail2ban запущен и активен"
-        echo ""
-        print_info "Статус fail2ban:"
-        fail2ban-client status
-        echo ""
-        print_info "Статус jail sshd:"
-        fail2ban-client status sshd || true
-    else
-        print_error "fail2ban не запустился! Проверьте: sudo journalctl -u fail2ban -n 30"
-    fi
-fi
-
-# ============================================
-# 12. ZSH
-# ============================================
-print_section "12. ZSH"
-print_info "Проверка Zsh..."
-CURRENT_SHELL=$(getent passwd "$CURRENT_USER" | cut -d: -f7)
-if [[ "$CURRENT_SHELL" == *"zsh"* ]]; then
-    print_info "Zsh уже является оболочкой по умолчанию для $CURRENT_USER"
-else
-    print_info "Установка Zsh как оболочки по умолчанию..."
-    chsh -s $(which zsh) "$CURRENT_USER"
-    print_success "Zsh установлен как оболочка по умолчанию"
-fi
-
-# ============================================
-# 13. OH MY ZSH
-# ============================================
-print_section "13. OH MY ZSH"
-print_info "Проверка Oh My Zsh..."
-if [ ! -d "$USER_HOME/.oh-my-zsh" ]; then
-    print_info "Установка Oh My Zsh..."
-    export RUNZSH=no
-    export KEEP_ZSHRC=no
-    if [ "$CURRENT_USER" = "root" ]; then
-        sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
-    else
-        sudo -u "$CURRENT_USER" sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
-    fi
-    print_success "Oh My Zsh установлен"
-else
-    print_info "Oh My Zsh уже установлен"
-fi
-
-# ============================================
-# 14. POWERLEVEL10K
-# ============================================
-print_section "14. POWERLEVEL10K"
-print_info "Проверка Powerlevel10k..."
-ZSH_CUSTOM_DIR="$USER_HOME/.oh-my-zsh/custom"
-if [ ! -d "$ZSH_CUSTOM_DIR/themes/powerlevel10k" ]; then
-    print_info "Установка Powerlevel10k..."
-    if [ "$CURRENT_USER" = "root" ]; then
-        git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "$ZSH_CUSTOM_DIR/themes/powerlevel10k"
-    else
-        sudo -u "$CURRENT_USER" git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "$ZSH_CUSTOM_DIR/themes/powerlevel10k"
-    fi
-    print_success "Powerlevel10k установлен"
-else
-    print_info "Powerlevel10k уже установлен"
-fi
-
-# ============================================
-# 15. ПЛАГИНЫ OMZ
-# ============================================
-print_section "15. ПЛАГИНЫ OMZ"
-print_info "Проверка плагинов Oh My Zsh..."
-clone_plugin() {
-    local name=$1
-    local url=$2
-    if [ ! -d "$ZSH_CUSTOM_DIR/plugins/$name" ]; then
-        print_info "Установка плагина: $name"
-        if [ "$CURRENT_USER" = "root" ]; then
-            git clone "$url" "$ZSH_CUSTOM_DIR/plugins/$name"
-        else
-            sudo -u "$CURRENT_USER" git clone "$url" "$ZSH_CUSTOM_DIR/plugins/$name"
-        fi
-    else
-        print_info "Плагин $name уже установлен"
-    fi
+  if systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket; then
+    systemctl daemon-reload
+    systemctl restart ssh.socket
+  else
+    systemctl reload ssh.service || systemctl restart ssh.service
+  fi
+  sleep 2
+  if ss -ltn | grep -qE "[:.]$SSH_PORT[[:space:]]"; then
+    ok "SSH слушает $SSH_PORT"
+  else
+    error "Порт $SSH_PORT не слушается; текущую сессию не закрывайте"
+    systemctl status ssh.socket ssh.service --no-pager || true
+  fi
+  if ss -ltn | grep -qE "[:.]22[[:space:]]"; then
+    warn "Порт 22 всё ещё слушается; покажите: systemctl cat ssh.socket"
+  fi
+  sshd -T | grep -E '^(port|passwordauthentication|permitrootlogin|clientaliveinterval) '
+}
+as_current_user() {
+  sudo -H -u "$CURRENT_USER" env HOME="$USER_HOME" "$@"
 }
 
-clone_plugin "zsh-autosuggestions" "https://github.com/zsh-users/zsh-autosuggestions"
-clone_plugin "zsh-syntax-highlighting" "https://github.com/zsh-users/zsh-syntax-highlighting.git"
-clone_plugin "zsh-completions" "https://github.com/zsh-users/zsh-completions"
-print_success "Плагины проверены"
+configure_shell() {
+  section "ZSH, OH MY ZSH И POWERLEVEL10K"
+  chsh -s "$(command -v zsh)" "$CURRENT_USER"
+  if [ ! -d "$USER_HOME/.oh-my-zsh" ]; then
+    as_current_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$USER_HOME/.oh-my-zsh"
+  fi
+  local custom="$USER_HOME/.oh-my-zsh/custom"
+  if [ ! -d "$custom/themes/powerlevel10k" ]; then
+    as_current_user git clone --depth=1 --recurse-submodules "$P10K_REPOSITORY" "$custom/themes/powerlevel10k"
+  fi
+  for spec in \
+    "zsh-autosuggestions https://github.com/zsh-users/zsh-autosuggestions.git" \
+    "zsh-syntax-highlighting https://github.com/zsh-users/zsh-syntax-highlighting.git" \
+    "zsh-completions https://github.com/zsh-users/zsh-completions.git"; do
+    set -- $spec
+    [ -d "$custom/plugins/$1" ] || as_current_user git clone --depth=1 "$2" "$custom/plugins/$1"
+  done
 
-# ============================================
-# 16. .zshrc
-# ============================================
-print_section "16. КОНФИГУРАЦИЯ .zshrc"
-print_info "Создание конфигурации .zshrc..."
-cat > "$USER_HOME/.zshrc" << 'EOF'
-# Enable Powerlevel10k instant prompt
-if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
-  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+  cat > "$USER_HOME/.zshrc" <<'EOF'
+# PATH — до P10K и Oh My Zsh.
+export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet
+if [[ -r "$HOME/.cache/p10k-instant-prompt-$USER.zsh" ]]; then
+  source "$HOME/.cache/p10k-instant-prompt-$USER.zsh"
 fi
 
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
-
 plugins=(
-    git
-    zsh-autosuggestions
-    zsh-syntax-highlighting
-    zsh-completions
-    zoxide
-    fzf
-    sudo
-    extract
-    docker
+  git
+  zsh-autosuggestions
+  zsh-completions
+  sudo
+  extract
+  zsh-syntax-highlighting
 )
+source "$ZSH/oh-my-zsh.sh"
 
-source $ZSH/oh-my-zsh.sh
+# Первый интерактивный вход запускает мастер P10K.
+if [[ -o interactive && ! -r "$HOME/.p10k.zsh" ]] && (( $+functions[p10k] )); then
+  p10k configure
+fi
 
-# === Алиасы на современные утилиты ===
-alias cat="bat --paging=never"
-alias ls="eza --icons"
-alias ll="eza -la --icons --git"
-alias lt="eza --tree --icons --level=2"
-alias grep="rg"
-alias fd="fd"
-alias cd="z"
-alias top="btop"
+# === Алиасы для установленных утилит ===
+if (( $+commands[bat] )); then
+  alias cat='bat --paging=never'
+fi
+if (( $+commands[eza] )); then
+  alias ls='eza --icons'
+  alias ll='eza -la --icons --git'
+  alias lt='eza --tree --icons --level=2'
+fi
+if (( $+commands[rg] )); then
+  alias grep='rg'
+fi
+if (( $+commands[fd] )); then
+  alias fd='fd'
+fi
+if (( $+commands[btop] )); then
+  alias top='btop'
+fi
 
-# === Удобные алиасы ===
-alias ..="cd .."
-alias ...="cd ../.."
-alias ports="ss -tulnp"
-alias myip="curl -s ifconfig.me"
-alias h="history"
-alias hg="history | grep"
-alias reload="source ~/.zshrc"
+alias ..='cd ..'
+alias ...='cd ../..'
+alias ports='ss -tulnp'
+alias listen='ss -ltnup'
+alias myip='curl -s ifconfig.me'
+alias h='history'
+alias hg='history | grep'
+alias reload='source ~/.zshrc'
+alias dfh='df -hT'
+alias mem='free -h'
+alias update='sudo apt update && sudo apt upgrade'
 
-# === UFW (Firewall) ===
-alias ufwv="sudo ufw status verbose"
-alias ufwn="sudo ufw status numbered"
-alias ufwl="sudo journalctl -u ufw -n 50 --no-pager"
+# UFW и SSH
+alias ufwv='sudo ufw status verbose'
+alias ufwn='sudo ufw status numbered'
+alias ufwl='sudo journalctl -u ufw -n 50 --no-pager'
+alias sshlog='sudo journalctl -u ssh -n 50 --no-pager'
+alias sshcheck='sudo sshd -t && echo "SSH config OK"'
 
-# === Fail2ban ===
-alias f2bs="sudo fail2ban-client status"
-alias f2bssh="sudo fail2ban-client status sshd"
+# Мониторинг
+alias iotop='sudo iotop'
+alias ncdu='ncdu --color dark'
 
-# === SSH безопасность ===
-alias sshlog="sudo journalctl -u ssh -n 50 --no-pager"
-alias sshcheck="sudo sshd -t && echo 'SSH config OK'"
+# === FZF ===
+# Ctrl+R: история команд; Ctrl+T: поиск файлов; Alt+C: переход в каталог.
+setup_fzf() {
+  (( $+commands[fzf] )) || return 0
 
-# === FZF (универсальный способ для всех Ubuntu 22/24/26) ===
-_fzf_init() {
-  local fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
-
-  # Если fzf >= 0.48.0, используем встроенную интеграцию
-  if [[ $(echo "$fzf_ver 0.48.0" | tr ' ' '\n' | sort -V | head -n1) = "0.48.0" ]]; then
+  # В новых версиях fzf эта команда сразу задаёт Ctrl+R, Ctrl+T и Alt+C.
+  if fzf --zsh >/dev/null 2>&1; then
     eval "$(fzf --zsh)"
-    return
+    return 0
   fi
 
-  # Иначе пробуем файлы примеров в разных местах
-  for dir in /usr/share/fzf /usr/share/doc/fzf/examples /usr/local/share/fzf; do
-    if [[ -f "$dir/key-bindings.zsh" ]]; then
-      source "$dir/key-bindings.zsh"
-      [[ -f "$dir/completion.zsh" ]] && source "$dir/completion.zsh"
-      return
+  # Совместимость с пакетами fzf из Ubuntu 24.04/26.04.
+  local fzf_paths=(
+    "/usr/share/doc/fzf/examples/key-bindings.zsh"
+    "/usr/share/fzf/key-bindings.zsh"
+    "/usr/local/share/fzf/key-bindings.zsh"
+  )
+  local fzf_file
+  for fzf_file in "${fzf_paths[@]}"; do
+    if [[ -r "$fzf_file" ]]; then
+      source "$fzf_file"
+      local fzf_completion="${fzf_file%/*}/completion.zsh"
+      [[ -r "$fzf_completion" ]] && source "$fzf_completion"
+      return 0
     fi
   done
-
-  # Если ничего не найдено - скачиваем напрямую
-  local fzf_tmp=$(mktemp)
-  if curl -fsSL https://raw.githubusercontent.com/junegunn/fzf/master/shell/key-bindings.zsh -o "$fzf_tmp" 2>/dev/null; then
-    source "$fzf_tmp"
-  fi
-  rm -f "$fzf_tmp"
+  print -P "%F{yellow}[WARN]%f fzf установлен, но его zsh key-bindings не найдены"
 }
-_fzf_init
-unset -f _fzf_init
+setup_fzf
+unfunction setup_fzf 2>/dev/null
 
-# === Zoxide (умный cd) ===
-eval "$(zoxide init zsh)"
+if (( $+commands[fd] )); then
+  export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
+  export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+fi
 
-# === Powerlevel10k config ===
-[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
+# Zoxide добавляет команду z; обычный cd не переопределяется.
+if (( $+commands[zoxide] )); then
+  eval "$(zoxide init zsh)"
+fi
+
+[[ ! -r "$HOME/.p10k.zsh" ]] || source "$HOME/.p10k.zsh"
 EOF
-print_success "Файл .zshrc создан"
+  chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc"
+  chmod 644 "$USER_HOME/.zshrc"
+  ok "Zsh и P10K настроены для $CURRENT_USER"
+  info "После нового SSH-входа под $CURRENT_USER мастер P10K стартует автоматически."
+}
 
-# ============================================
-# 17. ПРАВА ДОСТУПА
-# ============================================
-print_section "17. ПРАВА ДОСТУПА"
-if [ "$CURRENT_USER" != "root" ]; then
-    chown -R "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.oh-my-zsh"
-    chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc"
-fi
-print_success "Права доступа настроены"
+part2_setup() {
+  section "ЧАСТЬ 2: ОКРУЖЕНИЕ"
+  configure_locale_time
+  install_packages
+  configure_safe_sysctl
+  configure_swap
+  configure_pin
+  configure_ufw
+  configure_ssh
+  configure_shell
+  ok "Часть 2 завершена"
+}
 
-# ============================================
-# 18. ФИНАЛЬНАЯ ПРОВЕРКА
-# ============================================
-print_section "18. ФИНАЛЬНАЯ ПРОВЕРКА"
-
-print_info "Проверка SSH порта (IPv4)..."
-if ss -tuln | grep -q "0.0.0.0:$SSH_PORT "; then
-    print_success "SSH слушает порт $SSH_PORT на IPv4 ✓"
-else
-    print_error "SSH НЕ слушает порт $SSH_PORT на IPv4! ⚠️"
-fi
-
-print_info "Проверка SSH порта (IPv6)..."
-if ss -tuln | grep -q "\[::\]:$SSH_PORT "; then
-    print_success "SSH слушает порт $SSH_PORT на IPv6 ✓"
-else
-    print_warning "SSH НЕ слушает порт $SSH_PORT на IPv6"
-fi
-
-print_info "Проверка статуса SSH..."
-if systemctl is-active --quiet ssh; then
-    print_success "SSH сервис активен ✓"
-else
-    print_error "SSH сервис НЕ активен! ⚠️"
-fi
-
-print_info "Проверка статуса ssh.socket (должен быть замаскирован)..."
-# || true чтобы не падало с ошибкой при ненулевом exit code
-SOCKET_STATE=$(systemctl is-enabled ssh.socket 2>/dev/null || true)
-if [[ "$SOCKET_STATE" == "masked" ]]; then
-    print_success "ssh.socket замаскирован ✓ (socket activation полностью отключён)"
-elif [[ "$SOCKET_STATE" == "disabled" ]]; then
-    print_warning "ssh.socket отключён, но не замаскирован"
-elif [[ "$SOCKET_STATE" == "enabled" || "$SOCKET_STATE" == "static" ]]; then
-    print_error "ssh.socket ВКЛЮЧЁН! Это может вызывать проблемы с портом SSH"
-else
-    print_info "ssh.socket в состоянии: ${SOCKET_STATE:-неизвестно}"
-fi
-
-print_info "Проверка настроек SSH..."
-PASS_AUTH_FINAL=$(grep -E "^PasswordAuthentication" "$SSHD_CONFIG" | tail -1 || true)
-if [[ "$PASS_AUTH_FINAL" == *"no"* ]]; then
-    print_success "PasswordAuthentication отключён ✓"
-else
-    print_warning "PasswordAuthentication всё ещё включён ⚠️"
-fi
-
-print_info "Проверка fail2ban..."
-if systemctl is-active --quiet fail2ban; then
-    print_success "fail2ban активен ✓"
-else
-    print_warning "fail2ban НЕ активен"
-fi
-
-print_info "Проверка UFW..."
-# ВАЖНО: используем LC_ALL=C для английского вывода независимо от локали
-if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
-    print_success "UFW активен ✓"
-else
-    print_warning "UFW НЕ активен"
-    print_info "Для активации выполните: sudo ufw --force enable"
-fi
-
-# ============================================
-# ФИНАЛ
-# ============================================
-echo ""
-echo "=========================================="
-print_success "Настройка завершена!"
-echo "=========================================="
-echo ""
-print_info "ВАЖНО: Для применения всех изменений:"
-echo ""
-echo "  1. Выйдите из текущей SSH-сессии: exit"
-echo "  2. Зайдите снова на сервер через порт $SSH_PORT:"
-echo "     ssh -p $SSH_PORT $NEW_USER@YOUR_SERVER_IP"
-echo "  3. При первом входе запустите настройку Powerlevel10k: p10k configure"
-echo "  4. Установите шрифт MesloLGS NF на ваш локальный компьютер:"
-echo "     https://github.com/romkatv/powerlevel10k#fonts"
-echo ""
-echo "Полезные алиасы для управления безопасностью:"
-echo "  f2bs      - статус fail2ban"
-echo "  f2bssh    - статус jail sshd (заблокированные IP)"
-echo "  ufwv      - статус файрвола"
-echo "  ufwn      - правила файрвола с номерами"
-echo "  sshlog    - последние логи SSH"
-echo "  sshcheck  - проверка синтаксиса sshd_config"
-echo ""
-echo "Что разрешено на сервере:"
-echo "  ✅ SSH-туннели (AllowTcpForwarding yes)"
-echo "  ✅ Сессии живут бесконечно (нет таймаутов)"
-echo "  ✅ tmux/screen для долгоживущих задач"
-echo "  ✅ Agent forwarding"
-echo ""
-if [[ -f "$BACKUP_FILE" ]] 2>/dev/null; then
-    print_warning "Резервная копия sshd_config: $BACKUP_FILE"
-fi
-print_error "⚠️  ВХОД ПО ПАРОЛЮ ОТКЛЮЧЁН! Только по SSH-ключу!"
-print_error "⚠️  Вход под root по SSH ЗАПРЕЩЁН!"
-print_warning "fail2ban автоматически блокирует атакующих после 3 неудачных попыток"
-echo ""
-deepl is broken
+part3_tests() {
+  section "ЧАСТЬ 3: ТЕСТЫ И ДИАГНОСТИКА"
+  echo "  1) IP region"
+  echo "  2) Censorcheck для проверки геоблока"
+  echo "  3) Censorcheck для серверов РФ"
+  echo "  4) Тест до российских iPerf3 серверов"
+  echo "  5) YABS"
+  echo "  6) Проверка IP сервера на блокировки зарубежными сервисами"
+  echo "  7) Параметры сервера и проверка скорости к зарубежным провайдерам"
+  echo "  8) IPQuality"
+  echo "  9) Тест на процессор, можно понять примерно какой процент CPU выделили"
+  echo "  0) Назад"
+  local choice
+  ask "Выбор: " choice
+  case "$choice" in
+    1) bash <(wget -qO- https://ipregion.vrnt.xyz) ;;
+    2) bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock ;;
+    3) bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi ;;
+    4) bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) ;;
+    5) curl -sL yabs.sh | bash -s -- -4 ;;
+    6) bash <(curl -Ls IP.Check.Place) -l en ;;
+    7) wget -qO- bench.sh | bash ;;
+    8) bash <(curl -Ls https://Check.Place) -EI ;;
+    9) sysbench cpu run --threads=1 ;;
+    0) return ;;
+    *) warn "Неверный выбор" ;;
+  esac
+}
+while true; do
+  echo
+  echo "1) Первое обновление / unminimize"
+  echo "2) Настройка окружения"
+  echo "3) Тесты"
+  echo "0) Выход"
+  choice=""
+  ask "Выберите действие [0-3]: " choice
+  case "$choice" in
+    1) part1_update ;;
+    2) part2_setup ;;
+    3) part3_tests ;;
+    0) exit 0 ;;
+    *) warn "Неверный выбор" ;;
+  esac
+  pause
+done

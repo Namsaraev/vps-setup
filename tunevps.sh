@@ -19,6 +19,31 @@ error() { echo -e "$RED[ERROR]$NC $*" >&2; }
 section() { echo -e "\n$CYAN========== $* ==========$NC"; }
 
 ask() { echo -n "$1" > /dev/tty; read -r "$2" < /dev/tty; }
+ask_password() {
+  local prompt="$1" variable="$2"
+  printf '%s' "$prompt" > /dev/tty
+  IFS= read -r -s "$variable" < /dev/tty
+  printf '\n' > /dev/tty
+}
+set_pin_password() {
+  local password password_confirm
+  while true; do
+    ask_password "Введите пароль для $PIN_USER: " password
+    ask_password "Повторите пароль: " password_confirm
+    if [ -z "$password" ]; then
+      warn "Пароль не может быть пустым"
+    elif [ "$password" != "$password_confirm" ]; then
+      warn "Пароли не совпадают"
+    elif printf '%s:%s\n' "$PIN_USER" "$password" | chpasswd; then
+      unset password password_confirm
+      ok "Пароль для $PIN_USER установлен"
+      return 0
+    else
+      unset password password_confirm
+      error "Не удалось установить пароль; попробуйте ещё раз"
+    fi
+  done
+}
 pause() { local v; ask "Нажмите Enter для продолжения..." v; }
 yes_by_default() { [[ -z "$1" || "$1" =~ ^[Yy]$ ]]; }
 
@@ -201,12 +226,7 @@ configure_pin() {
     ask "Ваш выбор: " action
     case "$action" in
       "") info "Пользователь $PIN_USER оставлен без изменений"; return ;;
-      1)
-        until passwd "$PIN_USER"; do
-          ask "Пароль не установлен. Повторить? [Y/n]: " answer
-          yes_by_default "$answer" || return 1
-        done
-        return ;;
+      1) set_pin_password; return ;;
       2|3) ;;
       *) warn "Неизвестный выбор — ничего не меняем"; return ;;
     esac
@@ -223,10 +243,7 @@ configure_pin() {
     sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"; is_new=true
     ok "Пользователь $PIN_USER создан"
     info "Задайте пароль $PIN_USER (ввод и подтверждение не отображаются):"
-    until passwd "$PIN_USER"; do
-      ask "Пароль не установлен. Повторить? [Y/n]: " answer
-      yes_by_default "$answer" || break
-    done
+    set_pin_password
   fi
 
   if [ "$is_new" = true ]; then
@@ -430,40 +447,34 @@ part2_setup() {
   ok "Часть 2 завершена"
 }
 
-run_downloaded_script() {
-  local label="$1" url="$2"; shift 2
-  local tmp answer
-  tmp="$(mktemp)"
-  if ! curl --fail --location --proto '=https' --tlsv1.2 "$url" -o "$tmp"; then
-    error "Не удалось скачать $label"; rm -f "$tmp"; return 1
-  fi
-  echo "$label: SHA-256 $(sha256sum "$tmp" | awk '{print $1}')"
-  ask "Запустить скачанный скрипт $label? [y/N]: " answer
-  [[ "$answer" =~ ^[Yy]$ ]] && bash "$tmp" "$@"
-  rm -f "$tmp"
-}
-
 part3_tests() {
-  section "ЧАСТЬ 3: ТЕСТЫ"
-  echo "1) IP Region"; echo "2) Censorcheck geoblock"; echo "3) Censorcheck DPI"
-  echo "4) Russian iPerf3"; echo "5) YABS"; echo "6) IP.Check.Place"
-  echo "7) Bench.sh"; echo "8) Sysbench CPU"; echo "0) Назад"
+  section "ЧАСТЬ 3: ТЕСТЫ И ДИАГНОСТИКА"
+  echo "  1) IP region"
+  echo "  2) Censorcheck для проверки геоблока"
+  echo "  3) Censorcheck для серверов РФ"
+  echo "  4) Тест до российских iPerf3 серверов"
+  echo "  5) YABS"
+  echo "  6) Проверка IP сервера на блокировки зарубежными сервисами"
+  echo "  7) Параметры сервера и проверка скорости к зарубежным провайдерам"
+  echo "  8) IPQuality"
+  echo "  9) Тест на процессор, можно понять примерно какой процент CPU выделили"
+  echo "  0) Назад"
   local choice
   ask "Выбор: " choice
   case "$choice" in
-    1) run_downloaded_script "IP Region" "https://ipregion.vrnt.xyz" -4 ;;
-    2) run_downloaded_script "Censorcheck" "https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh" --mode geoblock ;;
-    3) run_downloaded_script "Censorcheck" "https://raw.githubusercontent.com/vernette/censorcheck/master/censorcheck.sh" --mode dpi ;;
-    4) run_downloaded_script "Russian iPerf3" "https://raw.githubusercontent.com/itdoginfo/russian-iperf3-servers/main/speedtest.sh" ;;
-    5) run_downloaded_script "YABS" "https://yabs.sh" -4 ;;
-    6) run_downloaded_script "IP.Check.Place" "https://IP.Check.Place" -l en ;;
-    7) run_downloaded_script "Bench.sh" "https://bench.sh" ;;
-    8) sysbench cpu run --threads=1 ;;
+    1) bash <(wget -qO- https://ipregion.vrnt.xyz) ;;
+    2) bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock ;;
+    3) bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi ;;
+    4) bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) ;;
+    5) curl -sL yabs.sh | bash -s -- -4 ;;
+    6) bash <(curl -Ls IP.Check.Place) -l en ;;
+    7) wget -qO- bench.sh | bash ;;
+    8) bash <(curl -Ls https://Check.Place) -EI ;;
+    9) sysbench cpu run --threads=1 ;;
     0) return ;;
     *) warn "Неверный выбор" ;;
   esac
 }
-
 while true; do
   echo
   echo "1) Первое обновление / unminimize"

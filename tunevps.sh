@@ -51,7 +51,7 @@ info "Окружение будет настроено для $CURRENT_USER: $US
 detect_minimized() {
   [ -f /etc/dpkg/origins/ubuntu-minimized ] && return 0
   [ -f /etc/dpkg/dpkg.cfg.d/excludes ] && grep -q 'path-exclude' /etc/dpkg/dpkg.cfg.d/excludes && return 0
-  dpkg-query -W -f='$'\''{db:Status-Status}'\'' ubuntu-standard 2>/dev/null | grep -qx installed && return 1
+  dpkg-query -W -f='${db:Status-Status}' ubuntu-standard 2>/dev/null | grep -qx installed && return 1
   ! command -v man >/dev/null 2>&1 && ! command -v less >/dev/null 2>&1
 }
 IS_MINIMIZED=false

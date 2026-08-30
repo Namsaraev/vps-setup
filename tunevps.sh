@@ -510,7 +510,7 @@ if (( $+commands[zoxide] )); then
 fi
 
 [[ ! -r "$HOME/.p10k.zsh" ]] || source "$HOME/.p10k.zsh"
-EOFEOF
+EOF
   chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc"
   chmod 644 "$USER_HOME/.zshrc"
   ok "Zsh и P10K настроены для $CURRENT_USER"

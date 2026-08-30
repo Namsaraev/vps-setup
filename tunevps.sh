@@ -49,9 +49,10 @@ info "Ubuntu $VERSION_ID ($VERSION_CODENAME), $ARCH"
 info "Окружение будет настроено для $CURRENT_USER: $USER_HOME"
 
 detect_minimized() {
-  [ -f /etc/dpkg/origins/ubuntu-minimized ] && return 0
-  [ -f /etc/dpkg/dpkg.cfg.d/excludes ] && grep -q 'path-exclude' /etc/dpkg/dpkg.cfg.d/excludes && return 0
+  # ubuntu-minimized origin может оставаться после unminimize, поэтому
+  # он не является достаточным признаком. Главный критерий — ubuntu-standard.
   dpkg-query -W -f='${db:Status-Status}' ubuntu-standard 2>/dev/null | grep -qx installed && return 1
+  [ -f /etc/dpkg/dpkg.cfg.d/excludes ] && grep -q 'path-exclude' /etc/dpkg/dpkg.cfg.d/excludes && return 0
   ! command -v man >/dev/null 2>&1 && ! command -v less >/dev/null 2>&1
 }
 IS_MINIMIZED=false
@@ -68,11 +69,18 @@ part1_update() {
       if ! command -v unminimize >/dev/null 2>&1; then
         apt-get install -y unminimize
       fi
-      if yes | unminimize; then
+      # При pipefail команда yes получает SIGPIPE, когда unminimize закончил чтение.
+      # Поэтому берём код именно unminimize, а затем проверяем реальное состояние.
+      set +o pipefail
+      yes | unminimize
+      unminimize_status="${PIPESTATUS[1]}"
+      set -o pipefail
+      if [ "$unminimize_status" -eq 0 ] || ! detect_minimized; then
         IS_MINIMIZED=false
         ok "unminimize завершён"
       else
-        error "unminimize завершился с ошибкой"
+        error "unminimize завершился с кодом $unminimize_status"
+        warn "Проверьте: dpkg-query -W ubuntu-standard; cat /etc/dpkg/dpkg.cfg.d/excludes"
         return 1
       fi
     fi
@@ -81,9 +89,7 @@ part1_update() {
   apt-get update
   apt-get upgrade -y
   apt-get autoremove -y
-  # Маркер в tmpfs: действует только до обязательной перезагрузки.
-  touch /run/tunevps-reboot-required
-  ok "Пакеты обновлены; перед частью 2 требуется перезагрузка"
+  ok "Пакеты обновлены"
   local answer
   ask "Перезагрузить сервер сейчас? [Y/n]: " answer
   if yes_by_default "$answer"; then
@@ -91,7 +97,7 @@ part1_update() {
     sleep 5
     reboot
   else
-    warn "Перед частью 2 обязательно перезагрузите сервер вручную"
+    info "Перезагрузка отложена по вашему выбору"
   fi
 }
 
@@ -160,7 +166,11 @@ configure_swap() {
     return
   fi
   local ram
-  ram="$(free -m | awk '/Mem:/ {print $2}')"
+  ram="$(LC_ALL=C free -m | awk '/^Mem:/ {print $2}')"
+  if ! [[ "$ram" =~ ^[0-9]+$ ]]; then
+    error "Не удалось определить объём RAM; swap не изменён"
+    return 1
+  fi
   if [ "$ram" -gt "$SWAP_RAM_THRESHOLD_MB" ]; then
     info "RAM больше $SWAP_RAM_THRESHOLD_MB MB — swap не нужен"
     return
@@ -179,7 +189,7 @@ configure_swap() {
 
 configure_pin() {
   section "ПОСТОЯННЫЙ ПОЛЬЗОВАТЕЛЬ $PIN_USER"
-  local home sshdir keys action answer method public_key keyfile
+  local home sshdir keys action answer method public_key keyfile is_new=false
   if id "$PIN_USER" >/dev/null 2>&1; then
     home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
     sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"
@@ -191,7 +201,12 @@ configure_pin() {
     ask "Ваш выбор: " action
     case "$action" in
       "") info "Пользователь $PIN_USER оставлен без изменений"; return ;;
-      1) passwd "$PIN_USER"; return ;;
+      1)
+        until passwd "$PIN_USER"; do
+          ask "Пароль не установлен. Повторить? [Y/n]: " answer
+          yes_by_default "$answer" || return 1
+        done
+        return ;;
       2|3) ;;
       *) warn "Неизвестный выбор — ничего не меняем"; return ;;
     esac
@@ -205,35 +220,45 @@ configure_pin() {
     adduser --disabled-password --gecos "" "$PIN_USER"
     usermod -aG sudo "$PIN_USER"
     home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
-    sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"
+    sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"; is_new=true
     ok "Пользователь $PIN_USER создан"
-    ask "Задать пароль $PIN_USER сейчас? [y/N]: " answer
-    [[ "$answer" =~ ^[Yy]$ ]] && passwd "$PIN_USER"
+    info "Задайте пароль $PIN_USER (ввод и подтверждение не отображаются):"
+    until passwd "$PIN_USER"; do
+      ask "Пароль не установлен. Повторить? [Y/n]: " answer
+      yes_by_default "$answer" || break
+    done
   fi
 
-  echo "1) Вставить публичный ключ"
-  echo "2) Скопировать ключ из файла на сервере"
-  echo "3) Пропустить"
-  ask "Способ добавления ключа [1/2/3]: " method
-  case "$method" in
-    1)
-      info "Вставьте один публичный ключ:"
-      read -r public_key < /dev/tty
-      [ -n "$public_key" ] || { warn "Пустой ключ — пропуск"; return; }
-      mkdir -p "$sshdir"; printf '%s\n' "$public_key" >> "$keys"
-      ;;
-    2)
-      ask "Путь к файлу публичного ключа: " keyfile
-      [ -f "$keyfile" ] || { error "Файл не найден"; return 1; }
-      mkdir -p "$sshdir"; cat "$keyfile" >> "$keys"
-      ;;
-    *) info "Ключ не изменён"; return ;;
-  esac
+  if [ "$is_new" = true ]; then
+    info "Вставьте публичный SSH-ключ для $PIN_USER одной строкой (Enter — пропустить):"
+    read -r public_key < /dev/tty
+    if [ -z "$public_key" ]; then
+      warn "Ключ не добавлен. До отключения паролей добавьте его вручную."
+      return
+    fi
+    mkdir -p "$sshdir"; printf '%s\n' "$public_key" > "$keys"
+  else
+    echo "1) Вставить публичный ключ"
+    echo "2) Скопировать ключ из файла на сервере"
+    echo "3) Пропустить"
+    ask "Способ добавления ключа [1/2/3]: " method
+    case "$method" in
+      1)
+        info "Вставьте один публичный ключ:"
+        read -r public_key < /dev/tty
+        [ -n "$public_key" ] || { warn "Пустой ключ — пропуск"; return; }
+        mkdir -p "$sshdir"; printf '%s\n' "$public_key" >> "$keys" ;;
+      2)
+        ask "Путь к файлу публичного ключа: " keyfile
+        [ -f "$keyfile" ] || { error "Файл не найден"; return 1; }
+        mkdir -p "$sshdir"; cat "$keyfile" >> "$keys" ;;
+      *) info "Ключ не изменён"; return ;;
+    esac
+  fi
   chown -R "$PIN_USER:$PIN_USER" "$sshdir"
   chmod 700 "$sshdir"; chmod 600 "$keys"
   ok "Ключ для $PIN_USER установлен"
 }
-
 configure_ufw() {
   section "UFW"
   local answer action source_ip
@@ -268,8 +293,8 @@ configure_ufw() {
 
 set_sshd_line() {
   local name="$1" value="$2"
-  if grep -qE "^#?$name " /etc/ssh/sshd_config; then
-    sed -i "s|^#?$name .*|$name $value|" /etc/ssh/sshd_config
+  if grep -qE "^#?$name[[:space:]]+" /etc/ssh/sshd_config; then
+    sed -Ei "s|^#?$name[[:space:]]+.*|$name $value|" /etc/ssh/sshd_config
   else
     echo "$name $value" >> /etc/ssh/sshd_config
   fi
@@ -303,9 +328,21 @@ EOF
     error "Ошибка sshd_config. Конфиг не перезапущен."
     return 1
   fi
+  if ! sshd -T | awk '$1 == "port" && $2 == 5829 {found=1} END {exit !found}'; then
+    error "sshd не принял порт $SSH_PORT; проверьте /etc/ssh/sshd_config и *.d"
+    return 1
+  fi
 
-  # На Ubuntu 24.04+ генератор читает Port из sshd_config после daemon-reload.
-  # Поэтому ssh.socket не отключается и не оставляет сам по себе порт 22.
+  # Явный override сохраняет socket activation, но очищает ListenStream :22
+  # и задаёт только 5829. Работает на Ubuntu 24.04 и на системах без генератора.
+  mkdir -p /etc/systemd/system/ssh.socket.d
+  cat > /etc/systemd/system/ssh.socket.d/99-vps-port.conf <<EOF
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:$SSH_PORT
+ListenStream=[::]:$SSH_PORT
+EOF
+
   if systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket; then
     systemctl daemon-reload
     systemctl restart ssh.socket
@@ -317,13 +354,13 @@ EOF
     ok "SSH слушает $SSH_PORT"
   else
     error "Порт $SSH_PORT не слушается; текущую сессию не закрывайте"
+    systemctl status ssh.socket ssh.service --no-pager || true
   fi
   if ss -ltn | grep -qE "[:.]22[[:space:]]"; then
-    warn "Порт 22 всё ещё слушается. Проверьте: sshd -T | grep ^port"
+    warn "Порт 22 всё ещё слушается; покажите: systemctl cat ssh.socket"
   fi
   sshd -T | grep -E '^(port|passwordauthentication|permitrootlogin|clientaliveinterval) '
 }
-
 as_current_user() {
   sudo -H -u "$CURRENT_USER" env HOME="$USER_HOME" "$@"
 }
@@ -381,10 +418,6 @@ EOF
 }
 
 part2_setup() {
-  if [ -e /run/tunevps-reboot-required ]; then
-    error "После части 1 требуется перезагрузка. Перезагрузите сервер и запустите скрипт снова."
-    return 1
-  fi
   section "ЧАСТЬ 2: ОКРУЖЕНИЕ"
   configure_locale_time
   install_packages
@@ -436,15 +469,13 @@ while true; do
   echo "1) Первое обновление / unminimize"
   echo "2) Настройка окружения"
   echo "3) Тесты"
-  echo "4) Часть 1 и выход для перезагрузки"
   echo "0) Выход"
   choice=""
-  ask "Выберите действие [0-4]: " choice
+  ask "Выберите действие [0-3]: " choice
   case "$choice" in
     1) part1_update ;;
     2) part2_setup ;;
     3) part3_tests ;;
-    4) part1_update; exit 0 ;;
     0) exit 0 ;;
     *) warn "Неверный выбор" ;;
   esac

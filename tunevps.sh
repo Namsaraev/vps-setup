@@ -81,7 +81,9 @@ part1_update() {
   apt-get update
   apt-get upgrade -y
   apt-get autoremove -y
-  ok "Пакеты обновлены"
+  # Маркер в tmpfs: действует только до обязательной перезагрузки.
+  touch /run/tunevps-reboot-required
+  ok "Пакеты обновлены; перед частью 2 требуется перезагрузка"
   local answer
   ask "Перезагрузить сервер сейчас? [Y/n]: " answer
   if yes_by_default "$answer"; then
@@ -379,6 +381,10 @@ EOF
 }
 
 part2_setup() {
+  if [ -e /run/tunevps-reboot-required ]; then
+    error "После части 1 требуется перезагрузка. Перезагрузите сервер и запустите скрипт снова."
+    return 1
+  fi
   section "ЧАСТЬ 2: ОКРУЖЕНИЕ"
   configure_locale_time
   install_packages

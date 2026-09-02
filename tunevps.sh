@@ -185,6 +185,39 @@ EOF
   fi
 }
 
+configure_autoremove() {
+  section "АВТООЧИСТКА НЕИСПОЛЬЗУЕМЫХ ПАКЕТОВ"
+
+  # Настраиваем автоматическую очистку при unattended-upgrades
+  cat > /etc/apt/apt.conf.d/50auto-remove <<'EOF'
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+EOF
+
+  # Проверяем текущее состояние
+  local packages
+  packages=$(apt-get --dry-run autoremove 2>/dev/null | grep -cE "^Remv " || echo 0)
+
+  if [ "$packages" -gt 0 ]; then
+    info "Найдено $packages пакетов для удаления:"
+    apt-get --dry-run autoremove 2>/dev/null | grep -E "^Remv " | awk '{print "  - " $2}' | head -20
+    [ "$packages" -gt 20 ] && info "  ... и ещё $((packages - 20))"
+
+    local answer
+    ask "Удалить эти пакеты сейчас? [y/N]: " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      apt-get autoremove -y --purge
+      ok "Удалено $packages пакетов"
+    else
+      info "Пропущено. Для ручного удаления: sudo apt autoremove --purge"
+    fi
+  else
+    ok "Нет пакетов для удаления"
+  fi
+
+  ok "Автоочистка настроена (будет работать при unattended-upgrades)"
+}
+
 configure_needrestart() {
   section "NEEDRESTART (ПЕРЕЗАПУСК СЛУЖБ ПОСЛЕ ОБНОВЛЕНИЙ)"
   info "needrestart установлен в режиме отчёта (без автоперезапуска)"
@@ -336,7 +369,7 @@ configure_pin() {
 configure_ufw() {
   section "UFW"
   local answer action source_ip
-  if ! ufw status | grep -q 'Status: active'; then
+  if ! LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active'; then
     ask "Настроить и активировать UFW? [Y/n]: " answer
     if yes_by_default "$answer"; then
       ufw default deny incoming
@@ -374,35 +407,90 @@ set_sshd_line() {
   fi
 }
 
+# ============================================
+# НАСТРОЙКА SSH — ИСПРАВЛЕННАЯ ВЕРСИЯ
+# ============================================
+# КРИТИЧЕСКИ ВАЖНО:
+# 1. В Ubuntu 24.04 cloud-init создаёт /etc/ssh/sshd_config.d/50-cloud-init.conf
+#    с PasswordAuthentication yes. В OpenSSH при Include используется ПЕРВОЕ
+#    встреченное значение, поэтому наш 99-файл игнорируется!
+# 2. Решение: создаём 00-vps-hardening.conf (загружается первым)
+# 3. Дополнительно удаляем конфликтующие параметры из других файлов в sshd_config.d
 configure_ssh() {
   section "SSH: ПОРТ, КЛЮЧИ И SOCKET ACTIVATION"
   local answer
   echo "Будет включён порт $SSH_PORT, а парольный вход — отключён."
-  echo "root разрешён только по ключу; ClientAliveInterval=0 отключает server-side idle timeout."
+  echo "root разрешён только по ключу."
+  echo "Сессия разрывается после 180с неактивности (60с × 3)."
   warn "Не закрывайте текущую сессию до успешной проверки нового входа."
   ask "Применить настройки SSH? [Y/n]: " answer
   yes_by_default "$answer" || return
 
+  # Резервная копия главного конфига
   cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
+
+  # Устанавливаем порт в основном конфиге
   set_sshd_line Port "$SSH_PORT"
   mkdir -p /etc/ssh/sshd_config.d
-  cat > /etc/ssh/sshd_config.d/99-vps-hardening.conf <<'EOF'
+
+  # ============================================
+  # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: файл с номером 00
+  # Загружается ПЕРВЫМ, поэтому его значения имеют приоритет
+  # ============================================
+  cat > /etc/ssh/sshd_config.d/00-vps-hardening.conf <<'EOF'
+# VPS hardening settings (создано tunevps.sh)
+# Этот файл загружается ПЕРВЫМ (номер 00), чтобы переопределить
+# настройки из 50-cloud-init.conf и других файлов
+
+# Аутентификация
+PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-PermitEmptyPasswords no
-PubkeyAuthentication yes
 PermitRootLogin prohibit-password
+PermitEmptyPasswords no
+
+# Защита от brute-force
 MaxAuthTries 3
-LogLevel VERBOSE
+
+# Безопасность окружения
 PermitUserEnvironment no
-ClientAliveInterval 0
+
+# PAM (обязательно включить при отключённых паролях)
+UsePAM yes
+
+# Keepalive: клиент отключается через 60*3 = 180 секунд неактивности
 TCPKeepAlive yes
+ClientAliveInterval 60
+ClientAliveCountMax 3
+
+LogLevel VERBOSE
 EOF
+
+  # ============================================
+  # УДАЛЕНИЕ КОНФЛИКТУЮЩИХ ПАРАМЕТРОВ из других файлов
+  # Например, 50-cloud-init.conf часто содержит "PasswordAuthentication yes"
+  # ============================================
+  local conflicting_params="PasswordAuthentication|PermitRootLogin|PubkeyAuthentication|KbdInteractiveAuthentication|PermitEmptyPasswords|MaxAuthTries|PermitUserEnvironment|UsePAM|TCPKeepAlive|ClientAliveInterval|ClientAliveCountMax|Port"
+
+  for conf in /etc/ssh/sshd_config.d/*.conf; do
+    [ -f "$conf" ] || continue
+    # Пропускаем наш файл
+    [ "$(basename "$conf")" = "00-vps-hardening.conf" ] && continue
+
+    # Проверяем, есть ли конфликтующие параметры
+    if grep -qEi "^($conflicting_params)[[:space:]]" "$conf" 2>/dev/null; then
+      info "Удаляем конфликтующие параметры из: $(basename "$conf")"
+      cp "$conf" "$conf.backup.$(date +%Y%m%d_%H%M%S)"
+      sed -i -E "/^($conflicting_params)[[:space:]]/Id" "$conf"
+    fi
+  done
+
+  # Проверка синтаксиса
   if ! sshd -t; then
     error "Ошибка sshd_config. Конфиг не перезапущен."
     return 1
   fi
-  if ! sshd -T | awk '$1 == "port" && $2 == 5829 {found=1} END {exit !found}'; then
+  if ! sshd -T | awk -v port="$SSH_PORT" '$1 == "port" && $2 == port {found=1} END {exit !found}'; then
     error "sshd не принял порт $SSH_PORT; проверьте /etc/ssh/sshd_config и *.d"
     return 1
   fi
@@ -424,6 +512,8 @@ EOF
     systemctl reload ssh.service || systemctl restart ssh.service
   fi
   sleep 2
+
+  # Проверка порта
   if ss -ltn | grep -qE "[:.]$SSH_PORT[[:space:]]"; then
     ok "SSH слушает $SSH_PORT"
   else
@@ -433,7 +523,41 @@ EOF
   if ss -ltn | grep -qE "[:.]22[[:space:]]"; then
     warn "Порт 22 всё ещё слушается; покажите: systemctl cat ssh.socket"
   fi
-  sshd -T | grep -E '^(port|passwordauthentication|permitrootlogin|clientaliveinterval) '
+
+  # ============================================
+  # ПРОВЕРКА ИТОГОВОЙ КОНФИГУРАЦИИ через sshd -T
+  # Это единственный надёжный способ увидеть, что реально применено
+  # ============================================
+  info "Итоговая конфигурация SSH (sshd -T):"
+  echo ""
+  sshd -T 2>/dev/null | grep -E "^(port|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|permituserenvironment|usepam|tcpkeepalive|clientaliveinterval|clientalivecountmax|maxauthtries) " | sort
+
+  echo ""
+
+  # Проверка критичных параметров
+  local pass_auth pubkey_auth root_login
+  pass_auth=$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')
+  pubkey_auth=$(sshd -T 2>/dev/null | awk '$1 == "pubkeyauthentication" {print $2}')
+  root_login=$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}')
+
+  if [ "$pass_auth" = "no" ]; then
+    ok "PasswordAuthentication=no применён ✓"
+  else
+    error "PasswordAuthentication=$pass_auth (должно быть 'no')!"
+    error "Проверьте файлы: grep -rEi '^PasswordAuthentication' /etc/ssh/"
+  fi
+
+  if [ "$pubkey_auth" = "yes" ]; then
+    ok "PubkeyAuthentication=yes применён ✓"
+  else
+    warn "PubkeyAuthentication=$pubkey_auth"
+  fi
+
+  if [ "$root_login" = "prohibit-password" ]; then
+    ok "PermitRootLogin=prohibit-password применён ✓"
+  else
+    warn "PermitRootLogin=$root_login"
+  fi
 }
 
 as_current_user() {
@@ -598,16 +722,31 @@ final_check() {
   else
     error "Ошибка синтаксиса sshd_config! ⚠️"
   fi
-  
-  # PasswordAuthentication через sshd -T (итоговая конфигурация)
-  local pass_auth
-  pass_auth=$(sshd -T 2>/dev/null | grep '^passwordauthentication' | awk '{print $2}')
+
+  # КРИТИЧНЫЕ параметры SSH через sshd -T (итоговая конфигурация)
+  local pass_auth pubkey_auth root_login
+  pass_auth=$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')
+  pubkey_auth=$(sshd -T 2>/dev/null | awk '$1 == "pubkeyauthentication" {print $2}')
+  root_login=$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}')
+
   if [ "$pass_auth" = "no" ]; then
-    ok "PasswordAuthentication отключён (итоговая конфигурация) ✓"
+    ok "PasswordAuthentication=no ✓"
   else
-    warn "PasswordAuthentication: $pass_auth ⚠️"
+    error "PasswordAuthentication=$pass_auth (должно быть 'no')!"
   fi
-  
+
+  if [ "$pubkey_auth" = "yes" ]; then
+    ok "PubkeyAuthentication=yes ✓"
+  else
+    warn "PubkeyAuthentication=$pubkey_auth"
+  fi
+
+  if [ "$root_login" = "prohibit-password" ]; then
+    ok "PermitRootLogin=prohibit-password ✓"
+  else
+    warn "PermitRootLogin=$root_login"
+  fi
+
   # BBR
   local bbr
   bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "none")
@@ -664,9 +803,10 @@ final_check() {
 
 part2_setup() {
   section "ЧАСТЬ 2: ОКРУЖЕНИЕ"
-  configure_locale_time
   install_packages
+  configure_locale_time
   configure_unattended_upgrades
+  configure_autoremove
   configure_needrestart
   configure_safe_sysctl
   configure_swap

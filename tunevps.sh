@@ -196,7 +196,7 @@ EOF
 
   # Проверяем текущее состояние
   local packages
-  packages=$(apt-get --dry-run autoremove 2>/dev/null | grep -cE "^Remv " || echo 0)
+  packages=$(apt-get --dry-run autoremove 2>/dev/null | grep -E "^Remv " | wc -l)
 
   if [ "$packages" -gt 0 ]; then
     info "Найдено $packages пакетов для удаления:"
@@ -553,8 +553,8 @@ EOF
     warn "PubkeyAuthentication=$pubkey_auth"
   fi
 
-  if [ "$root_login" = "prohibit-password" ]; then
-    ok "PermitRootLogin=prohibit-password применён ✓"
+  if [ "$root_login" = "prohibit-password" ] || [ "$root_login" = "without-password" ]; then
+    ok "PermitRootLogin=$root_login применён ✓ (только по ключу)"
   else
     warn "PermitRootLogin=$root_login"
   fi
@@ -741,8 +741,8 @@ final_check() {
     warn "PubkeyAuthentication=$pubkey_auth"
   fi
 
-  if [ "$root_login" = "prohibit-password" ]; then
-    ok "PermitRootLogin=prohibit-password ✓"
+  if [ "$root_login" = "prohibit-password" ] || [ "$root_login" = "without-password" ]; then
+    ok "PermitRootLogin=$root_login ✓ (только по ключу)"
   else
     warn "PermitRootLogin=$root_login"
   fi

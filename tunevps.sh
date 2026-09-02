@@ -10,6 +10,12 @@ SWAP_RAM_THRESHOLD_MB=2048
 SWAP_SIZE="2G"
 P10K_REPOSITORY="https://github.com/romkatv/powerlevel10k.git"
 
+# Маркер первого обновления (для выбора между full-upgrade и upgrade)
+FIRST_UPDATE_MARKER="/var/lib/tunevps/.first-update-done"
+
+# Глобальный флаг наличия ключа у pin
+PIN_HAS_KEY=false
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 info() { echo -e "$BLUE[INFO]$NC $*"; }
@@ -47,11 +53,16 @@ set_pin_password() {
 pause() { local v; ask "Нажмите Enter для продолжения..." v; }
 yes_by_default() { [[ -z "$1" || "$1" =~ ^[Yy]$ ]]; }
 
+# Надёжная проверка: порт должен быть в конце поля локального адреса (4-е поле)
+# Работает для 0.0.0.0:5829, [::]:5829, *:5829
+check_ssh_port() {
+  ss -ltn | awk -v suffix=":$SSH_PORT" '$4 ~ suffix"$" {found=1} END {exit !found}'
+}
+
 if [ "$EUID" -ne 0 ]; then
   exec sudo bash "$0" "$@"
 fi
 
-# Это именно пользователь, который вызвал sudo, а не root.
 CURRENT_USER="$SUDO_USER"
 [ -n "$CURRENT_USER" ] || CURRENT_USER=root
 if ! id "$CURRENT_USER" >/dev/null 2>&1; then
@@ -74,8 +85,6 @@ info "Ubuntu $VERSION_ID ($VERSION_CODENAME), $ARCH"
 info "Окружение будет настроено для $CURRENT_USER: $USER_HOME"
 
 detect_minimized() {
-  # ubuntu-minimized origin может оставаться после unminimize, поэтому
-  # он не является достаточным признаком. Главный критерий — ubuntu-standard.
   dpkg-query -W -f='${db:Status-Status}' ubuntu-standard 2>/dev/null | grep -qx installed && return 1
   [ -f /etc/dpkg/dpkg.cfg.d/excludes ] && grep -q 'path-exclude' /etc/dpkg/dpkg.cfg.d/excludes && return 0
   ! command -v man >/dev/null 2>&1 && ! command -v less >/dev/null 2>&1
@@ -94,8 +103,6 @@ part1_update() {
       if ! command -v unminimize >/dev/null 2>&1; then
         apt-get install -y unminimize
       fi
-      # При pipefail команда yes получает SIGPIPE, когда unminimize закончил чтение.
-      # Поэтому берём код именно unminimize, а затем проверяем реальное состояние.
       set +o pipefail
       yes | unminimize
       unminimize_status="${PIPESTATUS[1]}"
@@ -112,7 +119,17 @@ part1_update() {
   fi
 
   apt-get update
-  apt-get upgrade -y
+
+  if [ ! -f "$FIRST_UPDATE_MARKER" ]; then
+    info "ПЕРВОЕ обновление системы — используем full-upgrade"
+    apt-get full-upgrade -y
+    mkdir -p "$(dirname "$FIRST_UPDATE_MARKER")" 2>/dev/null
+    touch "$FIRST_UPDATE_MARKER"
+  else
+    info "ПОВТОРНОЕ обновление системы — используем upgrade"
+    apt-get upgrade -y
+  fi
+
   apt-get autoremove -y
   ok "Пакеты обновлены"
   local answer
@@ -128,20 +145,23 @@ part1_update() {
 
 install_packages() {
   section "БАЗОВЫЕ ПАКЕТЫ"
-  apt-get update
-  apt-get install -y nano git curl wget unzip jq htop tmux net-tools dnsutils \
+  apt-get update || { error "apt-get update завершился с ошибкой"; return 1; }
+
+  if ! apt-get install -y nano git curl wget unzip jq htop tmux net-tools dnsutils \
     bat fd-find ripgrep fzf python3 python3-pip python3-venv build-essential \
     btop mtr-tiny iperf3 zsh sysbench ca-certificates gnupg \
-    ncdu iotop ufw unattended-upgrades needrestart locales
-  
-  # rng-tools5 только при наличии аппаратного RNG
+    ncdu iotop ufw unattended-upgrades needrestart locales; then
+    error "Не удалось установить базовые пакеты"
+    return 1
+  fi
+
   if [ -e /dev/hwrng ]; then
     info "Обнаружен /dev/hwrng — устанавливаем rng-tools5"
     apt-get install -y rng-tools5
   else
     info "Аппаратный RNG не обнаружен — rng-tools5 не требуется"
   fi
-  
+
   for package in eza zoxide; do
     if apt-cache show "$package" >/dev/null 2>&1; then
       apt-get install -y "$package"
@@ -151,6 +171,7 @@ install_packages() {
   done
   ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
   ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
+  return 0
 }
 
 configure_locale_time() {
@@ -169,15 +190,14 @@ APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
-  
-  # Проверка и включение timer'ов
+
   local timers_ok=true
   for timer in apt-daily.timer apt-daily-upgrade.timer; do
     if ! systemctl is-enabled "$timer" >/dev/null 2>&1; then
       systemctl enable "$timer" 2>/dev/null || timers_ok=false
     fi
   done
-  
+
   if [ "$timers_ok" = true ]; then
     ok "Авто-обновления безопасности включены"
   else
@@ -188,21 +208,19 @@ EOF
 configure_autoremove() {
   section "АВТООЧИСТКА НЕИСПОЛЬЗУЕМЫХ ПАКЕТОВ"
 
-  # Настраиваем автоматическую очистку при unattended-upgrades
+  # Автоудаление зависимостей ОТКЛЮЧЕНО для безопасности сервера
   cat > /etc/apt/apt.conf.d/50auto-remove <<'EOF'
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
 EOF
+  ok "Автоудаление зависимостей отключено (безопасно для Xray/3x-ui/Docker)"
 
-  # Проверяем текущее состояние
   local packages
   packages=$(apt-get --dry-run autoremove 2>/dev/null | grep -E "^Remv " | wc -l)
-
   if [ "$packages" -gt 0 ]; then
     info "Найдено $packages пакетов для удаления:"
     apt-get --dry-run autoremove 2>/dev/null | grep -E "^Remv " | awk '{print "  - " $2}' | head -20
     [ "$packages" -gt 20 ] && info "  ... и ещё $((packages - 20))"
-
     local answer
     ask "Удалить эти пакеты сейчас? [y/N]: " answer
     if [[ "$answer" =~ ^[Yy]$ ]]; then
@@ -214,17 +232,12 @@ EOF
   else
     ok "Нет пакетов для удаления"
   fi
-
-  ok "Автоочистка настроена (будет работать при unattended-upgrades)"
 }
 
 configure_needrestart() {
   section "NEEDRESTART (ПЕРЕЗАПУСК СЛУЖБ ПОСЛЕ ОБНОВЛЕНИЙ)"
   info "needrestart установлен в режиме отчёта (без автоперезапуска)"
-  info "Это безопасно: службы не будут перезапускаться автоматически"
-  info "Для включения автоматического режима выполните:"
-  info "  sudo sed -i 's/#\\\$nrconf{restart} =.*/\\\$nrconf{restart} = \"a\";/' /etc/needrestart/needrestart.conf"
-  
+
   local answer
   ask "Включить автоматический перезапуск служб после обновлений? [y/N]: " answer
   if [[ "$answer" =~ ^[Yy]$ ]]; then
@@ -245,7 +258,6 @@ configure_safe_sysctl() {
   section "БЕЗОПАСНЫЕ SYSCTL"
   cat > /etc/sysctl.d/99-vps-tuning.conf <<'EOF'
 # Совместимо с VPN, policy routing, туннелями и proxy.
-# rp_filter, tcp_fastopen и агрессивные TCP-переменные намеренно не задаются.
 net.ipv4.tcp_syncookies = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.conf.all.accept_redirects = 0
@@ -260,24 +272,54 @@ fs.file-max = 1048576
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 EOF
+
+  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    ok "BBR доступен в ядре"
+  else
+    warn "BBR недоступен в этом ядре — удаляем строки BBR/fq из конфига"
+    sed -i '/tcp_congestion_control = bbr/d' /etc/sysctl.d/99-vps-tuning.conf
+    sed -i '/default_qdisc = fq/d' /etc/sysctl.d/99-vps-tuning.conf
+  fi
+
   if sysctl --system >/dev/null; then
     ok "Безопасные sysctl применены"
   else
-    warn "Некоторые sysctl не применились; проверьте: sysctl --system"
+    error "Не удалось применить некоторые sysctl"
+    return 1
   fi
+
   cat > /etc/security/limits.d/99-vps.conf <<'EOF'
 * soft nofile 524288
 * hard nofile 1048576
 root soft nofile 524288
 root hard nofile 1048576
 EOF
+  return 0
+}
+
+# Глобальный лимит для systemd-сервисов
+configure_systemd_limits() {
+  section "ЛИМИТЫ ДЛЯ SYSTEMD-СЕРВИСОВ"
+  info "limits.d применяется только к интерактивным сессиям (через PAM)."
+  info "Для системных сервисов (Xray, 3x-ui, Docker) задаём глобальный лимит."
+  mkdir -p /etc/systemd/system.conf.d || { error "Не удалось создать /etc/systemd/system.conf.d"; return 1; }
+  cat > /etc/systemd/system.conf.d/99-nofile.conf <<'EOF'
+[Manager]
+DefaultLimitNOFILE=1048576
+EOF
+  if systemctl daemon-reexec; then
+    ok "DefaultLimitNOFILE=1048576 применён ко всем сервисам"
+  else
+    error "Не удалось выполнить systemctl daemon-reexec"
+    return 1
+  fi
 }
 
 configure_swap() {
   section "SWAP"
   if swapon --show --noheadings | grep -q .; then
     info "Swap уже настроен"
-    return
+    return 0
   fi
   local ram
   ram="$(LC_ALL=C free -m | awk '/^Mem:/ {print $2}')"
@@ -287,83 +329,165 @@ configure_swap() {
   fi
   if [ "$ram" -gt "$SWAP_RAM_THRESHOLD_MB" ]; then
     info "RAM больше $SWAP_RAM_THRESHOLD_MB MB — swap не нужен"
-    return
+    return 0
   fi
   info "RAM не более $SWAP_RAM_THRESHOLD_MB MB — создаём swap $SWAP_SIZE"
+
+  if [ -f /swapfile ]; then
+    warn "Файл /swapfile уже существует, но не используется как swap. Пересоздаём."
+  fi
   rm -f /swapfile
+
   if ! fallocate -l "$SWAP_SIZE" /swapfile; then
-    dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
+    dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress || { error "dd завершился с ошибкой"; return 1; }
   fi
   chmod 600 /swapfile
-  mkswap /swapfile
-  swapon /swapfile
+  mkswap /swapfile || { error "mkswap завершился с ошибкой"; return 1; }
+  swapon /swapfile || { error "swapon завершился с ошибкой"; return 1; }
   grep -qE '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
   ok "Swap создан"
+  return 0
 }
 
+# Безопасное управление ключами pin
 configure_pin() {
   section "ПОСТОЯННЫЙ ПОЛЬЗОВАТЕЛЬ $PIN_USER"
-  local home sshdir keys action answer method public_key keyfile is_new=false
+  local home sshdir keys action answer method public_key keyfile
+  local is_new=false replace_mode=false use_file=false
+
   if id "$PIN_USER" >/dev/null 2>&1; then
     home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
     sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"
-    info "$PIN_USER уже существует; ключей: $(test -s "$keys" && wc -l < "$keys" || echo 0)"
+    local key_count
+    key_count=$(test -s "$keys" && wc -l < "$keys" || echo 0)
+    info "$PIN_USER уже существует; ключей: $key_count"
+    [ "$key_count" -gt 0 ] && PIN_HAS_KEY=true
+
     echo "Enter) Ничего не менять (по умолчанию)"
     echo "1) Сменить пароль"
     echo "2) Добавить публичный ключ"
     echo "3) Заменить все публичные ключи"
     ask "Ваш выбор: " action
     case "$action" in
-      "") info "Пользователь $PIN_USER оставлен без изменений"; return ;;
-      1) set_pin_password; return ;;
-      2|3) ;;
-      *) warn "Неизвестный выбор — ничего не меняем"; return ;;
+      "") info "Пользователь $PIN_USER оставлен без изменений"; return 0 ;;
+      1) set_pin_password; return 0 ;;
+      2|3) [ "$action" = 3 ] && replace_mode=true ;;
+      *) warn "Неизвестный выбор — ничего не меняем"; return 0 ;;
     esac
-    [ "$action" = 3 ] && rm -f "$keys"
   else
     ask "Создать $PIN_USER и добавить в группу sudo? [Y/n]: " answer
     if ! yes_by_default "$answer"; then
       warn "Создание $PIN_USER пропущено"
-      return
+      return 0
     fi
-    adduser --disabled-password --gecos "" "$PIN_USER"
-    usermod -aG sudo "$PIN_USER"
+
+    # ЗАМЕЧАНИЕ 2: проверяем результат критичных команд
+    if ! adduser --disabled-password --gecos "" "$PIN_USER"; then
+      error "Не удалось создать пользователя $PIN_USER"
+      return 1
+    fi
+    if ! usermod -aG sudo "$PIN_USER"; then
+      error "Не удалось добавить $PIN_USER в группу sudo"
+      return 1
+    fi
+
     home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
     sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"; is_new=true
     ok "Пользователь $PIN_USER создан"
     info "Задайте пароль $PIN_USER (ввод и подтверждение не отображаются):"
-    set_pin_password
+    if ! set_pin_password; then
+      error "Не удалось установить пароль для $PIN_USER"
+      return 1
+    fi
   fi
 
-  if [ "$is_new" = true ]; then
-    info "Вставьте публичный SSH-ключ для $PIN_USER одной строкой (Enter — пропустить):"
-    read -r public_key < /dev/tty
-    if [ -z "$public_key" ]; then
-      warn "Ключ не добавлен. До отключения паролей добавьте его вручную."
-      return
-    fi
-    mkdir -p "$sshdir"; printf '%s\n' "$public_key" > "$keys"
-  else
+  # === Запрос ключа ===
+  if [ "$is_new" = false ]; then
     echo "1) Вставить публичный ключ"
     echo "2) Скопировать ключ из файла на сервере"
     echo "3) Пропустить"
     ask "Способ добавления ключа [1/2/3]: " method
     case "$method" in
-      1)
-        info "Вставьте один публичный ключ:"
-        read -r public_key < /dev/tty
-        [ -n "$public_key" ] || { warn "Пустой ключ — пропуск"; return; }
-        mkdir -p "$sshdir"; printf '%s\n' "$public_key" >> "$keys" ;;
-      2)
-        ask "Путь к файлу публичного ключа: " keyfile
-        [ -f "$keyfile" ] || { error "Файл не найден"; return 1; }
-        mkdir -p "$sshdir"; cat "$keyfile" >> "$keys" ;;
-      *) info "Ключ не изменён"; return ;;
+      1) use_file=false ;;
+      2) use_file=true ;;
+      *) info "Ключ не изменён"; return 0 ;;
     esac
   fi
-  chown -R "$PIN_USER:$PIN_USER" "$sshdir"
+
+  if [ "$use_file" = true ]; then
+    ask "Путь к файлу публичного ключа: " keyfile
+    # ЗАМЕЧАНИЕ 2: файл не найден — это ОШИБКА, а не успех
+    if [ ! -f "$keyfile" ]; then
+      error "Файл не найден: $keyfile"
+      return 1
+    fi
+    public_key=$(cat "$keyfile")
+  else
+    info "Вставьте публичный SSH-ключ одной строкой:"
+    read -r public_key < /dev/tty
+  fi
+
+  # Пустой ключ: НЕ ломаем существующие ключи
+  if [ -z "$public_key" ]; then
+    if [ "$replace_mode" = true ]; then
+      warn "Пустой ключ — замена отменена, старые ключи сохранены"
+    elif [ "$is_new" = true ]; then
+      warn "Ключ не добавлен. До отключения паролей добавьте его вручную."
+    else
+      warn "Пустой ключ — пропуск"
+    fi
+    return 0
+  fi
+
+  # Валидация формата ключа
+  case "$public_key" in
+    ssh-ed25519*|ssh-rsa*|ecdsa-sha2-*|ssh-dss*|sk-ssh-ed25519*|sk-ecdsa-sha2-*)
+      ;;
+    *)
+      warn "Строка не похожа на публичный SSH-ключ. Ключ не добавлен."
+      return 0
+      ;;
+  esac
+
+  # ЗАМЕЧАНИЕ 2: проверяем создание директории
+  if ! mkdir -p "$sshdir"; then
+    error "Не удалось создать $sshdir"
+    return 1
+  fi
+
+  # Атомарная запись через временный файл с проверками
+  local tmp_keys="${keys}.tmp.$$"
+  if [ "$is_new" = true ] || [ "$replace_mode" = true ]; then
+    if ! printf '%s\n' "$public_key" > "$tmp_keys"; then
+      rm -f "$tmp_keys"
+      error "Не удалось записать ключ во временный файл"
+      return 1
+    fi
+  else
+    if ! { cat "$keys" 2>/dev/null; printf '%s\n' "$public_key"; } > "$tmp_keys"; then
+      rm -f "$tmp_keys"
+      error "Не удалось записать ключ во временный файл"
+      return 1
+    fi
+  fi
+  chmod 600 "$tmp_keys"
+
+  # ЗАМЕЧАНИЕ 2: проверяем атомарную замену
+  if ! mv -f "$tmp_keys" "$keys"; then
+    error "Не удалось записать ключ в $keys"
+    rm -f "$tmp_keys"
+    return 1
+  fi
+
+  if ! chown -R "$PIN_USER:$PIN_USER" "$sshdir"; then
+    error "Не удалось установить владельца для $sshdir"
+    return 1
+  fi
   chmod 700 "$sshdir"; chmod 600 "$keys"
+
+  PIN_HAS_KEY=true
   ok "Ключ для $PIN_USER установлен"
+  return 0
 }
 
 configure_ufw() {
@@ -407,36 +531,39 @@ set_sshd_line() {
   fi
 }
 
-# ============================================
-# НАСТРОЙКА SSH — ИСПРАВЛЕННАЯ ВЕРСИЯ
-# ============================================
-# КРИТИЧЕСКИ ВАЖНО:
-# 1. В Ubuntu 24.04 cloud-init создаёт /etc/ssh/sshd_config.d/50-cloud-init.conf
-#    с PasswordAuthentication yes. В OpenSSH при Include используется ПЕРВОЕ
-#    встреченное значение, поэтому наш 99-файл игнорируется!
-# 2. Решение: создаём 00-vps-hardening.conf (загружается первым)
-# 3. Дополнительно удаляем конфликтующие параметры из других файлов в sshd_config.d
 configure_ssh() {
   section "SSH: ПОРТ, КЛЮЧИ И SOCKET ACTIVATION"
   local answer
+
+  # Определяем состояние ключа непосредственно перед отключением паролей
+  local keys_file="/home/$PIN_USER/.ssh/authorized_keys"
+  if [ -f "$keys_file" ] && [ -s "$keys_file" ]; then
+    PIN_HAS_KEY=true
+  else
+    PIN_HAS_KEY=false
+  fi
+
+  if [ "$PIN_HAS_KEY" != "true" ]; then
+    error "У $PIN_USER НЕТ SSH-ключа."
+    error "Нельзя отключать пароли без ключа — вы потеряете доступ."
+    error "Добавьте ключ и перезапустите настройку."
+    return 1
+  fi
+  ok "SSH-ключ для $PIN_USER найден — можно безопасно отключать пароли"
+
   echo "Будет включён порт $SSH_PORT, а парольный вход — отключён."
-  echo "root разрешён только по ключу."
+  echo "Вход под root будет ПОЛНОСТЬЮ запрещён (PermitRootLogin no)."
   echo "Сессия разрывается после 180с неактивности (60с × 3)."
   warn "Не закрывайте текущую сессию до успешной проверки нового входа."
   ask "Применить настройки SSH? [Y/n]: " answer
   yes_by_default "$answer" || return
 
-  # Резервная копия главного конфига
   cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
 
-  # Устанавливаем порт в основном конфиге
   set_sshd_line Port "$SSH_PORT"
+
   mkdir -p /etc/ssh/sshd_config.d
 
-  # ============================================
-  # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: файл с номером 00
-  # Загружается ПЕРВЫМ, поэтому его значения имеют приоритет
-  # ============================================
   cat > /etc/ssh/sshd_config.d/00-vps-hardening.conf <<'EOF'
 # VPS hardening settings (создано tunevps.sh)
 # Этот файл загружается ПЕРВЫМ (номер 00), чтобы переопределить
@@ -446,7 +573,7 @@ configure_ssh() {
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
-PermitRootLogin prohibit-password
+PermitRootLogin no
 PermitEmptyPasswords no
 
 # Защита от brute-force
@@ -455,7 +582,7 @@ MaxAuthTries 3
 # Безопасность окружения
 PermitUserEnvironment no
 
-# PAM (обязательно включить при отключённых паролях)
+# PAM
 UsePAM yes
 
 # Keepalive: клиент отключается через 60*3 = 180 секунд неактивности
@@ -463,40 +590,23 @@ TCPKeepAlive yes
 ClientAliveInterval 60
 ClientAliveCountMax 3
 
+# Подробные логи
 LogLevel VERBOSE
 EOF
 
-  # ============================================
-  # УДАЛЕНИЕ КОНФЛИКТУЮЩИХ ПАРАМЕТРОВ из других файлов
-  # Например, 50-cloud-init.conf часто содержит "PasswordAuthentication yes"
-  # ============================================
-  local conflicting_params="PasswordAuthentication|PermitRootLogin|PubkeyAuthentication|KbdInteractiveAuthentication|PermitEmptyPasswords|MaxAuthTries|PermitUserEnvironment|UsePAM|TCPKeepAlive|ClientAliveInterval|ClientAliveCountMax|Port"
+  # Конфликтующие параметры из чужих файлов НЕ удаляем.
+  # Приоритет обеспечивается файлом 00-*. + итоговая проверка через `sshd -T`.
 
-  for conf in /etc/ssh/sshd_config.d/*.conf; do
-    [ -f "$conf" ] || continue
-    # Пропускаем наш файл
-    [ "$(basename "$conf")" = "00-vps-hardening.conf" ] && continue
-
-    # Проверяем, есть ли конфликтующие параметры
-    if grep -qEi "^($conflicting_params)[[:space:]]" "$conf" 2>/dev/null; then
-      info "Удаляем конфликтующие параметры из: $(basename "$conf")"
-      cp "$conf" "$conf.backup.$(date +%Y%m%d_%H%M%S)"
-      sed -i -E "/^($conflicting_params)[[:space:]]/Id" "$conf"
-    fi
-  done
-
-  # Проверка синтаксиса
   if ! sshd -t; then
     error "Ошибка sshd_config. Конфиг не перезапущен."
     return 1
   fi
+
   if ! sshd -T | awk -v port="$SSH_PORT" '$1 == "port" && $2 == port {found=1} END {exit !found}'; then
     error "sshd не принял порт $SSH_PORT; проверьте /etc/ssh/sshd_config и *.d"
     return 1
   fi
 
-  # Явный override сохраняет socket activation, но очищает ListenStream :22
-  # и задаёт только 5829. Работает на Ubuntu 24.04 и на системах без генератора.
   mkdir -p /etc/systemd/system/ssh.socket.d
   cat > /etc/systemd/system/ssh.socket.d/99-vps-port.conf <<EOF
 [Socket]
@@ -513,28 +623,24 @@ EOF
   fi
   sleep 2
 
-  # Проверка порта
-  if ss -ltn | grep -qE "[:.]$SSH_PORT[[:space:]]"; then
+  # Надёжная проверка порта через awk
+  if check_ssh_port; then
     ok "SSH слушает $SSH_PORT"
   else
     error "Порт $SSH_PORT не слушается; текущую сессию не закрывайте"
     systemctl status ssh.socket ssh.service --no-pager || true
+    return 1
   fi
-  if ss -ltn | grep -qE "[:.]22[[:space:]]"; then
+
+  if ss -ltn | awk '$4 ~ /:22$/' | grep -q .; then
     warn "Порт 22 всё ещё слушается; покажите: systemctl cat ssh.socket"
   fi
 
-  # ============================================
-  # ПРОВЕРКА ИТОГОВОЙ КОНФИГУРАЦИИ через sshd -T
-  # Это единственный надёжный способ увидеть, что реально применено
-  # ============================================
   info "Итоговая конфигурация SSH (sshd -T):"
   echo ""
-  sshd -T 2>/dev/null | grep -E "^(port|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|permituserenvironment|usepam|tcpkeepalive|clientaliveinterval|clientalivecountmax|maxauthtries) " | sort
-
+  sshd -T 2>/dev/null | grep -E "^(port|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|permituserenvironment|usepam|tcpkeepalive|clientaliveinterval|clientalivecountmax|maxauthtries|loglevel) " | sort
   echo ""
 
-  # Проверка критичных параметров
   local pass_auth pubkey_auth root_login
   pass_auth=$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')
   pubkey_auth=$(sshd -T 2>/dev/null | awk '$1 == "pubkeyauthentication" {print $2}')
@@ -544,7 +650,7 @@ EOF
     ok "PasswordAuthentication=no применён ✓"
   else
     error "PasswordAuthentication=$pass_auth (должно быть 'no')!"
-    error "Проверьте файлы: grep -rEi '^PasswordAuthentication' /etc/ssh/"
+    return 1
   fi
 
   if [ "$pubkey_auth" = "yes" ]; then
@@ -553,11 +659,13 @@ EOF
     warn "PubkeyAuthentication=$pubkey_auth"
   fi
 
-  if [ "$root_login" = "prohibit-password" ] || [ "$root_login" = "without-password" ]; then
-    ok "PermitRootLogin=$root_login применён ✓ (только по ключу)"
+  if [ "$root_login" = "no" ]; then
+    ok "PermitRootLogin=no применён ✓"
   else
-    warn "PermitRootLogin=$root_login"
+    warn "PermitRootLogin=$root_login (должно быть 'no')"
   fi
+
+  return 0
 }
 
 as_current_user() {
@@ -609,19 +717,18 @@ if [[ -o interactive && ! -r "$HOME/.p10k.zsh" ]] && (( $+functions[p10k] )); th
 fi
 
 # === Алиасы для установленных утилит ===
+# Настоящий `cat` остаётся, добавлен bcat
 if (( $+commands[bat] )); then
-  alias cat='bat --paging=never'
+  alias bcat='bat --paging=never'
 fi
 if (( $+commands[eza] )); then
   alias ls='eza --icons'
   alias ll='eza -la --icons --git'
   alias lt='eza --tree --icons --level=2'
 fi
+# Настоящий `grep` остаётся, добавлен удобный алиас для `rg`
 if (( $+commands[rg] )); then
-  alias grep='rg'
-fi
-if (( $+commands[fd] )); then
-  alias fd='fd'
+  alias rg='rg --smart-case'
 fi
 if (( $+commands[btop] )); then
   alias top='btop'
@@ -650,18 +757,13 @@ alias sshcheck='sudo sshd -t && echo "SSH config OK"'
 alias iotop='sudo iotop'
 alias ncdu='ncdu --color dark'
 
-# === FZF ===
-# Ctrl+R: история команд; Ctrl+T: поиск файлов; Alt+C: переход в каталог.
+# === ФZF ===
 setup_fzf() {
   (( $+commands[fzf] )) || return 0
-
-  # В новых версиях fzf эта команда сразу задаёт Ctrl+R, Ctrl+T и Alt+C.
   if fzf --zsh >/dev/null 2>&1; then
     eval "$(fzf --zsh)"
     return 0
   fi
-
-  # Совместимость с пакетами fzf из Ubuntu 24.04/26.04.
   local fzf_paths=(
     "/usr/share/doc/fzf/examples/key-bindings.zsh"
     "/usr/share/fzf/key-bindings.zsh"
@@ -686,7 +788,6 @@ if (( $+commands[fd] )); then
   export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
 fi
 
-# Zoxide добавляет команду z; обычный cd не переопределяется.
 if (( $+commands[zoxide] )); then
   eval "$(zoxide init zsh)"
 fi
@@ -701,29 +802,25 @@ EOF
 
 final_check() {
   section "ФИНАЛЬНАЯ ПРОВЕРКА"
-  
-  # SSH порт (проверяем и socket, и service)
-  if ss -ltn | grep -qE "[:.]$SSH_PORT[[:space:]]"; then
+
+  if check_ssh_port; then
     ok "SSH слушает порт $SSH_PORT ✓"
   else
     error "SSH НЕ слушает порт $SSH_PORT! ⚠️"
   fi
-  
-  # SSH активен (service или socket)
+
   if systemctl is-active --quiet ssh.service || systemctl is-active --quiet ssh.socket; then
     ok "SSH активен (service или socket) ✓"
   else
     error "SSH НЕ активен! ⚠️"
   fi
-  
-  # Проверка синтаксиса sshd_config
+
   if sshd -t 2>/dev/null; then
     ok "Синтаксис sshd_config корректен ✓"
   else
     error "Ошибка синтаксиса sshd_config! ⚠️"
   fi
 
-  # КРИТИЧНЫЕ параметры SSH через sshd -T (итоговая конфигурация)
   local pass_auth pubkey_auth root_login
   pass_auth=$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')
   pubkey_auth=$(sshd -T 2>/dev/null | awk '$1 == "pubkeyauthentication" {print $2}')
@@ -734,36 +831,31 @@ final_check() {
   else
     error "PasswordAuthentication=$pass_auth (должно быть 'no')!"
   fi
-
   if [ "$pubkey_auth" = "yes" ]; then
     ok "PubkeyAuthentication=yes ✓"
   else
     warn "PubkeyAuthentication=$pubkey_auth"
   fi
-
-  if [ "$root_login" = "prohibit-password" ] || [ "$root_login" = "without-password" ]; then
-    ok "PermitRootLogin=$root_login ✓ (только по ключу)"
+  if [ "$root_login" = "no" ]; then
+    ok "PermitRootLogin=no ✓"
   else
     warn "PermitRootLogin=$root_login"
   fi
 
-  # BBR
   local bbr
   bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "none")
   if [ "$bbr" = "bbr" ]; then
     ok "BBR включён ✓"
   else
-    warn "BBR не включён (текущий: $bbr)"
+    info "Алгоритм контроля перегрузки: $bbr"
   fi
-  
-  # Swap
+
   if swapon --show --noheadings | grep -q .; then
     ok "Swap настроен ✓"
   else
     info "Swap не настроен (RAM > ${SWAP_RAM_THRESHOLD_MB}MB)"
   fi
-  
-  # UFW
+
   if command -v ufw >/dev/null 2>&1; then
     if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
       ok "UFW активен ✓"
@@ -773,29 +865,34 @@ final_check() {
   else
     warn "UFW не установлен"
   fi
-  
-  # Zoxide
+
   if command -v zoxide >/dev/null 2>&1; then
     ok "zoxide установлен ✓"
   else
-    warn "zoxide НЕ установлен — алиас z будет работать как cd"
+    warn "zoxide НЕ установлен"
   fi
-  
-  # Powerlevel10k (проверяем каталог темы)
+
   if [ -d "$USER_HOME/.oh-my-zsh/custom/themes/powerlevel10k" ]; then
     ok "Powerlevel10k установлен ✓"
   else
     warn "Powerlevel10k не найден"
   fi
-  
-  # .zshrc
+
   if [ -f "$USER_HOME/.zshrc" ]; then
     ok ".zshrc создан для $CURRENT_USER ✓"
   else
     error ".zshrc НЕ найден! ⚠️"
   fi
-  
-  # Minimized
+
+  # ЗАМЕЧАНИЕ 1: проверяем, что systemd реально использует лимит (не просто наличие файла)
+  local default_nofile
+  default_nofile=$(systemctl show --property=DefaultLimitNOFILE --value 2>/dev/null || true)
+  if [ "$default_nofile" = "1048576" ]; then
+    ok "systemd DefaultLimitNOFILE=1048576 ✓"
+  else
+    warn "systemd DefaultLimitNOFILE=$default_nofile"
+  fi
+
   if [ "$IS_MINIMIZED" = true ]; then
     warn "⚠️  Система осталась в minimized состоянии"
   fi
@@ -803,16 +900,50 @@ final_check() {
 
 part2_setup() {
   section "ЧАСТЬ 2: ОКРУЖЕНИЕ"
-  install_packages
+
+  # КРИТИЧНЫЕ ЭТАПЫ с контролем ошибок
+  if ! install_packages; then
+    error "Не удалось установить базовые пакеты — останавливаюсь"
+    return 1
+  fi
+
   configure_locale_time
+
   configure_unattended_upgrades
+
+  # Менее критичные этапы (без остановки при ошибке)
   configure_autoremove
   configure_needrestart
-  configure_safe_sysctl
-  configure_swap
-  configure_pin
+
+  if ! configure_safe_sysctl; then
+    error "Не удалось применить безопасные sysctl — останавливаюсь"
+    return 1
+  fi
+
+  if ! configure_systemd_limits; then
+    error "Не удалось настроить лимиты для сервисов — останавливаюсь"
+    return 1
+  fi
+
+  if ! configure_swap; then
+    error "Не удалось настроить swap — останавливаюсь"
+    return 1
+  fi
+
+  if ! configure_pin; then
+    error "Настройка пользователя $PIN_USER завершилась ошибкой"
+    return 1
+  fi
+
+  # Сначала настраиваем SSH, затем файрвол,
+  # чтобы не открыть порт в файрволе до реального переключения
+  if ! configure_ssh; then
+    error "Настройка SSH завершилась ошибкой — останавливаюсь"
+    error "Доступ по текущей сессии сохранён, проверьте логи выше"
+    return 1
+  fi
+
   configure_ufw
-  configure_ssh
   configure_shell
   final_check
   ok "Часть 2 завершена"

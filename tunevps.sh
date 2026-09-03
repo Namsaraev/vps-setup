@@ -402,8 +402,17 @@ configure_swap() {
       info "  $source — $size_human ($type)"
     done
 
-    if [ "$total_swap_bytes" -eq "$desired_bytes" ]; then
-      ok "Размер активного swap уже соответствует $desired_human — ничего не меняем"
+    # Для swapfile swapon может показывать полезный размер на несколько байт/страницу
+    # меньше размера файла из-за служебного заголовка mkswap. Поэтому сравниваем
+    # с небольшой погрешностью, иначе повторный запуск ошибочно предложит пересоздать
+    # уже правильный swap (например, 2.00 GiB против 2G).
+    local page_size swap_tolerance size_diff
+    page_size=$(getconf PAGESIZE 2>/dev/null || echo 4096)
+    swap_tolerance=$((page_size * ${#active_sources[@]}))
+    size_diff=$(( total_swap_bytes > desired_bytes ? total_swap_bytes - desired_bytes : desired_bytes - total_swap_bytes ))
+
+    if [ "$size_diff" -le "$swap_tolerance" ]; then
+      ok "Размер активного swap соответствует $desired_human — ничего не меняем"
       return 0
     fi
 
@@ -715,13 +724,23 @@ configure_ssh() {
   fi
   ok "SSH-ключ для $PIN_USER найден"
 
+  # В Ubuntu/Debian sshd -t/-T может требовать этот runtime-каталог даже
+  # до запуска службы. Создаём его заранее, чтобы проверка была надёжной.
+  if ! install -d -m 0755 /run/sshd; then
+    error "Не удалось создать /run/sshd"
+    return 1
+  fi
+
   # Сначала смотрим эффективную конфигурацию sshd, а не только текст файлов.
   # Это делает повторный запуск идемпотентным и учитывает *.d/ и cloud-init.
   local effective
-  effective="$(sshd -T 2>/dev/null)" || {
+  if ! effective="$(sshd -T 2>&1)"; then
     error "Не удалось получить эффективную конфигурацию sshd (sshd -T)"
+    error "Причина:"
+    printf '%s\n' "$effective" >&2
+    error "Проверка: sshd -t"
     return 1
-  }
+  fi
 
   local current_port pass_auth pubkey_auth root_login kbd_auth max_auth
   current_port=$(awk '$1 == "port" {print $2; exit}' <<< "$effective")
@@ -1008,6 +1027,8 @@ EOF
 
 final_check() {
   section "ФИНАЛЬНАЯ ПРОВЕРКА"
+
+  install -d -m 0755 /run/sshd 2>/dev/null || true
 
   if check_ssh_port; then
     ok "SSH слушает порт $SSH_PORT ✓"

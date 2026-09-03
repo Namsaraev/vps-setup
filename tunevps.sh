@@ -256,7 +256,41 @@ configure_needrestart() {
 
 configure_safe_sysctl() {
   section "БЕЗОПАСНЫЕ SYSCTL"
-  cat > /etc/sysctl.d/99-vps-tuning.conf <<'EOF'
+
+  # BBR в Ubuntu может быть доступен как модуль tcp_bbr, но не загружен.
+  # Сначала пробуем загрузить модуль, затем только при необходимости
+  # отказываемся от BBR. Это важно для минимальных cloud-образов.
+  local bbr_available=false
+  local bbr_module=false
+
+  if command -v modinfo >/dev/null 2>&1 && modinfo tcp_bbr >/dev/null 2>&1; then
+    bbr_module=true
+  fi
+
+  if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    if [ "$bbr_module" = true ] && command -v modprobe >/dev/null 2>&1; then
+      info "BBR найден как модуль tcp_bbr, загружаем его"
+      if modprobe tcp_bbr 2>/dev/null; then
+        ok "Модуль tcp_bbr загружен"
+      else
+        warn "Не удалось загрузить модуль tcp_bbr"
+      fi
+    fi
+  fi
+
+  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    bbr_available=true
+    if [ "$bbr_module" = true ]; then
+      printf '%s\n' tcp_bbr > /etc/modules-load.d/tcp_bbr.conf
+      ok "tcp_bbr добавлен в автозагрузку модулей"
+    fi
+    info "BBR доступен в ядре"
+  else
+    rm -f /etc/modules-load.d/tcp_bbr.conf
+    warn "BBR недоступен в этом ядре — будет использован штатный алгоритм"
+  fi
+
+  cat > /etc/sysctl.d/99-vps-tuning.conf <<EOF
 # Совместимо с VPN, policy routing, туннелями и proxy.
 net.ipv4.tcp_syncookies = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
@@ -266,20 +300,11 @@ net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+$(if [ "$bbr_available" = true ]; then printf '%s\n' 'net.core.default_qdisc = fq' 'net.ipv4.tcp_congestion_control = bbr'; fi)
 fs.file-max = 1048576
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 EOF
-
-  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-    ok "BBR доступен в ядре"
-  else
-    warn "BBR недоступен в этом ядре — удаляем строки BBR/fq из конфига"
-    sed -i '/tcp_congestion_control = bbr/d' /etc/sysctl.d/99-vps-tuning.conf
-    sed -i '/default_qdisc = fq/d' /etc/sysctl.d/99-vps-tuning.conf
-  fi
 
   if sysctl --system >/dev/null; then
     ok "Безопасные sysctl применены"
@@ -317,35 +342,174 @@ EOF
 
 configure_swap() {
   section "SWAP"
-  if swapon --show --noheadings | grep -q .; then
-    info "Swap уже настроен"
-    return 0
-  fi
-  local ram
-  ram="$(LC_ALL=C free -m | awk '/^Mem:/ {print $2}')"
-  if ! [[ "$ram" =~ ^[0-9]+$ ]]; then
-    error "Не удалось определить объём RAM; swap не изменён"
+
+  local ram desired_bytes desired_human
+  local active_sources=() active_lines=()
+  local total_swap_bytes=0
+  local source size_bytes size_human type
+  local answer
+
+  # Проверяем, что SWAP_SIZE задан в формате, который понимает fallocate.
+  if ! [[ "$SWAP_SIZE" =~ ^[1-9][0-9]*([KMGTP]i?B?|[KMGTP])?$ ]]; then
+    error "Некорректный SWAP_SIZE: $SWAP_SIZE"
     return 1
   fi
-  if [ "$ram" -gt "$SWAP_RAM_THRESHOLD_MB" ]; then
-    info "RAM больше $SWAP_RAM_THRESHOLD_MB MB — swap не нужен"
-    return 0
-  fi
-  info "RAM не более $SWAP_RAM_THRESHOLD_MB MB — создаём swap $SWAP_SIZE"
 
-  if [ -f /swapfile ]; then
-    warn "Файл /swapfile уже существует, но не используется как swap. Пересоздаём."
-  fi
-  rm -f /swapfile
+  # Переводим SWAP_SIZE в байты без зависимости от numfmt.
+  swap_size_to_bytes() {
+    local value="$1" number suffix multiplier
+    number="${value%%[KMGTPiB]*}"
+    suffix="${value#$number}"
+    case "${suffix^^}" in
+      ""|B) multiplier=1 ;;
+      K|KB|KI|KIB) multiplier=1024 ;;
+      M|MB|MI|MIB) multiplier=1048576 ;;
+      G|GB|GI|GIB) multiplier=1073741824 ;;
+      T|TB|TI|TIB) multiplier=1099511627776 ;;
+      P|PB|PI|PIB) multiplier=1125899906842624 ;;
+      *) return 1 ;;
+    esac
+    printf '%s\n' "$((number * multiplier))"
+  }
 
+  desired_bytes="$(swap_size_to_bytes "$SWAP_SIZE")" || {
+    error "Не удалось разобрать SWAP_SIZE=$SWAP_SIZE"
+    return 1
+  }
+  desired_human="$SWAP_SIZE"
+
+  # swapon --show --bytes даёт размер именно активного swap.
+  # Поэтому скрипт не путает существующий /swapfile с реально включённым swap.
+  while read -r source size_bytes type; do
+    [ -n "$source" ] || continue
+    [[ "$size_bytes" =~ ^[0-9]+$ ]] || continue
+    active_sources+=("$source")
+    active_lines+=("$source|$size_bytes|$type")
+    total_swap_bytes=$((total_swap_bytes + size_bytes))
+  done < <(swapon --show=NAME,SIZE,TYPE --bytes --noheadings 2>/dev/null)
+
+  if [ "${#active_sources[@]}" -gt 0 ]; then
+    info "Активный swap уже найден:"
+    for line in "${active_lines[@]}"; do
+      IFS='|' read -r source size_bytes type <<< "$line"
+      size_human=$(awk -v b="$size_bytes" 'BEGIN {
+        if (b >= 1099511627776) printf "%.2f TiB", b/1099511627776;
+        else if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
+        else if (b >= 1048576) printf "%.2f MiB", b/1048576;
+        else if (b >= 1024) printf "%.2f KiB", b/1024;
+        else printf "%d B", b;
+      }')
+      info "  $source — $size_human ($type)"
+    done
+
+    if [ "$total_swap_bytes" -eq "$desired_bytes" ]; then
+      ok "Размер активного swap уже соответствует $desired_human — ничего не меняем"
+      return 0
+    fi
+
+    local total_human
+    total_human=$(awk -v b="$total_swap_bytes" 'BEGIN {
+      if (b >= 1099511627776) printf "%.2f TiB", b/1099511627776;
+      else if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
+      else if (b >= 1048576) printf "%.2f MiB", b/1048576;
+      else if (b >= 1024) printf "%.2f KiB", b/1024;
+      else printf "%d B", b;
+    }')
+    warn "Размер активного swap ($total_human) отличается от требуемого ($desired_human)."
+    warn "При замене активный swap будет временно отключён. Не делайте это при критической нехватке RAM."
+    ask "Заменить существующий swap на $desired_human? [y/N]: " answer
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+      info "Существующий swap оставлен без изменений"
+      return 0
+    fi
+
+    # Сначала отключаем каждый активный источник. Ничего не удаляем до swapoff.
+    for source in "${active_sources[@]}"; do
+      if ! swapoff "$source"; then
+        error "Не удалось отключить swap: $source"
+        warn "Остальные источники swap не изменялись"
+        return 1
+      fi
+    done
+
+    # Удаляем только обычные swap-файлы. Разделы/устройства не удаляем.
+    for source in "${active_sources[@]}"; do
+      if [ -f "$source" ]; then
+        rm -f -- "$source" || {
+          error "Не удалось удалить старый swap-файл: $source"
+          return 1
+        }
+      fi
+    done
+
+    # Если старый источник был прописан в fstab, отключаем его автоподключение.
+    # Строки не удаляем — только комментируем, чтобы не потерять исходную конфигурацию.
+    for source in "${active_sources[@]}"; do
+      if [ -f /etc/fstab ]; then
+        escaped_source=$(printf '%s' "$source" | sed 's/[.[\\*^$()+?{|]/\\&/g')
+        sed -Ei "s|^([[:space:]]*)($escaped_source[[:space:]]+[^#]*[[:space:]]+swap[[:space:]].*)$|# tunevps: disabled old swap \2|" /etc/fstab
+      fi
+    done
+  else
+    # Активного swap нет. Существующий /swapfile может быть просто старым файлом.
+    # Если файл не swap и RAM позволяет/требует swap — его можно безопасно заменить.
+    if [ -e /swapfile ] && [ ! -f /swapfile ]; then
+      error "/swapfile существует, но это не обычный файл — отказываюсь его удалять"
+      return 1
+    fi
+
+    ram="$(LC_ALL=C free -m | awk '/^Mem:/ {print $2}')"
+    if ! [[ "$ram" =~ ^[0-9]+$ ]]; then
+      error "Не удалось определить объём RAM; swap не изменён"
+      return 1
+    fi
+    if [ "$ram" -gt "$SWAP_RAM_THRESHOLD_MB" ]; then
+      info "Активного swap нет, RAM больше $SWAP_RAM_THRESHOLD_MB MB — swap не нужен"
+      return 0
+    fi
+    info "Активного swap нет, RAM не более $SWAP_RAM_THRESHOLD_MB MB — создаём $desired_human"
+    [ ! -f /swapfile ] || rm -f /swapfile || {
+      error "Не удалось удалить неиспользуемый /swapfile"
+      return 1
+    }
+  fi
+
+  # Создаём новый swap-файл. fallocate быстрее; dd — запасной вариант для FS,
+  # где fallocate создаёт неподходящий файл.
   if ! fallocate -l "$SWAP_SIZE" /swapfile; then
-    dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress || { error "dd завершился с ошибкой"; return 1; }
+    local count_mb=$((desired_bytes / 1048576))
+    if [ "$count_mb" -lt 1 ]; then count_mb=1; fi
+    if ! dd if=/dev/zero of=/swapfile bs=1M count="$count_mb" status=progress; then
+      error "Не удалось создать /swapfile"
+      rm -f /swapfile
+      return 1
+    fi
   fi
-  chmod 600 /swapfile
-  mkswap /swapfile || { error "mkswap завершился с ошибкой"; return 1; }
-  swapon /swapfile || { error "swapon завершился с ошибкой"; return 1; }
-  grep -qE '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  ok "Swap создан"
+
+  chmod 600 /swapfile || { error "Не удалось установить права 600 на /swapfile"; return 1; }
+  if ! mkswap /swapfile >/dev/null; then
+    error "mkswap завершился с ошибкой"
+    rm -f /swapfile
+    return 1
+  fi
+  if ! swapon /swapfile; then
+    error "swapon завершился с ошибкой"
+    rm -f /swapfile
+    return 1
+  fi
+
+  # Удаляем только старую строку tunevps для /swapfile и добавляем ровно одну.
+  # Это делает повторный запуск идемпотентным.
+  sed -i '\|^[[:space:]]*#*[[:space:]]*tunevps: .* /swapfile[[:space:]]|d' /etc/fstab 2>/dev/null || true
+  sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+  printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab
+
+  if swapon --show=NAME,SIZE --bytes --noheadings 2>/dev/null | awk '$1 == "/swapfile" && $2 > 0 {found=1} END {exit !found}'; then
+    ok "Swap $desired_human создан и активирован"
+  else
+    error "Swap создан, но проверка активации не пройдена"
+    return 1
+  fi
   return 0
 }
 
@@ -376,13 +540,9 @@ configure_pin() {
     esac
   else
     ask "Создать $PIN_USER и добавить в группу sudo? [Y/n]: " answer
-    # ============================================================
-    # ИСПРАВЛЕНИЕ: $PIN_USER обязателен для безопасной настройки
-    # ============================================================
     if ! yes_by_default "$answer"; then
-      error "Пользователь $PIN_USER обязателен для безопасной настройки SSH."
-      error "Без него невозможно настроить вход по ключу и отключить пароли."
-      return 1
+      warn "Создание $PIN_USER пропущено"
+      return 0
     fi
 
     # ЗАМЕЧАНИЕ 2: проверяем результат критичных команд
@@ -538,9 +698,9 @@ set_sshd_line() {
 configure_ssh() {
   section "SSH: ПОРТ, КЛЮЧИ И SOCKET ACTIVATION"
   local answer
-
-  # Определяем состояние ключа непосредственно перед отключением паролей
   local keys_file="/home/$PIN_USER/.ssh/authorized_keys"
+
+  # Определяем наличие ключа непосредственно перед возможным отключением паролей.
   if [ -f "$keys_file" ] && [ -s "$keys_file" ]; then
     PIN_HAS_KEY=true
   else
@@ -550,30 +710,71 @@ configure_ssh() {
   if [ "$PIN_HAS_KEY" != "true" ]; then
     error "У $PIN_USER НЕТ SSH-ключа."
     error "Нельзя отключать пароли без ключа — вы потеряете доступ."
-    error "Добавьте ключ и перезапустите настройку."
+    error "Добавьте ключ и повторите настройку."
     return 1
   fi
-  ok "SSH-ключ для $PIN_USER найден — можно безопасно отключать пароли"
+  ok "SSH-ключ для $PIN_USER найден"
 
-  echo "Будет включён порт $SSH_PORT, а парольный вход — отключён."
-  echo "Вход под root будет ПОЛНОСТЬЮ запрещён (PermitRootLogin no)."
-  echo "Сессия разрывается после 180с неактивности (60с × 3)."
-  warn "Не закрывайте текущую сессию до успешной проверки нового входа."
-  ask "Применить настройки SSH? [Y/n]: " answer
-  yes_by_default "$answer" || return
+  # Сначала смотрим эффективную конфигурацию sshd, а не только текст файлов.
+  # Это делает повторный запуск идемпотентным и учитывает *.d/ и cloud-init.
+  local effective
+  effective="$(sshd -T 2>/dev/null)" || {
+    error "Не удалось получить эффективную конфигурацию sshd (sshd -T)"
+    return 1
+  }
 
-  cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
+  local current_port pass_auth pubkey_auth root_login kbd_auth max_auth
+  current_port=$(awk '$1 == "port" {print $2; exit}' <<< "$effective")
+  pass_auth=$(awk '$1 == "passwordauthentication" {print $2}' <<< "$effective")
+  pubkey_auth=$(awk '$1 == "pubkeyauthentication" {print $2}' <<< "$effective")
+  root_login=$(awk '$1 == "permitrootlogin" {print $2}' <<< "$effective")
+  kbd_auth=$(awk '$1 == "kbdinteractiveauthentication" {print $2}' <<< "$effective")
+  max_auth=$(awk '$1 == "maxauthtries" {print $2}' <<< "$effective")
+
+  local ssh_ok=true
+  [ "$current_port" = "$SSH_PORT" ] || ssh_ok=false
+  [ "$pass_auth" = "no" ] || ssh_ok=false
+  [ "$pubkey_auth" = "yes" ] || ssh_ok=false
+  [ "$root_login" = "no" ] || ssh_ok=false
+  [ "$kbd_auth" = "no" ] || ssh_ok=false
+  [ "$max_auth" = "3" ] || ssh_ok=false
+
+  if [ "$ssh_ok" = true ] && check_ssh_port; then
+    ok "SSH уже настроен согласно требованиям скрипта — ничего не меняем"
+    return 0
+  fi
+
+  echo "Текущее состояние SSH:"
+  echo "  Порт:                     ${current_port:-не определён} (требуется $SSH_PORT)"
+  echo "  PasswordAuthentication:   ${pass_auth:-не определён} (требуется no)"
+  echo "  PubkeyAuthentication:     ${pubkey_auth:-не определён} (требуется yes)"
+  echo "  PermitRootLogin:          ${root_login:-не определён} (требуется no)"
+  echo "  KbdInteractiveAuth:       ${kbd_auth:-не определён} (требуется no)"
+  echo "  MaxAuthTries:             ${max_auth:-не определён} (требуется 3)"
+  echo
+  echo "Будет настроено: порт $SSH_PORT, вход по ключу, без паролей, root запрещён."
+  warn "Не закрывайте текущую SSH-сессию до успешной проверки нового входа."
+  ask "Применить настройки SSH? [y/N]: " answer
+  if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+    info "Настройка SSH пропущена по вашему выбору"
+    return 0
+  fi
+
+  cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)" || {
+    error "Не удалось создать резервную копию sshd_config"
+    return 1
+  }
 
   set_sshd_line Port "$SSH_PORT"
+  mkdir -p /etc/ssh/sshd_config.d || return 1
 
-  mkdir -p /etc/ssh/sshd_config.d
-
-  cat > /etc/ssh/sshd_config.d/00-vps-hardening.conf <<'EOF'
+  cat > /etc/ssh/sshd_config.d/00-vps-hardening.conf <<EOF
 # VPS hardening settings (создано tunevps.sh)
 # Этот файл загружается ПЕРВЫМ (номер 00), чтобы переопределить
-# настройки из 50-cloud-init.conf и других файлов
+# настройки из 50-cloud-init.conf и других файлов.
 
-# Аутентификация
+# Сетевой порт и аутентификация
+Port $SSH_PORT
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -598,9 +799,6 @@ ClientAliveCountMax 3
 LogLevel VERBOSE
 EOF
 
-  # Конфликтующие параметры из чужих файлов НЕ удаляем.
-  # Приоритет обеспечивается файлом 00-*. + итоговая проверка через `sshd -T`.
-
   if ! sshd -t; then
     error "Ошибка sshd_config. Конфиг не перезапущен."
     return 1
@@ -621,13 +819,18 @@ EOF
 
   if systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket; then
     systemctl daemon-reload
-    systemctl restart ssh.socket
+    if ! systemctl restart ssh.socket; then
+      error "Не удалось перезапустить ssh.socket"
+      return 1
+    fi
   else
-    systemctl reload ssh.service || systemctl restart ssh.service
+    if ! systemctl reload ssh.service && ! systemctl restart ssh.service; then
+      error "Не удалось перезагрузить ssh.service"
+      return 1
+    fi
   fi
   sleep 2
 
-  # Надёжная проверка порта через awk
   if check_ssh_port; then
     ok "SSH слушает $SSH_PORT"
   else
@@ -645,7 +848,6 @@ EOF
   sshd -T 2>/dev/null | grep -E "^(port|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|permituserenvironment|usepam|tcpkeepalive|clientaliveinterval|clientalivecountmax|maxauthtries|loglevel) " | sort
   echo ""
 
-  local pass_auth pubkey_auth root_login
   pass_auth=$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')
   pubkey_auth=$(sshd -T 2>/dev/null | awk '$1 == "pubkeyauthentication" {print $2}')
   root_login=$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}')
@@ -934,9 +1136,6 @@ part2_setup() {
     return 1
   fi
 
-  # ============================================================
-  # ИСПРАВЛЕНИЕ: если $PIN_USER не создан, останавливаемся сразу
-  # ============================================================
   if ! configure_pin; then
     error "Настройка пользователя $PIN_USER завершилась ошибкой"
     return 1

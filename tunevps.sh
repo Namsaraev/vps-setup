@@ -99,7 +99,7 @@ part1_update() {
     local answer
     ask "Преобразовать в обычную Ubuntu через unminimize? [Y/n]: " answer
     if yes_by_default "$answer"; then
-      apt-get update
+      apt-get update || { error "apt-get update завершился с ошибкой"; return 1; }
       if ! command -v unminimize >/dev/null 2>&1; then
         apt-get install -y unminimize
       fi
@@ -118,19 +118,18 @@ part1_update() {
     fi
   fi
 
-  apt-get update
+  apt-get update || { error "apt-get update завершился с ошибкой"; return 1; }
 
   if [ ! -f "$FIRST_UPDATE_MARKER" ]; then
     info "ПЕРВОЕ обновление системы — используем full-upgrade"
-    apt-get full-upgrade -y
-    mkdir -p "$(dirname "$FIRST_UPDATE_MARKER")" 2>/dev/null
-    touch "$FIRST_UPDATE_MARKER"
+    apt-get full-upgrade -y || { error "apt-get full-upgrade завершился с ошибкой"; return 1; }
+    mkdir -p "$(dirname "$FIRST_UPDATE_MARKER")" || { error "Не удалось создать каталог маркера обновления"; return 1; }
+    touch "$FIRST_UPDATE_MARKER" || { error "Не удалось создать маркер обновления"; return 1; }
   else
     info "ПОВТОРНОЕ обновление системы — используем upgrade"
-    apt-get upgrade -y
+    apt-get upgrade -y || { error "apt-get upgrade завершился с ошибкой"; return 1; }
   fi
 
-  apt-get autoremove -y
   ok "Пакеты обновлены"
   local answer
   ask "Перезагрузить сервер сейчас? [Y/n]: " answer

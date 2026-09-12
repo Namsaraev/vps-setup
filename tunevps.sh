@@ -663,10 +663,49 @@ configure_pin() {
   return 0
 }
 
+ufw_is_active() {
+  LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active$'
+}
+
+# Если UFW уже активен, целевой SSH-порт должен быть разрешён ДО
+# переключения sshd. Старые SSH-правила здесь намеренно не удаляются.
+ensure_ufw_ssh_port() {
+  if ! command -v ufw >/dev/null 2>&1; then
+    error "UFW не установлен — невозможно безопасно проверить доступ к SSH-порту $SSH_PORT"
+    return 1
+  fi
+
+  if ! ufw_is_active; then
+    info "UFW сейчас не активен — предварительное правило для SSH не требуется"
+    return 0
+  fi
+
+  info "UFW активен — заранее разрешаем SSH-порт $SSH_PORT/tcp"
+  if ! ufw allow "$SSH_PORT/tcp" comment 'SSH'; then
+    error "Не удалось разрешить $SSH_PORT/tcp в UFW"
+    return 1
+  fi
+
+  if LC_ALL=C ufw status | awk -v port="$SSH_PORT/tcp" '$1 == port && $2 == "ALLOW" {found=1} END {exit !found}'; then
+    ok "UFW разрешает $SSH_PORT/tcp"
+  else
+    error "После изменения UFW правило ALLOW для $SSH_PORT/tcp не найдено"
+    return 1
+  fi
+
+  return 0
+}
+
 configure_ufw() {
   section "UFW"
   local answer action source_ip
-  if ! LC_ALL=C ufw status 2>/dev/null | grep -q 'Status: active'; then
+
+  if ufw_is_active; then
+    # Повторная проверка безопасна и идемпотентна. Старый SSH-порт не удаляем.
+    if ! ensure_ufw_ssh_port; then
+      return 1
+    fi
+  else
     ask "Настроить и активировать UFW? [Y/n]: " answer
     if yes_by_default "$answer"; then
       ufw default deny incoming
@@ -678,6 +717,7 @@ configure_ufw() {
       ok "UFW включён: SSH $SSH_PORT, HTTP/HTTPS"
     fi
   fi
+
   echo "iPerf3: Enter) не менять; 1) открыть всем; 2) открыть одному IP; 3) закрыть общие правила"
   ask "Правило для порта 5201: " action
   case "$action" in
@@ -777,6 +817,13 @@ configure_ssh() {
   if [[ ! "$answer" =~ ^[Yy]$ ]]; then
     info "Настройка SSH пропущена по вашему выбору"
     return 0
+  fi
+
+  # Критическая preflight-проверка: если UFW уже активен, новый SSH-порт
+  # должен быть разрешён до изменения sshd. Старый порт намеренно сохраняем.
+  if ! ensure_ufw_ssh_port; then
+    error "Новый SSH-порт не подтверждён в UFW — конфигурация SSH не изменена"
+    return 1
   fi
 
   cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)" || {
@@ -1163,8 +1210,8 @@ part2_setup() {
     return 1
   fi
 
-  # Сначала настраиваем SSH, затем файрвол,
-  # чтобы не открыть порт в файрволе до реального переключения
+  # configure_ssh сам делает UFW preflight: если UFW уже активен,
+  # порт $SSH_PORT/tcp разрешается и проверяется ДО переключения sshd.
   if ! configure_ssh; then
     error "Настройка SSH завершилась ошибкой — останавливаюсь"
     error "Доступ по текущей сессии сохранён, проверьте логи выше"

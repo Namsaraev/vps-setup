@@ -1,0 +1,18 @@
+name: Bash syntax
+
+on:
+  pull_request:
+    paths:
+      - 'tunevps.sh'
+      - '.github/workflows/bash-syntax.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bash-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tunevps.sh syntax
+        run: bash -n tunevps.sh

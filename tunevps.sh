@@ -1018,7 +1018,9 @@ configure_shell() {
     [ -d "$custom/plugins/$1" ] || as_current_user git clone --depth=1 "$2" "$custom/plugins/$1"
   done
 
-  cat > "$USER_HOME/.zshrc" <<'EOF'
+  local managed_dir="$USER_HOME/.config/tunevps"
+  as_current_user mkdir -p "$managed_dir" || return 1
+  as_current_user tee "$managed_dir/zshrc" >/dev/null <<'EOF'
 # PATH — до P10K и Oh My Zsh.
 export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
@@ -1123,8 +1125,32 @@ fi
 
 [[ ! -r "$HOME/.p10k.zsh" ]] || source "$HOME/.p10k.zsh"
 EOF
-  chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/.zshrc"
-  chmod 644 "$USER_HOME/.zshrc"
+  [ "$?" -eq 0 ] || return 1
+
+  # Python is installed by install_packages(). Preserve user bytes, including
+  # CRLF and a missing final newline; never interpret the user's shell code.
+  as_current_user python3 - "$USER_HOME/.zshrc" <<'PY' || return 1
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+original = path.read_bytes() if path.exists() else b""
+begin = b"# >>> tunevps managed block >>>"
+end = b"# <<< tunevps managed block <<<"
+block = (begin + b'\nsource "$HOME/.config/tunevps/zshrc"\n' + end + b"\n")
+lines = original.splitlines(keepends=True)
+starts = [i for i, line in enumerate(lines) if line.rstrip(b"\r\n") == begin]
+ends = [i for i, line in enumerate(lines) if line.rstrip(b"\r\n") == end]
+if not starts and not ends:
+    # Put defaults first so the user's settings can override them afterwards.
+    updated = block + original
+elif len(starts) == len(ends) == 1 and starts[0] < ends[0]:
+    updated = b"".join(lines[:starts[0]]) + block + b"".join(lines[ends[0] + 1:])
+else:
+    sys.exit("Invalid or duplicate tunevps managed markers; .zshrc unchanged")
+if updated != original:
+    path.write_bytes(updated)
+PY
   ok "Zsh и P10K настроены для $CURRENT_USER"
   info "После нового SSH-входа под $CURRENT_USER мастер P10K стартует автоматически."
 }

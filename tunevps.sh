@@ -1340,8 +1340,8 @@ part2_setup() {
     return 1
   fi
 
-  configure_ufw
-  configure_shell
+  configure_ufw || return $?
+  configure_shell || return $?
   final_check || return $?
   ok "Часть 2 завершена"
 }

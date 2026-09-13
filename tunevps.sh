@@ -235,21 +235,90 @@ EOF
 
 configure_needrestart() {
   section "NEEDRESTART (ПЕРЕЗАПУСК СЛУЖБ ПОСЛЕ ОБНОВЛЕНИЙ)"
-  info "needrestart установлен в режиме отчёта (без автоперезапуска)"
+  info "Настройка режима перезапуска служб needrestart"
 
-  local answer
+  local answer confirm
   ask "Включить автоматический перезапуск служб после обновлений? [y/N]: " answer
   if [[ "$answer" =~ ^[Yy]$ ]]; then
     warn "ВНИМАНИЕ: Автоматический перезапуск может прервать активные соединения"
     ask "Вы уверены? Это может остановить SSH, nginx, БД [y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-      sed -i 's/#\$nrconf{restart} =.*/\$nrconf{restart} = "a";/' /etc/needrestart/needrestart.conf 2>/dev/null || true
+      # Python 3 is installed by install_packages(); do not execute Perl config.
+      if ! python3 - /etc/needrestart/needrestart.conf <<'PY'
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+key = rb"\$nrconf[ \t]*\{[ \t]*(?:restart|'restart'|\"restart\")[ \t]*\}"
+setting = re.compile(rb"^([ \t]*)(?:#[ \t]*)?" + key +
+                     rb"[ \t]*=[ \t]*(['\"])[ailq]\2[ \t]*;([ \t]*(?:#[^\r\n]*)?)(\r?\n)?$")
+reference = re.compile(key)
+
+
+def configure(data):
+    lines = []
+    found = False
+    for line in data.splitlines(keepends=True):
+        match = setting.fullmatch(line)
+        if match:
+            found = True
+            # Leave an already active 'a' byte-for-byte unchanged.
+            if re.match(rb"^[ \t]*" + key + rb"[ \t]*=[ \t]*(['\"])a\1[ \t]*;", line):
+                lines.append(line)
+            else:
+                lines.append(match[1] + b'$nrconf{restart} = "a";' +
+                             match[3] + (match[4] or b''))
+        else:
+            if not line.lstrip().startswith(b'#') and reference.search(line.split(b'#', 1)[0]):
+                raise ValueError("Unsupported restart expression; configuration unchanged")
+            lines.append(line)
+    result = b''.join(lines)
+    if not found:
+        result += (b'\n' if result and not result.endswith(b'\n') else b'')
+        result += b'$nrconf{restart} = "a";\n'
+    return result
+
+
+temporary = None
+try:
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("needrestart.conf must be a regular file")
+    original = path.read_bytes()
+    updated = configure(original)
+    if updated != original:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.needrestart-', delete=False) as stream:
+            temporary = stream.name
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chown(temporary, metadata.st_uid, metadata.st_gid)
+        os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+        os.replace(temporary, path)
+        temporary = None
+    actual = path.read_bytes()
+    if actual != updated or configure(actual) != actual:
+        raise ValueError("needrestart restart mode validation failed")
+except (OSError, ValueError) as exc:
+    sys.exit(str(exc))
+finally:
+    if temporary is not None:
+        os.unlink(temporary)
+PY
+      then
+        error "Не удалось включить и проверить автоматический перезапуск needrestart"
+        return 1
+      fi
       ok "Автоматический перезапуск включён"
     else
-      info "Оставлен режим отчёта"
+      info "Настройки needrestart не изменены"
     fi
   else
-    ok "Оставлен режим отчёта (безопасно)"
+    info "Настройки needrestart не изменены"
   fi
 }
 
@@ -1241,7 +1310,7 @@ part2_setup() {
 
   # Менее критичные этапы (без остановки при ошибке)
   configure_autoremove
-  configure_needrestart
+  configure_needrestart || return $?
 
   if ! configure_safe_sysctl; then
     error "Не удалось применить безопасные sysctl — останавливаюсь"

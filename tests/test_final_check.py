@@ -106,6 +106,18 @@ class FinalCheckTest(unittest.TestCase):
                 self.assertNotIn("Часть 2 завершена", result.stdout + result.stderr)
                 self.assertNotIn("PAUSED", result.stdout)
 
+    def test_needrestart_failure_propagates_without_completion_message(self):
+        stubs = "\n".join(f"{name}() {{ :; }}" for name in SETUP_STEPS)
+        result = subprocess.run(
+            [os.environ.get("BASH", "bash")],
+            input=PRELUDE + stubs + "\n" + PART2 + "\n"
+                  "configure_needrestart() { return 1; }\n"
+                  "final_check() { :; }\n"
+                  "set -e\npart2_setup || exit $?\n",
+            text=True, encoding="utf-8", capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("Часть 2 завершена", result.stdout + result.stderr)
+
     def test_success_flow_retains_completion_message(self):
         for mode in ("part2", "main"):
             with self.subTest(mode=mode):

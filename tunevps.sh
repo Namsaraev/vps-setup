@@ -1310,7 +1310,7 @@ part2_setup() {
 
   # Менее критичные этапы (без остановки при ошибке)
   configure_autoremove
-  configure_needrestart
+  configure_needrestart || return $?
 
   if ! configure_safe_sysctl; then
     error "Не удалось применить безопасные sysctl — останавливаюсь"

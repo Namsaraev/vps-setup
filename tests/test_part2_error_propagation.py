@@ -14,7 +14,7 @@ STEPS = (
     "configure_ufw configure_shell final_check"
 ).split()
 CRITICAL = [name for name in STEPS if name not in (
-    "configure_locale_time", "configure_unattended_upgrades", "configure_autoremove")]
+    "configure_unattended_upgrades", "configure_autoremove")]
 
 
 class Part2PropagationTest(unittest.TestCase):
@@ -53,7 +53,7 @@ error() { echo "ERROR: $*" >&2; }
                     self.assertNotIn("Часть 2 завершена", result.stdout + result.stderr)
 
     def test_new_guards_preserve_failure_status(self):
-        for name in ("configure_ufw", "configure_shell"):
+        for name in ("configure_locale_time", "configure_ufw", "configure_shell"):
             with self.subTest(step=name):
                 result = self.run_part2(failure=name, status=23)
                 self.assertEqual(result.returncode, 23, result.stderr)

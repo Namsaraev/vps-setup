@@ -175,9 +175,9 @@ install_packages() {
 
 configure_locale_time() {
   section "ВРЕМЯ И ЛОКАЛЬ"
-  timedatectl set-timezone Asia/Irkutsk
-  locale-gen ru_RU.UTF-8 en_US.UTF-8
-  update-locale LANG=ru_RU.UTF-8
+  timedatectl set-timezone Asia/Irkutsk || { error "Не удалось настроить часовой пояс Asia/Irkutsk"; return 1; }
+  locale-gen ru_RU.UTF-8 en_US.UTF-8 || { error "Не удалось сгенерировать локали ru_RU.UTF-8 en_US.UTF-8"; return 1; }
+  update-locale LANG=ru_RU.UTF-8 || { error "Не удалось установить локаль LANG=ru_RU.UTF-8"; return 1; }
   ok "Часовой пояс и локаль настроены"
 }
 
@@ -1304,7 +1304,7 @@ part2_setup() {
     return 1
   fi
 
-  configure_locale_time
+  configure_locale_time || return $?
 
   configure_unattended_upgrades
 

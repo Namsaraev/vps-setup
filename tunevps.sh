@@ -522,18 +522,51 @@ configure_swap() {
 }
 
 # Безопасное управление ключами pin
+# Проверяем одну запись authorized_keys самим OpenSSH (включая записи с options).
+ssh_key_fingerprint() {
+  local line="$1" tmp fingerprint
+  [[ "$line" =~ ^[[:space:]]*($|#) || "$line" == *$'\n'* ]] && return 1
+  tmp="$(mktemp)" || return 1
+  if ! printf '%s\n' "$line" > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  fingerprint="$(ssh-keygen -E sha256 -lf "$tmp" 2>/dev/null)"
+  local status=$?
+  rm -f -- "$tmp"
+  [ "$status" -eq 0 ] || return 1
+  # DSA не подходит для входа; комментарий ключа не участвует в сравнении.
+  [[ "$fingerprint" == *" (DSA)" ]] && return 1
+  printf '%s\n' "$fingerprint" | awk 'NR == 1 {print $2}'
+}
+
+authorized_keys_has_key() {
+  local file="$1" wanted="${2:-}" line fingerprint
+  [ -r "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    fingerprint="$(ssh_key_fingerprint "$line")" || continue
+    if [ -z "$wanted" ] || [ "$fingerprint" = "$wanted" ]; then
+      return 0
+    fi
+  done < "$file"
+  return 1
+}
+
 configure_pin() {
   section "ПОСТОЯННЫЙ ПОЛЬЗОВАТЕЛЬ $PIN_USER"
   local home sshdir keys action answer method public_key keyfile
   local is_new=false replace_mode=false use_file=false
+  PIN_HAS_KEY=false
 
   if id "$PIN_USER" >/dev/null 2>&1; then
     home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
     sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"
-    local key_count
-    key_count=$(test -s "$keys" && wc -l < "$keys" || echo 0)
-    info "$PIN_USER уже существует; ключей: $key_count"
-    [ "$key_count" -gt 0 ] && PIN_HAS_KEY=true
+    if [ -z "$home" ] || [ ! -d "$home" ]; then
+      error "Не найдена домашняя директория пользователя $PIN_USER"
+      return 1
+    fi
+    authorized_keys_has_key "$keys" && PIN_HAS_KEY=true
+    info "$PIN_USER уже существует; валидный SSH-ключ: $PIN_HAS_KEY"
 
     echo "Enter) Ничего не менять (по умолчанию)"
     echo "1) Сменить пароль"
@@ -564,6 +597,10 @@ configure_pin() {
     fi
 
     home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
+    if [ -z "$home" ] || [ ! -d "$home" ]; then
+      error "Не найдена домашняя директория пользователя $PIN_USER"
+      return 1
+    fi
     sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"; is_new=true
     ok "Пользователь $PIN_USER создан"
     info "Задайте пароль $PIN_USER (ввод и подтверждение не отображаются):"
@@ -611,15 +648,16 @@ configure_pin() {
     return 0
   fi
 
-  # Валидация формата ключа
-  case "$public_key" in
-    ssh-ed25519*|ssh-rsa*|ecdsa-sha2-*|ssh-dss*|sk-ssh-ed25519*|sk-ecdsa-sha2-*)
-      ;;
-    *)
-      warn "Строка не похожа на публичный SSH-ключ. Ключ не добавлен."
-      return 0
-      ;;
-  esac
+  local fingerprint
+  if ! fingerprint="$(ssh_key_fingerprint "$public_key")"; then
+    warn "Некорректный публичный SSH-ключ или запрещённый ssh-dss. Ключ не добавлен."
+    return 0
+  fi
+  if [ "$replace_mode" = false ] && authorized_keys_has_key "$keys" "$fingerprint"; then
+    PIN_HAS_KEY=true
+    info "Этот публичный ключ уже установлен"
+    return 0
+  fi
 
   # ЗАМЕЧАНИЕ 2: проверяем создание директории
   if ! mkdir -p "$sshdir"; then
@@ -636,7 +674,14 @@ configure_pin() {
       return 1
     fi
   else
-    if ! { cat "$keys" 2>/dev/null; printf '%s\n' "$public_key"; } > "$tmp_keys"; then
+    if ! (
+      if [ -e "$keys" ]; then
+        cat "$keys" || exit 1
+        # Отделяем новый ключ, даже если последняя запись не заканчивается LF.
+        printf '\n'
+      fi
+      printf '%s\n' "$public_key"
+    ) > "$tmp_keys"; then
       rm -f "$tmp_keys"
       error "Не удалось записать ключ во временный файл"
       return 1
@@ -657,6 +702,11 @@ configure_pin() {
   fi
   chmod 700 "$sshdir"; chmod 600 "$keys"
 
+  PIN_HAS_KEY=false
+  if ! authorized_keys_has_key "$keys"; then
+    error "После записи не найден валидный SSH-ключ для $PIN_USER"
+    return 1
+  fi
   PIN_HAS_KEY=true
   ok "Ключ для $PIN_USER установлен"
   return 0
@@ -746,10 +796,17 @@ set_sshd_line() {
 configure_ssh() {
   section "SSH: ПОРТ, КЛЮЧИ И SOCKET ACTIVATION"
   local answer
-  local keys_file="/home/$PIN_USER/.ssh/authorized_keys"
+  local home keys_file
+  PIN_HAS_KEY=false
+  home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
+  if [ -z "$home" ] || [ ! -d "$home" ]; then
+    error "Не найдена домашняя директория пользователя $PIN_USER"
+    return 1
+  fi
+  keys_file="$home/.ssh/authorized_keys"
 
   # Определяем наличие ключа непосредственно перед возможным отключением паролей.
-  if [ -f "$keys_file" ] && [ -s "$keys_file" ]; then
+  if authorized_keys_has_key "$keys_file"; then
     PIN_HAS_KEY=true
   else
     PIN_HAS_KEY=false

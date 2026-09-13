@@ -342,11 +342,9 @@ EOF
 configure_swap() {
   section "SWAP"
 
-  local ram desired_bytes desired_human
-  local active_sources=() active_lines=()
-  local total_swap_bytes=0
-  local source size_bytes size_human type
-  local answer
+  local ram desired_bytes desired_human active_output
+  local own_bytes=0 foreign_count=0
+  local source size_bytes type answer
 
   # Проверяем, что SWAP_SIZE задан в формате, который понимает fallocate.
   if ! [[ "$SWAP_SIZE" =~ ^[1-9][0-9]*([KMGTP]i?B?|[KMGTP])?$ ]]; then
@@ -377,95 +375,49 @@ configure_swap() {
   }
   desired_human="$SWAP_SIZE"
 
-  # swapon --show --bytes даёт размер именно активного swap.
-  # Поэтому скрипт не путает существующий /swapfile с реально включённым swap.
+  # Ошибка чтения списка не означает отсутствие swap: ничего не меняем.
+  if ! active_output=$(swapon --show=NAME,SIZE,TYPE --bytes --noheadings); then
+    error "Не удалось определить активные swap-источники; swap не изменён"
+    return 1
+  fi
   while read -r source size_bytes type; do
     [ -n "$source" ] || continue
-    [[ "$size_bytes" =~ ^[0-9]+$ ]] || continue
-    active_sources+=("$source")
-    active_lines+=("$source|$size_bytes|$type")
-    total_swap_bytes=$((total_swap_bytes + size_bytes))
-  done < <(swapon --show=NAME,SIZE,TYPE --bytes --noheadings 2>/dev/null)
-
-  if [ "${#active_sources[@]}" -gt 0 ]; then
-    info "Активный swap уже найден:"
-    for line in "${active_lines[@]}"; do
-      IFS='|' read -r source size_bytes type <<< "$line"
-      size_human=$(awk -v b="$size_bytes" 'BEGIN {
-        if (b >= 1099511627776) printf "%.2f TiB", b/1099511627776;
-        else if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
-        else if (b >= 1048576) printf "%.2f MiB", b/1048576;
-        else if (b >= 1024) printf "%.2f KiB", b/1024;
-        else printf "%d B", b;
-      }')
-      info "  $source — $size_human ($type)"
-    done
-
-    # Для swapfile swapon может показывать полезный размер на несколько байт/страницу
-    # меньше размера файла из-за служебного заголовка mkswap. Поэтому сравниваем
-    # с небольшой погрешностью, иначе повторный запуск ошибочно предложит пересоздать
-    # уже правильный swap (например, 2.00 GiB против 2G).
-    local page_size swap_tolerance size_diff
-    page_size=$(getconf PAGESIZE 2>/dev/null || echo 4096)
-    swap_tolerance=$((page_size * ${#active_sources[@]}))
-    size_diff=$(( total_swap_bytes > desired_bytes ? total_swap_bytes - desired_bytes : desired_bytes - total_swap_bytes ))
-
-    if [ "$size_diff" -le "$swap_tolerance" ]; then
-      ok "Размер активного swap соответствует $desired_human — ничего не меняем"
-      return 0
-    fi
-
-    local total_human
-    total_human=$(awk -v b="$total_swap_bytes" 'BEGIN {
-      if (b >= 1099511627776) printf "%.2f TiB", b/1099511627776;
-      else if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
-      else if (b >= 1048576) printf "%.2f MiB", b/1048576;
-      else if (b >= 1024) printf "%.2f KiB", b/1024;
-      else printf "%d B", b;
-    }')
-    warn "Размер активного swap ($total_human) отличается от требуемого ($desired_human)."
-    warn "При замене активный swap будет временно отключён. Не делайте это при критической нехватке RAM."
-    ask "Заменить существующий swap на $desired_human? [y/N]: " answer
-    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-      info "Существующий swap оставлен без изменений"
-      return 0
-    fi
-
-    # Сначала отключаем каждый активный источник. Ничего не удаляем до swapoff.
-    for source in "${active_sources[@]}"; do
-      if ! swapoff "$source"; then
-        error "Не удалось отключить swap: $source"
-        warn "Остальные источники swap не изменялись"
-        return 1
-      fi
-    done
-
-    # Удаляем только обычные swap-файлы. Разделы/устройства не удаляем.
-    for source in "${active_sources[@]}"; do
-      if [ -f "$source" ]; then
-        rm -f -- "$source" || {
-          error "Не удалось удалить старый swap-файл: $source"
-          return 1
-        }
-      fi
-    done
-
-    # Если старый источник был прописан в fstab, отключаем его автоподключение.
-    # Строки не удаляем — только комментируем, чтобы не потерять исходную конфигурацию.
-    for source in "${active_sources[@]}"; do
-      if [ -f /etc/fstab ]; then
-        escaped_source=$(printf '%s' "$source" | sed 's/[.[\\*^$()+?{|]/\\&/g')
-        sed -Ei "s|^([[:space:]]*)($escaped_source[[:space:]]+[^#]*[[:space:]]+swap[[:space:]].*)$|# tunevps: disabled old swap \2|" /etc/fstab
-      fi
-    done
-  else
-    # Активного swap нет. Существующий /swapfile может быть просто старым файлом.
-    # Если файл не swap и RAM позволяет/требует swap — его можно безопасно заменить.
-    if [ -e /swapfile ] && [ ! -f /swapfile ]; then
-      error "/swapfile существует, но это не обычный файл — отказываюсь его удалять"
+    if ! [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
+      error "Не удалось разобрать размер swap: $source; swap не изменён"
       return 1
     fi
+    if [ "$source" = /swapfile ]; then
+      own_bytes="$size_bytes"
+    else
+      foreign_count=$((foreign_count + 1))
+      info "Чужой swap-источник: $source — $size_bytes байт ($type); оставлен без изменений"
+    fi
+  done <<< "$active_output"
 
+  if [ "$own_bytes" -gt 0 ]; then
+    # mkswap резервирует одну страницу под заголовок.
+    local page_size
+    page_size=$(getconf PAGESIZE 2>/dev/null || echo 4096)
+    [[ "$page_size" =~ ^[1-9][0-9]*$ ]] || page_size=4096
+    if [ "$own_bytes" -le "$desired_bytes" ] &&
+       [ "$((desired_bytes - own_bytes))" -le "$page_size" ]; then
+      ok "Размер /swapfile соответствует $desired_human — ничего не меняем"
+      return 0
+    fi
+    warn "Размер /swapfile ($own_bytes байт) отличается от $desired_human."
+    warn "При замене только /swapfile будет временно отключён. Не делайте это при критической нехватке RAM."
+    ask "Заменить только /swapfile на $desired_human? [y/N]: " answer
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+      info "/swapfile оставлен без изменений"
+      return 0
+    fi
+  elif [ "$foreign_count" -gt 0 ]; then
+    ask "Чужой swap уже активен. Дополнительно создать /swapfile $desired_human? [y/N]: " answer
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+      info "Дополнительный /swapfile не создан"
+      return 0
+    fi
+  else
     ram="$(LC_ALL=C free -m | awk '/^Mem:/ {print $2}')"
     if ! [[ "$ram" =~ ^[0-9]+$ ]]; then
       error "Не удалось определить объём RAM; swap не изменён"
@@ -476,11 +428,21 @@ configure_swap() {
       return 0
     fi
     info "Активного swap нет, RAM не более $SWAP_RAM_THRESHOLD_MB MB — создаём $desired_human"
-    [ ! -f /swapfile ] || rm -f /swapfile || {
-      error "Не удалось удалить неиспользуемый /swapfile"
-      return 1
-    }
   fi
+
+  # Не следуем симлинкам и не заменяем устройства даже по управляемому пути.
+  if [ -L /swapfile ] || { [ -e /swapfile ] && [ ! -f /swapfile ]; }; then
+    error "/swapfile существует, но это не обычный файл — отказываюсь его изменять"
+    return 1
+  fi
+  if [ "$own_bytes" -gt 0 ] && ! swapoff /swapfile; then
+    error "Не удалось отключить /swapfile"
+    return 1
+  fi
+  [ ! -f /swapfile ] || rm -f -- /swapfile || {
+    error "Не удалось удалить старый /swapfile"
+    return 1
+  }
 
   # Создаём новый swap-файл. fallocate быстрее; dd — запасной вариант для FS,
   # где fallocate создаёт неподходящий файл.
@@ -506,10 +468,12 @@ configure_swap() {
     return 1
   fi
 
-  # Удаляем только старую строку tunevps для /swapfile и добавляем ровно одну.
-  # Это делает повторный запуск идемпотентным.
-  sed -i '\|^[[:space:]]*#*[[:space:]]*tunevps: .* /swapfile[[:space:]]|d' /etc/fstab 2>/dev/null || true
-  sed -i '\|^/swapfile[[:space:]]|d' /etc/fstab
+  # Нормализуем только записи swap с первым полем /swapfile.
+  # Чужие строки, включая комментарии, сохраняются дословно.
+  sed -Ei '\@^[[:space:]]*/swapfile[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)@d' /etc/fstab || {
+    error "Не удалось обновить /etc/fstab"
+    return 1
+  }
   printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab
 
   if swapon --show=NAME,SIZE --bytes --noheadings 2>/dev/null | awk '$1 == "/swapfile" && $2 > 0 {found=1} END {exit !found}'; then

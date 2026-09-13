@@ -1156,6 +1156,7 @@ PY
 }
 
 final_check() {
+  local failed=0
   section "ФИНАЛЬНАЯ ПРОВЕРКА"
 
   install -d -m 0755 /run/sshd 2>/dev/null || true
@@ -1164,18 +1165,21 @@ final_check() {
     ok "SSH слушает порт $SSH_PORT ✓"
   else
     error "SSH НЕ слушает порт $SSH_PORT! ⚠️"
+    failed=1
   fi
 
   if systemctl is-active --quiet ssh.service || systemctl is-active --quiet ssh.socket; then
     ok "SSH активен (service или socket) ✓"
   else
     error "SSH НЕ активен! ⚠️"
+    failed=1
   fi
 
   if sshd -t 2>/dev/null; then
     ok "Синтаксис sshd_config корректен ✓"
   else
     error "Ошибка синтаксиса sshd_config! ⚠️"
+    failed=1
   fi
 
   local pass_auth pubkey_auth root_login
@@ -1187,6 +1191,7 @@ final_check() {
     ok "PasswordAuthentication=no ✓"
   else
     error "PasswordAuthentication=$pass_auth (должно быть 'no')!"
+    failed=1
   fi
   if [ "$pubkey_auth" = "yes" ]; then
     ok "PubkeyAuthentication=yes ✓"
@@ -1239,6 +1244,7 @@ final_check() {
     ok ".zshrc создан для $CURRENT_USER ✓"
   else
     error ".zshrc НЕ найден! ⚠️"
+    failed=1
   fi
 
   # ЗАМЕЧАНИЕ 1: проверяем, что systemd реально использует лимит (не просто наличие файла)
@@ -1253,6 +1259,7 @@ final_check() {
   if [ "$IS_MINIMIZED" = true ]; then
     warn "⚠️  Система осталась в minimized состоянии"
   fi
+  return "$failed"
 }
 
 part2_setup() {
@@ -1302,7 +1309,7 @@ part2_setup() {
 
   configure_ufw
   configure_shell
-  final_check
+  final_check || return $?
   ok "Часть 2 завершена"
 }
 
@@ -1345,7 +1352,7 @@ while true; do
   ask "Выберите действие [0-3]: " choice
   case "$choice" in
     1) part1_update ;;
-    2) part2_setup ;;
+    2) part2_setup || exit $? ;;
     3) part3_tests ;;
     0) exit 0 ;;
     *) warn "Неверный выбор" ;;

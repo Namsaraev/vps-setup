@@ -271,10 +271,14 @@ configure_needrestart() {
   info "Настройка режима перезапуска служб needrestart"
 
   local answer confirm
-  ask "Включить автоматический перезапуск служб после обновлений? [y/N]: " answer
+  ask "Включить автоматический перезапуск служб после обновлений? [y/N]: " answer || {
+    error "Не удалось прочитать ответ для настройки needrestart"; return 1;
+  }
   if [[ "$answer" =~ ^[Yy]$ ]]; then
     warn "ВНИМАНИЕ: Автоматический перезапуск может прервать активные соединения"
-    ask "Вы уверены? Это может остановить SSH, nginx, БД [y/N]: " confirm
+    ask "Вы уверены? Это может остановить SSH, nginx, БД [y/N]: " confirm || {
+      error "Не удалось прочитать подтверждение настройки needrestart"; return 1;
+    }
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
       # Python 3 is installed by install_packages(); do not execute Perl config.
       if ! python3 - /etc/needrestart/needrestart.conf <<'PY'
@@ -293,6 +297,11 @@ reference = re.compile(key)
 
 
 def configure(data):
+    # Reject multiline restart references instead of appending an ineffective setting.
+    active = b'\n'.join(line.split(b'#', 1)[0] for line in data.splitlines())
+    multiline_key = re.compile(key.replace(b'[ \\t]*', rb'\s*'))
+    if len(multiline_key.findall(active)) != len(reference.findall(active)):
+        raise ValueError("Unsupported multiline restart expression; configuration unchanged")
     lines = []
     found = False
     for line in data.splitlines(keepends=True):
@@ -326,7 +335,8 @@ try:
     if updated != original:
         with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.needrestart-', delete=False) as stream:
             temporary = stream.name
-            stream.write(updated)
+            if stream.write(updated) != len(updated):
+                raise OSError("Short write of needrestart configuration")
             stream.flush()
             os.fsync(stream.fileno())
         os.chown(temporary, metadata.st_uid, metadata.st_gid)
@@ -340,7 +350,10 @@ except (OSError, ValueError) as exc:
     sys.exit(str(exc))
 finally:
     if temporary is not None:
-        os.unlink(temporary)
+        try:
+            os.unlink(temporary)
+        except OSError as exc:
+            sys.exit("Could not remove needrestart temporary file: " + str(exc))
 PY
       then
         error "Не удалось включить и проверить автоматический перезапуск needrestart"

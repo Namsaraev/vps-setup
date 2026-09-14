@@ -25,12 +25,44 @@ WRAPPER = r'''
 import os
 from pathlib import Path
 import sys
+import tempfile
 from unittest.mock import patch
+from contextlib import ExitStack
 
 sys.argv = sys.argv[1:]
 source = sys.stdin.read()
 mode = os.environ.get('FAILURE', '')
+if mode == 'python':
+    sys.exit(29)
+if mode == 'exception':
+    raise RuntimeError('injected Python exception')
 replace = os.replace
+read_bytes = Path.read_bytes
+reads = 0
+named_temporary = tempfile.NamedTemporaryFile
+
+class FailingStream:
+    def __init__(self, *args, **kwargs):
+        self.stream = named_temporary(*args, **kwargs)
+    def __enter__(self):
+        self.stream.__enter__()
+        return self
+    def __exit__(self, *args):
+        return self.stream.__exit__(*args)
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+    def write(self, data):
+        self.stream.write(data[:1])
+        if mode == 'short_write':
+            return 1
+        raise OSError('injected stream write failure')
+
+def injected_read(path):
+    global reads
+    reads += 1
+    if mode == 'read' or (mode == 'validation_read' and reads == 2):
+        raise PermissionError('injected open/read failure')
+    return read_bytes(path)
 def injected_replace(src, dst):
     if mode == 'write':
         raise OSError('injected write failure')
@@ -41,7 +73,19 @@ def injected_replace(src, dst):
 # Native Windows lacks chown. Linux runs the real ownership operation.
 if os.name == 'nt':
     os.chown = lambda *args: None
-with patch('os.replace', injected_replace):
+with ExitStack() as stack:
+    stack.enter_context(patch('os.replace', injected_replace))
+    stack.enter_context(patch.object(Path, 'read_bytes', injected_read))
+    operations = {
+        'temp_open': 'tempfile.NamedTemporaryFile',
+        'flush_write': 'os.fsync',
+        'chown': 'os.chown',
+        'chmod': 'os.chmod',
+    }
+    if mode in operations:
+        stack.enter_context(patch(operations[mode], side_effect=OSError('injected ' + mode)))
+    if mode in ('short_write', 'stream_write'):
+        stack.enter_context(patch('tempfile.NamedTemporaryFile', FailingStream))
     exec(compile(source, '<needrestart helper>', 'exec'))
 '''
 
@@ -55,10 +99,17 @@ class NeedrestartTest(unittest.TestCase):
         self.wrapper = self.root / 'runner.py'
         self.wrapper.write_text(WRAPPER, encoding='utf-8')
 
-    def run_configure(self, answers='y\ny\n', failure=''):
+    def run_configure(self, answers='y\ny\n', failure='', through_part2=False):
         function = FUNCTION.replace('/etc/needrestart/needrestart.conf', '"$CONFIG"')
         script = self.root / 'run.sh'
-        script.write_text(PRELUDE + function + '\nconfigure_needrestart\n', encoding='utf-8', newline='\n')
+        # A guarded call disables implicit errexit, just as part2_setup does.
+        invocation = '\nconfigure_needrestart || exit $?\n'
+        if through_part2:
+            from test_part2_error_propagation import PART2, STEPS
+            stubs = '\n'.join(f'{name}() {{ echo CALL:{name}; }}'
+                              for name in STEPS if name != 'configure_needrestart')
+            invocation = '\n' + stubs + '\n' + PART2 + '\npart2_setup || exit $?\n'
+        script.write_text(PRELUDE + function + invocation, encoding='utf-8', newline='\n')
         result = subprocess.run(
             [os.environ.get('BASH', 'bash'), script.as_posix()], input=answers.encode('utf-8'),
             capture_output=True, timeout=15,
@@ -164,6 +215,47 @@ class NeedrestartTest(unittest.TestCase):
         self.config.write_bytes(original)
         self.assert_failure(self.run_configure())
         self.assertEqual(self.config.read_bytes(), original)
+
+    def test_critical_operations(self):
+        original = b"$nrconf{restart}='q';\n"
+        for failure in ('python', 'exception', 'read', 'temp_open',
+                        'flush_write', 'chown', 'chmod', 'write',
+                        'stream_write', 'short_write'):
+            with self.subTest(failure=failure):
+                self.config.write_bytes(original)
+                self.assert_failure(self.run_configure(failure=failure))
+                self.assertEqual(self.config.read_bytes(), original)
+
+    def test_post_replace_read_failure(self):
+        self.config.write_bytes(b"$nrconf{restart}='q';\n")
+        self.assert_failure(self.run_configure(failure='validation_read'))
+        self.assertEqual(self.config.read_bytes(), AUTO)
+
+    def test_multiline_restart_is_rejected(self):
+        for original in (b"$nrconf\n{restart}='q';\n",
+                         b"$nrconf{\n'restart'\n}='i';\n",
+                         b"$nrconf{restart}\n= 'i';\n"):
+            with self.subTest(original=original):
+                self.config.write_bytes(original)
+                self.assert_failure(self.run_configure())
+                self.assertEqual(self.config.read_bytes(), original)
+
+    def test_answer_read_failures(self):
+        for answers in ('', 'y\n'):
+            with self.subTest(answers=answers):
+                self.config.write_bytes(AUTO)
+                self.assert_failure(self.run_configure(answers=answers))
+                self.assertEqual(self.config.read_bytes(), AUTO)
+
+    def test_real_failures_propagate_through_part2(self):
+        for failure in ('read', 'python', 'stream_write', 'short_write',
+                        'write', 'validation', 'validation_read'):
+            with self.subTest(failure=failure):
+                self.config.write_bytes(b"$nrconf{restart}='q';\n")
+                result = self.run_configure(failure=failure, through_part2=True)
+                self.assert_failure(result)
+                self.assertNotIn('Часть 2 завершена', result.stdout + result.stderr)
+                self.assertNotIn('CALL:configure_safe_sysctl', result.stdout)
 
 
 if __name__ == '__main__':

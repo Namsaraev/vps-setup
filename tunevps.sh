@@ -161,20 +161,20 @@ install_packages() {
 
   if [ -e /dev/hwrng ]; then
     info "Обнаружен /dev/hwrng — устанавливаем rng-tools5"
-    apt-get install -y rng-tools5
+    apt-get install -y rng-tools5 || warn "Не удалось установить optional-пакет rng-tools5; продолжаем"
   else
     info "Аппаратный RNG не обнаружен — rng-tools5 не требуется"
   fi
 
   for package in eza zoxide; do
     if apt-cache show "$package" >/dev/null 2>&1; then
-      apt-get install -y "$package"
+      apt-get install -y "$package" || warn "Не удалось установить optional-пакет $package; продолжаем"
     else
-      warn "Пакет $package отсутствует в этом репозитории Ubuntu; пропуск"
+      warn "Пакет $package недоступен или не удалось проверить его доступность; пропуск"
     fi
   done
-  ln -sf /usr/bin/batcat /usr/local/bin/bat 2>/dev/null || true
-  ln -sf /usr/bin/fdfind /usr/local/bin/fd 2>/dev/null || true
+  ln -sf /usr/bin/batcat /usr/local/bin/bat || warn "Не удалось создать symlink /usr/local/bin/bat для batcat; продолжаем"
+  ln -sf /usr/bin/fdfind /usr/local/bin/fd || warn "Не удалось создать symlink /usr/local/bin/fd для fdfind; продолжаем"
   return 0
 }
 

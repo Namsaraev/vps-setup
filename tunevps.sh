@@ -218,29 +218,52 @@ configure_autoremove() {
   section "АВТООЧИСТКА НЕИСПОЛЬЗУЕМЫХ ПАКЕТОВ"
 
   # Автоудаление зависимостей ОТКЛЮЧЕНО для безопасности сервера
-  cat > /etc/apt/apt.conf.d/50auto-remove <<'EOF'
+  if ! cat > /etc/apt/apt.conf.d/50auto-remove <<'EOF'
 Unattended-Upgrade::Remove-Unused-Dependencies "false";
 Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
 EOF
+  then
+    error "Не удалось отключить автоудаление зависимостей"
+    return 1
+  fi
   ok "Автоудаление зависимостей отключено (безопасно для Xray/3x-ui/Docker)"
 
-  local packages
-  packages=$(apt-get --dry-run autoremove 2>/dev/null | grep -E "^Remv " | wc -l)
+  local packages=0 preview line package rest listing=""
+  if ! preview=$(apt-get --dry-run autoremove); then
+    error "Не удалось проверить пакеты для удаления (apt-get --dry-run autoremove)"
+    return 1
+  fi
+  while IFS= read -r line; do
+    if [[ "$line" == "Remv "* ]]; then
+      packages=$((packages + 1))
+      if [ "$packages" -le 20 ]; then
+        read -r rest package rest <<< "$line"
+        listing+="  - $package"$'\n'
+      fi
+    fi
+  done <<< "$preview"
   if [ "$packages" -gt 0 ]; then
     info "Найдено $packages пакетов для удаления:"
-    apt-get --dry-run autoremove 2>/dev/null | grep -E "^Remv " | awk '{print "  - " $2}' | head -20
+    printf '%s' "$listing"
     [ "$packages" -gt 20 ] && info "  ... и ещё $((packages - 20))"
     local answer
-    ask "Удалить эти пакеты сейчас? [y/N]: " answer
+    if ! ask "Удалить эти пакеты сейчас? [y/N]: " answer; then
+      error "Не удалось прочитать ответ об удалении пакетов"
+      return 1
+    fi
     if [[ "$answer" =~ ^[Yy]$ ]]; then
-      apt-get autoremove -y --purge
-      ok "Удалено $packages пакетов"
+      if ! apt-get autoremove -y --purge; then
+        error "Не удалось удалить неиспользуемые пакеты (apt-get autoremove)"
+        return 1
+      fi
+      ok "Удаление неиспользуемых пакетов завершено"
     else
       info "Пропущено. Для ручного удаления: sudo apt autoremove --purge"
     fi
   else
     ok "Нет пакетов для удаления"
   fi
+  return 0
 }
 
 configure_needrestart() {
@@ -1367,7 +1390,7 @@ part2_setup() {
   configure_unattended_upgrades || return $?
 
   # Менее критичные этапы (без остановки при ошибке)
-  configure_autoremove
+  configure_autoremove || return $?
   configure_needrestart || return $?
 
   if ! configure_safe_sysctl; then

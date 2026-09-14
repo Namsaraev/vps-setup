@@ -406,10 +406,14 @@ configure_systemd_limits() {
   info "limits.d применяется только к интерактивным сессиям (через PAM)."
   info "Для системных сервисов (Xray, 3x-ui, Docker) задаём глобальный лимит."
   mkdir -p /etc/systemd/system.conf.d || { error "Не удалось создать /etc/systemd/system.conf.d"; return 1; }
-  cat > /etc/systemd/system.conf.d/99-nofile.conf <<'EOF'
+  if ! cat > /etc/systemd/system.conf.d/99-nofile.conf <<'EOF'
 [Manager]
 DefaultLimitNOFILE=1048576
 EOF
+  then
+    error "Не удалось записать /etc/systemd/system.conf.d/99-nofile.conf"
+    return 1
+  fi
   if systemctl daemon-reexec; then
     ok "DefaultLimitNOFILE=1048576 применён ко всем сервисам"
   else

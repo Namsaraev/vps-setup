@@ -1041,24 +1041,39 @@ as_current_user() {
 
 configure_shell() {
   section "ZSH, OH MY ZSH И POWERLEVEL10K"
-  chsh -s "$(command -v zsh)" "$CURRENT_USER"
+  chsh -s /usr/bin/zsh "$CURRENT_USER" || {
+    error "Не удалось изменить shell для $CURRENT_USER на /usr/bin/zsh"
+    return 1
+  }
   if [ ! -d "$USER_HOME/.oh-my-zsh" ]; then
-    as_current_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$USER_HOME/.oh-my-zsh"
+    as_current_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$USER_HOME/.oh-my-zsh" || {
+      error "Не удалось установить Oh My Zsh"
+      return 1
+    }
   fi
   local custom="$USER_HOME/.oh-my-zsh/custom"
   if [ ! -d "$custom/themes/powerlevel10k" ]; then
-    as_current_user git clone --depth=1 --recurse-submodules "$P10K_REPOSITORY" "$custom/themes/powerlevel10k"
+    as_current_user git clone --depth=1 --recurse-submodules "$P10K_REPOSITORY" "$custom/themes/powerlevel10k" || {
+      error "Не удалось установить Powerlevel10k"
+      return 1
+    }
   fi
   for spec in \
     "zsh-autosuggestions https://github.com/zsh-users/zsh-autosuggestions.git" \
     "zsh-syntax-highlighting https://github.com/zsh-users/zsh-syntax-highlighting.git" \
     "zsh-completions https://github.com/zsh-users/zsh-completions.git"; do
     set -- $spec
-    [ -d "$custom/plugins/$1" ] || as_current_user git clone --depth=1 "$2" "$custom/plugins/$1"
+    [ -d "$custom/plugins/$1" ] || as_current_user git clone --depth=1 "$2" "$custom/plugins/$1" || {
+      error "Не удалось установить плагин $1"
+      return 1
+    }
   done
 
   local managed_dir="$USER_HOME/.config/tunevps"
-  as_current_user mkdir -p "$managed_dir" || return 1
+  as_current_user mkdir -p "$managed_dir" || {
+    error "Не удалось создать каталог $managed_dir"
+    return 1
+  }
   as_current_user tee "$managed_dir/zshrc" >/dev/null <<'EOF'
 # PATH — до P10K и Oh My Zsh.
 export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
@@ -1164,11 +1179,14 @@ fi
 
 [[ ! -r "$HOME/.p10k.zsh" ]] || source "$HOME/.p10k.zsh"
 EOF
-  [ "$?" -eq 0 ] || return 1
+  [ "$?" -eq 0 ] || {
+    error "Не удалось записать $managed_dir/zshrc"
+    return 1
+  }
 
   # Python is installed by install_packages(). Preserve user bytes, including
   # CRLF and a missing final newline; never interpret the user's shell code.
-  as_current_user python3 - "$USER_HOME/.zshrc" <<'PY' || return 1
+  if ! as_current_user python3 - "$USER_HOME/.zshrc" <<'PY'
 from pathlib import Path
 import sys
 
@@ -1190,6 +1208,10 @@ else:
 if updated != original:
     path.write_bytes(updated)
 PY
+  then
+    error "Не удалось обновить managed block в $USER_HOME/.zshrc"
+    return 1
+  fi
   ok "Zsh и P10K настроены для $CURRENT_USER"
   info "После нового SSH-входа под $CURRENT_USER мастер P10K стартует автоматически."
 }

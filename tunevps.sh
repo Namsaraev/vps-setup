@@ -346,12 +346,15 @@ configure_safe_sysctl() {
   fi
 
   if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-    if [ "$bbr_module" = true ] && command -v modprobe >/dev/null 2>&1; then
+    if [ "$bbr_module" = true ]; then
+      # Отсутствие модуля допустимо; сбой загрузки уже найденного модуля — ошибка.
+      command -v modprobe >/dev/null 2>&1 || { error "tcp_bbr найден, но modprobe недоступен"; return 1; }
       info "BBR найден как модуль tcp_bbr, загружаем его"
       if modprobe tcp_bbr 2>/dev/null; then
         ok "Модуль tcp_bbr загружен"
       else
-        warn "Не удалось загрузить модуль tcp_bbr"
+        error "Не удалось загрузить найденный модуль tcp_bbr"
+        return 1
       fi
     fi
   fi
@@ -359,16 +362,21 @@ configure_safe_sysctl() {
   if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
     bbr_available=true
     if [ "$bbr_module" = true ]; then
-      printf '%s\n' tcp_bbr > /etc/modules-load.d/tcp_bbr.conf
+      mkdir -p /etc/modules-load.d || { error "Не удалось создать /etc/modules-load.d"; return 1; }
+      if ! printf '%s\n' tcp_bbr > /etc/modules-load.d/tcp_bbr.conf; then
+        error "Не удалось записать /etc/modules-load.d/tcp_bbr.conf"
+        return 1
+      fi
       ok "tcp_bbr добавлен в автозагрузку модулей"
     fi
     info "BBR доступен в ядре"
   else
-    rm -f /etc/modules-load.d/tcp_bbr.conf
+    rm -f /etc/modules-load.d/tcp_bbr.conf || { error "Не удалось удалить /etc/modules-load.d/tcp_bbr.conf"; return 1; }
     warn "BBR недоступен в этом ядре — будет использован штатный алгоритм"
   fi
 
-  cat > /etc/sysctl.d/99-vps-tuning.conf <<EOF
+  mkdir -p /etc/sysctl.d || { error "Не удалось создать /etc/sysctl.d"; return 1; }
+  if ! cat > /etc/sysctl.d/99-vps-tuning.conf <<EOF
 # Совместимо с VPN, policy routing, туннелями и proxy.
 net.ipv4.tcp_syncookies = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
@@ -383,20 +391,28 @@ fs.file-max = 1048576
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 EOF
+  then
+    error "Не удалось записать /etc/sysctl.d/99-vps-tuning.conf"
+    return 1
+  fi
 
-  if sysctl --system >/dev/null; then
-    ok "Безопасные sysctl применены"
-  else
+  if ! sysctl --system >/dev/null; then
     error "Не удалось применить некоторые sysctl"
     return 1
   fi
 
-  cat > /etc/security/limits.d/99-vps.conf <<'EOF'
+  mkdir -p /etc/security/limits.d || { error "Не удалось создать /etc/security/limits.d"; return 1; }
+  if ! cat > /etc/security/limits.d/99-vps.conf <<'EOF'
 * soft nofile 524288
 * hard nofile 1048576
 root soft nofile 524288
 root hard nofile 1048576
 EOF
+  then
+    error "Не удалось записать /etc/security/limits.d/99-vps.conf"
+    return 1
+  fi
+  ok "Безопасные sysctl применены"
   return 0
 }
 

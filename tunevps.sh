@@ -758,6 +758,7 @@ configure_pin() {
     return 0
   fi
 
+  PIN_HAS_KEY=false
   # ЗАМЕЧАНИЕ 2: проверяем создание директории
   if ! mkdir -p "$sshdir"; then
     error "Не удалось создать $sshdir"
@@ -786,7 +787,11 @@ configure_pin() {
       return 1
     fi
   fi
-  chmod 600 "$tmp_keys"
+  if ! chmod 600 "$tmp_keys"; then
+    error "Не удалось установить права 600 на $tmp_keys"
+    rm -f "$tmp_keys"
+    return 1
+  fi
 
   # ЗАМЕЧАНИЕ 2: проверяем атомарную замену
   if ! mv -f "$tmp_keys" "$keys"; then
@@ -799,7 +804,14 @@ configure_pin() {
     error "Не удалось установить владельца для $sshdir"
     return 1
   fi
-  chmod 700 "$sshdir"; chmod 600 "$keys"
+  if ! chmod 700 "$sshdir"; then
+    error "Не удалось установить права 700 на $sshdir"
+    return 1
+  fi
+  if ! chmod 600 "$keys"; then
+    error "Не удалось установить права 600 на $keys"
+    return 1
+  fi
 
   PIN_HAS_KEY=false
   if ! authorized_keys_has_key "$keys"; then

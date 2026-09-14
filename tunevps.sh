@@ -183,17 +183,26 @@ configure_locale_time() {
 
 configure_unattended_upgrades() {
   section "АВТО-ОБНОВЛЕНИЯ БЕЗОПАСНОСТИ"
-  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+  mkdir -p /etc/apt/apt.conf.d || { error "Не удалось создать каталог /etc/apt/apt.conf.d"; return 1; }
+  if ! cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
+  then
+    error "Не удалось записать /etc/apt/apt.conf.d/20auto-upgrades"
+    return 1
+  fi
 
+  # Конфигурация обязательна; включение таймеров остаётся best-effort.
   local timers_ok=true
   for timer in apt-daily.timer apt-daily-upgrade.timer; do
     if ! systemctl is-enabled "$timer" >/dev/null 2>&1; then
-      systemctl enable "$timer" 2>/dev/null || timers_ok=false
+      systemctl enable "$timer" 2>/dev/null || {
+        warn "Не удалось включить $timer"
+        timers_ok=false
+      }
     fi
   done
 
@@ -202,6 +211,7 @@ EOF
   else
     warn "Не удалось включить некоторые timer'ы; проверьте: systemctl list-timers"
   fi
+  return 0
 }
 
 configure_autoremove() {
@@ -1334,7 +1344,7 @@ part2_setup() {
 
   configure_locale_time || return $?
 
-  configure_unattended_upgrades
+  configure_unattended_upgrades || return $?
 
   # Менее критичные этапы (без остановки при ошибке)
   configure_autoremove

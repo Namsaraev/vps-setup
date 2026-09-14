@@ -26,16 +26,21 @@ section() { echo -e "\n$CYAN========== $* ==========$NC"; }
 
 ask() { echo -n "$1" > /dev/tty; read -r "$2" < /dev/tty; }
 ask_password() {
-  local prompt="$1" variable="$2"
+  local prompt="$1" variable="$2" read_status=0
   printf '%s' "$prompt" > /dev/tty
-  IFS= read -r -s "$variable" < /dev/tty
+  IFS= read -r -s "$variable" < /dev/tty || read_status=$?
   printf '\n' > /dev/tty
+  if [ "$read_status" -ne 0 ]; then
+    error "Не удалось прочитать пароль из /dev/tty"
+    return "$read_status"
+  fi
+  return 0
 }
 set_pin_password() {
   local password password_confirm
   while true; do
-    ask_password "Введите пароль для $PIN_USER: " password
-    ask_password "Повторите пароль: " password_confirm
+    ask_password "Введите пароль для $PIN_USER: " password || return $?
+    ask_password "Повторите пароль: " password_confirm || return $?
     if [ -z "$password" ]; then
       warn "Пароль не может быть пустым"
     elif [ "$password" != "$password_confirm" ]; then
@@ -674,7 +679,7 @@ configure_pin() {
     ask "Ваш выбор: " action
     case "$action" in
       "") info "Пользователь $PIN_USER оставлен без изменений"; return 0 ;;
-      1) set_pin_password; return 0 ;;
+      1) set_pin_password; return $? ;;
       2|3) [ "$action" = 3 ] && replace_mode=true ;;
       *) warn "Неизвестный выбор — ничего не меняем"; return 0 ;;
     esac

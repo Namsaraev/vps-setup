@@ -790,12 +790,12 @@ configure_ufw() {
   else
     ask "Настроить и активировать UFW? [Y/n]: " answer
     if yes_by_default "$answer"; then
-      ufw default deny incoming
-      ufw default allow outgoing
-      ufw allow "$SSH_PORT/tcp" comment 'SSH'
-      ufw allow 80/tcp comment 'HTTP'
-      ufw allow 443/tcp comment 'HTTPS'
-      ufw --force enable
+      ufw default deny incoming || { error "Не удалось установить UFW default deny incoming"; return 1; }
+      ufw default allow outgoing || { error "Не удалось установить UFW default allow outgoing"; return 1; }
+      ufw allow "$SSH_PORT/tcp" comment 'SSH' || { error "Не удалось разрешить $SSH_PORT/tcp в UFW"; return 1; }
+      ufw allow 80/tcp comment 'HTTP' || { error "Не удалось разрешить 80/tcp в UFW"; return 1; }
+      ufw allow 443/tcp comment 'HTTPS' || { error "Не удалось разрешить 443/tcp в UFW"; return 1; }
+      ufw --force enable || { error "Не удалось включить UFW"; return 1; }
       ok "UFW включён: SSH $SSH_PORT, HTTP/HTTPS"
     fi
   fi
@@ -803,16 +803,22 @@ configure_ufw() {
   echo "iPerf3: Enter) не менять; 1) открыть всем; 2) открыть одному IP; 3) закрыть общие правила"
   ask "Правило для порта 5201: " action
   case "$action" in
-    1) ufw allow 5201/tcp comment 'temporary iperf3'; ufw allow 5201/udp comment 'temporary iperf3'; warn "Закройте 5201 после теста: выберите пункт 3" ;;
+    1)
+      ufw allow 5201/tcp comment 'temporary iperf3' || { error "Не удалось разрешить 5201/tcp в UFW"; return 1; }
+      ufw allow 5201/udp comment 'temporary iperf3' || { error "Не удалось разрешить 5201/udp в UFW"; return 1; }
+      warn "Закройте 5201 после теста: выберите пункт 3" ;;
     2)
       ask "IPv4 или IPv6-адрес клиента: " source_ip
       if [[ "$source_ip" =~ ^[0-9A-Fa-f:.]+$ ]]; then
-        ufw allow from "$source_ip" to any port 5201 proto tcp
-        ufw allow from "$source_ip" to any port 5201 proto udp
+        ufw allow from "$source_ip" to any port 5201 proto tcp || { error "Не удалось разрешить iPerf3 TCP для $source_ip в UFW"; return 1; }
+        ufw allow from "$source_ip" to any port 5201 proto udp || { error "Не удалось разрешить iPerf3 UDP для $source_ip в UFW"; return 1; }
         ok "iPerf3 разрешён только для $source_ip"
       else
         error "Некорректный IP"; fi ;;
-    3) ufw --force delete allow 5201/tcp 2>/dev/null || true; ufw --force delete allow 5201/udp 2>/dev/null || true; ok "Общие правила 5201 удалены" ;;
+    3)
+      ufw --force delete allow 5201/tcp || { error "Не удалось удалить общее правило 5201/tcp в UFW"; return 1; }
+      ufw --force delete allow 5201/udp || { error "Не удалось удалить общее правило 5201/udp в UFW"; return 1; }
+      ok "Общие правила 5201 удалены" ;;
     *) info "Правила iPerf3 не изменены" ;;
   esac
 }

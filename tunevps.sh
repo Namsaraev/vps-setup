@@ -614,7 +614,10 @@ configure_swap() {
     error "Не удалось обновить /etc/fstab"
     return 1
   }
-  printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab
+  printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab || {
+    error "Не удалось записать /swapfile в /etc/fstab; /swapfile может быть активен в текущей сессии, но автоподключение после перезагрузки не настроено"
+    return 1
+  }
 
   if swapon --show=NAME,SIZE --bytes --noheadings 2>/dev/null | awk '$1 == "/swapfile" && $2 > 0 {found=1} END {exit !found}'; then
     ok "Swap $desired_human создан и активирован"

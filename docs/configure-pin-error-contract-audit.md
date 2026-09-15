@@ -34,7 +34,7 @@ directories and dangling links are operational failures. Readability/access
 predicates still have the shell's usual limits (no errno detail). `id` status 1
 retains its existing missing-user interpretation; other nonzero statuses fail.
 
-OpenSSH itself reuses exit status 1 for malformed keys and operational errors.
+OpenSSH itself reuses exit statuses 1/255 for malformed keys and operational errors.
 The wrapper fixes the locale to C, recognizes only exact expected invalid-file
 diagnostics, and treats other failures or unexpected successful output as fatal.
 It verifies the temporary input's contents before invoking OpenSSH. This cannot

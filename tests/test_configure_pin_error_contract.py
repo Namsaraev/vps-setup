@@ -300,7 +300,7 @@ authorized_keys_has_key() {
         # Stub only the readability predicate: deterministic even when run as root.
         result, *_ = self.run_case(extra=r'''
 function [ {
-  if builtin [ "$#" = 2 ] && builtin [ "$1" = -r ] && builtin [ "$2" = "$keys_path" ]; then
+  if builtin [ "$#" = 3 ] && builtin [ "$1" = -r ] && builtin [ "$2" = "$keys_path" ]; then
     return 1
   fi
   builtin [ "$@"

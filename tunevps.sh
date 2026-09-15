@@ -706,14 +706,16 @@ ssh_key_fingerprint() {
     return 2
   fi
   fingerprint="$(LC_ALL=C ssh-keygen -E sha256 -lf "$tmp" 2>&1)" || status=$?
+  # OpenSSH diagnostics may end in CRLF even on Unix.
+  fingerprint="${fingerprint%$'\r'}"
   if ! rm -f -- "$tmp"; then
     error "Не удалось удалить временный файл проверки ключа"
     return 2
   fi
   if [ "$status" -ne 0 ]; then
-    # OpenSSH uses status 1 for both invalid input and I/O errors. Only its
+    # OpenSSH uses status 1/255 for invalid input and I/O errors. Only its
     # exact C-locale invalid-file diagnostic is an expected input rejection.
-    if [ "$status" -eq 1 ] && { [ "$fingerprint" = "$tmp is not a public key file." ] || [ "$fingerprint" = "$tmp is not a key file." ]; }; then
+    if { [ "$status" -eq 1 ] || [ "$status" -eq 255 ]; } && { [ "$fingerprint" = "$tmp is not a public key file." ] || [ "$fingerprint" = "$tmp is not a key file." ]; }; then
       return 1
     fi
     error "Не удалось выполнить проверку SSH-ключа"

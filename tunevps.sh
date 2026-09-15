@@ -910,11 +910,22 @@ configure_ufw() {
 }
 
 set_sshd_line() {
-  local name="$1" value="$2"
+  local name="$1" value="$2" status
   if grep -qE "^#?$name[[:space:]]+" /etc/ssh/sshd_config; then
-    sed -Ei "s|^#?$name[[:space:]]+.*|$name $value|" /etc/ssh/sshd_config
+    sed -Ei "s|^#?$name[[:space:]]+.*|$name $value|" /etc/ssh/sshd_config || {
+      error "Не удалось обновить $name в /etc/ssh/sshd_config"
+      return 1
+    }
   else
-    echo "$name $value" >> /etc/ssh/sshd_config
+    status=$?
+    if [ "$status" -ne 1 ]; then
+      error "Не удалось проверить $name в /etc/ssh/sshd_config"
+      return 1
+    fi
+    echo "$name $value" >> /etc/ssh/sshd_config || {
+      error "Не удалось добавить $name в /etc/ssh/sshd_config"
+      return 1
+    }
   fi
 }
 
@@ -1012,10 +1023,16 @@ configure_ssh() {
     return 1
   }
 
-  set_sshd_line Port "$SSH_PORT"
-  mkdir -p /etc/ssh/sshd_config.d || return 1
+  if ! set_sshd_line Port "$SSH_PORT"; then
+    error "Не удалось настроить Port в sshd_config"
+    return 1
+  fi
+  mkdir -p /etc/ssh/sshd_config.d || {
+    error "Не удалось создать /etc/ssh/sshd_config.d"
+    return 1
+  }
 
-  cat > /etc/ssh/sshd_config.d/00-vps-hardening.conf <<EOF
+  if ! cat > /etc/ssh/sshd_config.d/00-vps-hardening.conf <<EOF
 # VPS hardening settings (создано tunevps.sh)
 # Этот файл загружается ПЕРВЫМ (номер 00), чтобы переопределить
 # настройки из 50-cloud-init.conf и других файлов.
@@ -1045,6 +1062,10 @@ ClientAliveCountMax 3
 # Подробные логи
 LogLevel VERBOSE
 EOF
+  then
+    error "Не удалось записать /etc/ssh/sshd_config.d/00-vps-hardening.conf"
+    return 1
+  fi
 
   if ! sshd -t; then
     error "Ошибка sshd_config. Конфиг не перезапущен."
@@ -1056,16 +1077,26 @@ EOF
     return 1
   fi
 
-  mkdir -p /etc/systemd/system/ssh.socket.d
-  cat > /etc/systemd/system/ssh.socket.d/99-vps-port.conf <<EOF
+  mkdir -p /etc/systemd/system/ssh.socket.d || {
+    error "Не удалось создать /etc/systemd/system/ssh.socket.d"
+    return 1
+  }
+  if ! cat > /etc/systemd/system/ssh.socket.d/99-vps-port.conf <<EOF
 [Socket]
 ListenStream=
 ListenStream=0.0.0.0:$SSH_PORT
 ListenStream=[::]:$SSH_PORT
 EOF
+  then
+    error "Не удалось записать /etc/systemd/system/ssh.socket.d/99-vps-port.conf"
+    return 1
+  fi
 
   if systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket; then
-    systemctl daemon-reload
+    if ! systemctl daemon-reload; then
+      error "Не удалось выполнить systemctl daemon-reload для SSH"
+      return 1
+    fi
     if ! systemctl restart ssh.socket; then
       error "Не удалось перезапустить ssh.socket"
       return 1

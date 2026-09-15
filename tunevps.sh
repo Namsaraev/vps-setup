@@ -89,30 +89,86 @@ ARCH="$(uname -m)"
 info "Ubuntu $VERSION_ID ($VERSION_CODENAME), $ARCH"
 info "Окружение будет настроено для $CURRENT_USER: $USER_HOME"
 
+# Return 0: minimized, 1: not minimized, 2: probe failure.
 detect_minimized() {
-  dpkg-query -W -f='${db:Status-Status}' ubuntu-standard 2>/dev/null | grep -qx installed && return 1
-  [ -f /etc/dpkg/dpkg.cfg.d/excludes ] && grep -q 'path-exclude' /etc/dpkg/dpkg.cfg.d/excludes && return 0
-  ! command -v man >/dev/null 2>&1 && ! command -v less >/dev/null 2>&1
+  local packages probe_status
+  # Query the database without a package filter: an absent ubuntu-standard is
+  # normal, whereas a failed database query must not look like an absent package.
+  if ! packages=$(dpkg-query -W -f='${Package} ${db:Status-Status}\n'); then
+    error "Не удалось проверить пакеты для определения Ubuntu minimized"
+    return 2
+  fi
+  case $'\n'"$packages"$'\n' in
+    *$'\nubuntu-standard installed\n'*) return 1 ;;
+  esac
+  if [ -f /etc/dpkg/dpkg.cfg.d/excludes ]; then
+    if grep -q 'path-exclude' /etc/dpkg/dpkg.cfg.d/excludes; then
+      return 0
+    else
+      probe_status=$?
+      if [ "$probe_status" -ne 1 ]; then
+        error "Не удалось прочитать excludes для определения Ubuntu minimized"
+        return 2
+      fi
+    fi
+  fi
+  local tool
+  for tool in man less; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      return 1
+    else
+      probe_status=$?
+      if [ "$probe_status" -ne 1 ]; then
+        error "Не удалось проверить $tool для определения Ubuntu minimized"
+        return 2
+      fi
+    fi
+  done
+  return 0
 }
 IS_MINIMIZED=false
-detect_minimized && IS_MINIMIZED=true
+if detect_minimized; then
+  IS_MINIMIZED=true
+else
+  minimized_status=$?
+  [ "$minimized_status" -eq 1 ] || exit "$minimized_status"
+fi
 
 part1_update() {
   section "ЧАСТЬ 1: ОБНОВЛЕНИЕ И UNMINIMIZE"
   if [ "$IS_MINIMIZED" = true ]; then
     warn "Обнаружена Ubuntu minimized"
-    local answer
-    ask "Преобразовать в обычную Ubuntu через unminimize? [Y/n]: " answer
+    local answer unminimize_status minimized_status
+    if ! ask "Преобразовать в обычную Ubuntu через unminimize? [Y/n]: " answer; then
+      error "Не удалось прочитать ответ о запуске unminimize"
+      return 1
+    fi
     if yes_by_default "$answer"; then
       apt-get update || { error "apt-get update завершился с ошибкой"; return 1; }
-      if ! command -v unminimize >/dev/null 2>&1; then
-        apt-get install -y unminimize
+      if command -v unminimize >/dev/null 2>&1; then
+        :
+      else
+        unminimize_status=$?
+        if [ "$unminimize_status" -ne 1 ]; then
+          error "Не удалось проверить наличие unminimize"
+          return 1
+        fi
+        apt-get install -y unminimize || { error "Не удалось установить unminimize"; return 1; }
       fi
       set +o pipefail
       yes | unminimize
       unminimize_status="${PIPESTATUS[1]}"
       set -o pipefail
-      if [ "$unminimize_status" -eq 0 ] || ! detect_minimized; then
+      minimized_status=1
+      if [ "$unminimize_status" -ne 0 ]; then
+        if detect_minimized; then
+          minimized_status=0
+        else
+          minimized_status=$?
+          [ "$minimized_status" -eq 1 ] || return "$minimized_status"
+        fi
+      fi
+      if [ "$unminimize_status" -eq 0 ] || [ "$minimized_status" -eq 1 ]; then
         IS_MINIMIZED=false
         ok "unminimize завершён"
       else
@@ -135,16 +191,20 @@ part1_update() {
     apt-get upgrade -y || { error "apt-get upgrade завершился с ошибкой"; return 1; }
   fi
 
-  ok "Пакеты обновлены"
   local answer
-  ask "Перезагрузить сервер сейчас? [Y/n]: " answer
+  if ! ask "Перезагрузить сервер сейчас? [Y/n]: " answer; then
+    error "Не удалось прочитать ответ о перезагрузке"
+    return 1
+  fi
   if yes_by_default "$answer"; then
     warn "Перезагрузка через 5 секунд"
-    sleep 5
-    reboot
+    sleep 5 || { error "Не удалось выдержать задержку перед перезагрузкой"; return 1; }
+    reboot || { error "Не удалось перезагрузить сервер"; return 1; }
   else
     info "Перезагрузка отложена по вашему выбору"
   fi
+  ok "Пакеты обновлены"
+  return 0
 }
 
 install_packages() {
@@ -1554,13 +1614,16 @@ while true; do
   echo "3) Тесты"
   echo "0) Выход"
   choice=""
-  ask "Выберите действие [0-3]: " choice
+  if ! ask "Выберите действие [0-3]: " choice; then
+    error "Не удалось прочитать выбор действия"
+    exit 1
+  fi
   case "$choice" in
-    1) part1_update ;;
+    1) part1_update || exit $? ;;
     2) part2_setup || exit $? ;;
     3) part3_tests ;;
     0) exit 0 ;;
     *) warn "Неверный выбор" ;;
   esac
-  pause
+  pause || { error "Не удалось прочитать ответ для продолжения"; exit 1; }
 done

@@ -691,55 +691,121 @@ configure_swap() {
 # Безопасное управление ключами pin
 # Проверяем одну запись authorized_keys самим OpenSSH (включая записи с options).
 ssh_key_fingerprint() {
-  local line="$1" tmp fingerprint
+  # 0 = valid fingerprint, 1 = invalid/DSA input, 2 = operational failure.
+  local line="$1" tmp fingerprint contents status=0
   [[ "$line" =~ ^[[:space:]]*($|#) || "$line" == *$'\n'* ]] && return 1
-  tmp="$(mktemp)" || return 1
+  tmp="$(mktemp)" || { error "Не удалось создать временный файл проверки ключа"; return 2; }
   if ! printf '%s\n' "$line" > "$tmp"; then
-    rm -f -- "$tmp"
-    return 1
+    rm -f -- "$tmp" || error "Не удалось удалить временный файл проверки ключа"
+    error "Не удалось записать временный файл проверки ключа"
+    return 2
   fi
-  fingerprint="$(ssh-keygen -E sha256 -lf "$tmp" 2>/dev/null)"
-  local status=$?
-  rm -f -- "$tmp"
-  [ "$status" -eq 0 ] || return 1
+  if ! contents="$(cat -- "$tmp")" || [ "$contents" != "$line" ]; then
+    rm -f -- "$tmp" || error "Не удалось удалить временный файл проверки ключа"
+    error "Не удалось прочитать временный файл проверки ключа"
+    return 2
+  fi
+  fingerprint="$(LC_ALL=C ssh-keygen -E sha256 -lf "$tmp" 2>&1)" || status=$?
+  if ! rm -f -- "$tmp"; then
+    error "Не удалось удалить временный файл проверки ключа"
+    return 2
+  fi
+  if [ "$status" -ne 0 ]; then
+    # OpenSSH uses status 1 for both invalid input and I/O errors. Only its
+    # exact C-locale invalid-file diagnostic is an expected input rejection.
+    if [ "$status" -eq 1 ] && { [ "$fingerprint" = "$tmp is not a public key file." ] || [ "$fingerprint" = "$tmp is not a key file." ]; }; then
+      return 1
+    fi
+    error "Не удалось выполнить проверку SSH-ключа"
+    return 2
+  fi
   # DSA не подходит для входа; комментарий ключа не участвует в сравнении.
   [[ "$fingerprint" == *" (DSA)" ]] && return 1
-  printf '%s\n' "$fingerprint" | awk 'NR == 1 {print $2}'
+  if [[ "$fingerprint" != *$'\n'* && "$fingerprint" =~ ^[0-9]+[[:space:]]+(SHA256:[A-Za-z0-9+/]+)[[:space:]] ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}" || { error "Не удалось вывести fingerprint SSH-ключа"; return 2; }
+    return 0
+  fi
+  error "Неожиданный результат проверки SSH-ключа"
+  return 2
 }
 
 authorized_keys_has_key() {
-  local file="$1" wanted="${2:-}" line fingerprint
+  # 0 = match, 1 = ordinary no-match, 2 = operational failure.
+  local file="$1" wanted="${2:-}" line fingerprint content status
+  [ -e "$file" ] || { [ ! -L "$file" ] && return 1; }
+  if [ ! -f "$file" ]; then
+    error "Не удалось прочитать обычный файл ключей: $file"
+    return 2
+  fi
   [ -r "$file" ] || return 1
-  while IFS= read -r line || [ -n "$line" ]; do
-    fingerprint="$(ssh_key_fingerprint "$line")" || continue
+  # Read the entire file before matching: a partial read must not yield a
+  # successful early match or silently look like EOF/no-match.
+  if ! content="$(cat -- "$file")"; then
+    error "Не удалось прочитать файл ключей: $file"
+    return 2
+  fi
+  while true; do
+    status=0
+    IFS= read -r line || status=$?
+    [ "$status" -eq 1 ] && break
+    if [ "$status" -ne 0 ]; then
+      error "Не удалось прочитать запись SSH-ключа"
+      return 2
+    fi
+    status=0
+    fingerprint="$(ssh_key_fingerprint "$line")" || status=$?
+    case "$status" in
+      0) ;;
+      1) continue ;;
+      *) return 2 ;;
+    esac
     if [ -z "$wanted" ] || [ "$fingerprint" = "$wanted" ]; then
       return 0
     fi
-  done < "$file"
+  done <<< "$content"
   return 1
 }
 
 configure_pin() {
   section "ПОСТОЯННЫЙ ПОЛЬЗОВАТЕЛЬ $PIN_USER"
-  local home sshdir keys action answer method public_key keyfile
+  local home sshdir keys action answer method public_key keyfile passwd_entry status
   local is_new=false replace_mode=false use_file=false
   PIN_HAS_KEY=false
 
   if id "$PIN_USER" >/dev/null 2>&1; then
-    home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
+    if ! passwd_entry="$(getent passwd "$PIN_USER")"; then
+      error "Не удалось получить passwd-запись пользователя $PIN_USER"
+      return 1
+    fi
+    # Parse one complete passwd record without a pipeline; preserve custom home.
+    if [[ "$passwd_entry" == *$'\n'* || ! "$passwd_entry" =~ ^([^:]+):[^:]*:[0-9]+:[0-9]+:[^:]*:([^:]+):[^:]*$ ]]; then
+      error "Некорректная passwd-запись пользователя $PIN_USER"
+      return 1
+    fi
+    if [ "${BASH_REMATCH[1]}" != "$PIN_USER" ]; then
+      error "Получена passwd-запись другого пользователя"
+      return 1
+    fi
+    home="${BASH_REMATCH[2]}"
     sshdir="$home/.ssh"; keys="$sshdir/authorized_keys"
     if [ -z "$home" ] || [ ! -d "$home" ]; then
       error "Не найдена домашняя директория пользователя $PIN_USER"
       return 1
     fi
-    authorized_keys_has_key "$keys" && PIN_HAS_KEY=true
+    status=0
+    authorized_keys_has_key "$keys" || status=$?
+    case "$status" in
+      0) PIN_HAS_KEY=true ;;
+      1) ;;
+      *) error "Не удалось проверить ключи пользователя $PIN_USER"; return 1 ;;
+    esac
     info "$PIN_USER уже существует; валидный SSH-ключ: $PIN_HAS_KEY"
 
     echo "Enter) Ничего не менять (по умолчанию)"
     echo "1) Сменить пароль"
     echo "2) Добавить публичный ключ"
     echo "3) Заменить все публичные ключи"
-    ask "Ваш выбор: " action
+    ask "Ваш выбор: " action || { error "Не удалось прочитать ответ для настройки $PIN_USER"; return 1; }
     case "$action" in
       "") info "Пользователь $PIN_USER оставлен без изменений"; return 0 ;;
       1) set_pin_password; return $? ;;
@@ -747,7 +813,12 @@ configure_pin() {
       *) warn "Неизвестный выбор — ничего не меняем"; return 0 ;;
     esac
   else
-    ask "Создать $PIN_USER и добавить в группу sudo? [Y/n]: " answer
+    status=$?
+    if [ "$status" -ne 1 ]; then
+      error "Не удалось проверить существование пользователя $PIN_USER"
+      return 1
+    fi
+    ask "Создать $PIN_USER и добавить в группу sudo? [Y/n]: " answer || { error "Не удалось прочитать ответ для настройки $PIN_USER"; return 1; }
     if ! yes_by_default "$answer"; then
       warn "Создание $PIN_USER пропущено"
       return 0
@@ -763,7 +834,20 @@ configure_pin() {
       return 1
     fi
 
-    home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
+    if ! passwd_entry="$(getent passwd "$PIN_USER")"; then
+      error "Не удалось получить passwd-запись пользователя $PIN_USER"
+      return 1
+    fi
+    # Parse one complete passwd record without a pipeline; preserve custom home.
+    if [[ "$passwd_entry" == *$'\n'* || ! "$passwd_entry" =~ ^([^:]+):[^:]*:[0-9]+:[0-9]+:[^:]*:([^:]+):[^:]*$ ]]; then
+      error "Некорректная passwd-запись пользователя $PIN_USER"
+      return 1
+    fi
+    if [ "${BASH_REMATCH[1]}" != "$PIN_USER" ]; then
+      error "Получена passwd-запись другого пользователя"
+      return 1
+    fi
+    home="${BASH_REMATCH[2]}"
     if [ -z "$home" ] || [ ! -d "$home" ]; then
       error "Не найдена домашняя директория пользователя $PIN_USER"
       return 1
@@ -782,7 +866,7 @@ configure_pin() {
     echo "1) Вставить публичный ключ"
     echo "2) Скопировать ключ из файла на сервере"
     echo "3) Пропустить"
-    ask "Способ добавления ключа [1/2/3]: " method
+    ask "Способ добавления ключа [1/2/3]: " method || { error "Не удалось прочитать ответ для настройки $PIN_USER"; return 1; }
     case "$method" in
       1) use_file=false ;;
       2) use_file=true ;;
@@ -791,16 +875,16 @@ configure_pin() {
   fi
 
   if [ "$use_file" = true ]; then
-    ask "Путь к файлу публичного ключа: " keyfile
+    ask "Путь к файлу публичного ключа: " keyfile || { error "Не удалось прочитать ответ для настройки $PIN_USER"; return 1; }
     # ЗАМЕЧАНИЕ 2: файл не найден — это ОШИБКА, а не успех
     if [ ! -f "$keyfile" ]; then
       error "Файл не найден: $keyfile"
       return 1
     fi
-    public_key=$(cat "$keyfile")
+    public_key=$(cat "$keyfile") || { error "Не удалось прочитать файл публичного ключа: $keyfile"; return 1; }
   else
     info "Вставьте публичный SSH-ключ одной строкой:"
-    read -r public_key < /dev/tty
+    read -r public_key < /dev/tty || { error "Не удалось прочитать публичный SSH-ключ из /dev/tty"; return 1; }
   fi
 
   # Пустой ключ: НЕ ломаем существующие ключи
@@ -816,14 +900,21 @@ configure_pin() {
   fi
 
   local fingerprint
-  if ! fingerprint="$(ssh_key_fingerprint "$public_key")"; then
-    warn "Некорректный публичный SSH-ключ или запрещённый ssh-dss. Ключ не добавлен."
-    return 0
-  fi
-  if [ "$replace_mode" = false ] && authorized_keys_has_key "$keys" "$fingerprint"; then
-    PIN_HAS_KEY=true
-    info "Этот публичный ключ уже установлен"
-    return 0
+  status=0
+  fingerprint="$(ssh_key_fingerprint "$public_key")" || status=$?
+  case "$status" in
+    0) ;;
+    1) warn "Некорректный публичный SSH-ключ или запрещённый ssh-dss. Ключ не добавлен."; return 0 ;;
+    *) error "Не удалось проверить публичный SSH-ключ"; return 1 ;;
+  esac
+  if [ "$replace_mode" = false ]; then
+    status=0
+    authorized_keys_has_key "$keys" "$fingerprint" || status=$?
+    case "$status" in
+      0) PIN_HAS_KEY=true; info "Этот публичный ключ уже установлен"; return 0 ;;
+      1) ;;
+      *) error "Не удалось проверить наличие публичного SSH-ключа"; return 1 ;;
+    esac
   fi
 
   PIN_HAS_KEY=false
@@ -846,7 +937,7 @@ configure_pin() {
       if [ -e "$keys" ]; then
         cat "$keys" || exit 1
         # Отделяем новый ключ, даже если последняя запись не заканчивается LF.
-        printf '\n'
+        printf '\n' || exit 1
       fi
       printf '%s\n' "$public_key"
     ) > "$tmp_keys"; then

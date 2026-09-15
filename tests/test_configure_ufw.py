@@ -16,7 +16,9 @@ SUCCESS = 'UFW включён: SSH 5829, HTTP/HTTPS'
 
 class ConfigureUfwTest(unittest.TestCase):
     def run_ufw(self, active=False, failure='', refuse=False, missing_rule=False,
-                part2=False, errexit=False, action=''):
+                part2=False, errexit=False, action='', ask_failure='',
+                source_ip='192.0.2.1', call_override='', status_failure_at=0,
+                pipefail=True, repeat=False, missing_ufw=False, read_error=False):
         prelude = '''
 set -o pipefail
 SSH_PORT=5829
@@ -26,10 +28,19 @@ ok() { echo "OK: $*"; }
 error() { echo "ERROR: $*" >&2; }
 warn() { echo "WARN: $*"; }
 ask() {
+  if [[ "$2" == "$ASK_FAILURE" ]]; then
+    if [[ "$READ_ERROR" == yes ]]; then
+      read -r "$2" <&-  # Closed input descriptor, distinct from EOF.
+      return $?
+    fi
+    # Real read on an exhausted input: failure must not become a default.
+    read -r "$2" < /dev/null
+    return $?
+  fi
   case "$2" in
     answer) printf -v answer '%s' "$ANSWER" ;;
     action) printf -v action '%s' "$ACTION" ;;
-    source_ip) printf -v source_ip '%s' '192.0.2.1' ;;
+    source_ip) printf -v source_ip '%s' "$SOURCE_IP" ;;
   esac
 }
 yes_by_default() { [[ "$1" != n ]]; }
@@ -37,8 +48,13 @@ ufw() {
   echo "CMD:$*" >&2
   if [[ "$*" == "$FAILURE" ]]; then return 23; fi
   if [[ "$1" == status ]]; then
+    local count=0
+    if [[ -f "$STATUS_COUNT" ]]; then read -r count < "$STATUS_COUNT"; fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$STATUS_COUNT"
     echo "Status: $STATE"
     if [[ "$MISSING_RULE" == no ]]; then echo '5829/tcp ALLOW Anywhere'; fi
+    if [[ "$count" == "$STATUS_FAILURE_AT" ]]; then return 23; fi
     return 0
   fi
   return 0
@@ -46,9 +62,17 @@ ufw() {
 '''
         env = dict(os.environ, STATE='active' if active else 'inactive', FAILURE=failure,
                    ANSWER='n' if refuse else '', MISSING_RULE='yes' if missing_rule else 'no',
-                   ACTION=action)
+                   ACTION=action, ASK_FAILURE=ask_failure, SOURCE_IP=source_ip,
+                   STATUS_FAILURE_AT=str(status_failure_at), READ_ERROR='yes' if read_error else 'no')
         stubs = '\n'.join(f'{name}() {{ echo STEP:{name}; }}' for name in STEPS if name != 'configure_ufw')
-        call = 'part2_setup' if part2 else 'configure_ufw'
+        call = call_override or ('part2_setup' if part2 else 'configure_ufw')
+        prelude += '\nSTATUS_COUNT=$(mktemp)\ntrap \'rm -f "$STATUS_COUNT"\' EXIT\n'
+        if not pipefail:
+            prelude += 'set +o pipefail\n'
+        if missing_ufw:
+            prelude += 'command() { return 1; }\n'
+        if repeat:
+            call += ' || exit $?\n' + call
         return subprocess.run([os.environ.get('BASH', 'bash')],
                               input=prelude + stubs + '\n' + FUNCTIONS + '\n' + PART2
                               + ('\nset -e\n' if errexit else '\n') + call + ' || exit $?\n',

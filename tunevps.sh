@@ -832,18 +832,33 @@ configure_pin() {
 }
 
 ufw_is_active() {
-  LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active$'
+  # 0 = active, 1 = inactive, 2 = operational failure (fail closed).
+  local status_output
+  if ! status_output="$(LC_ALL=C ufw status)"; then
+    error "Не удалось получить статус UFW"
+    return 2
+  fi
+  case "$status_output" in
+    'Status: active'|'Status: active'$'\n'*) return 0 ;;
+    'Status: inactive'|'Status: inactive'$'\n'*) return 1 ;;
+    *) error "Неожиданный ответ ufw status"; return 2 ;;
+  esac
 }
 
 # Если UFW уже активен, целевой SSH-порт должен быть разрешён ДО
 # переключения sshd. Старые SSH-правила здесь намеренно не удаляются.
 ensure_ufw_ssh_port() {
+  local status status_output
   if ! command -v ufw >/dev/null 2>&1; then
     error "UFW не установлен — невозможно безопасно проверить доступ к SSH-порту $SSH_PORT"
     return 1
   fi
 
-  if ! ufw_is_active; then
+  if ufw_is_active; then
+    :
+  else
+    status=$?
+    if [ "$status" -ne 1 ]; then return "$status"; fi
     info "UFW сейчас не активен — предварительное правило для SSH не требуется"
     return 0
   fi
@@ -854,7 +869,11 @@ ensure_ufw_ssh_port() {
     return 1
   fi
 
-  if LC_ALL=C ufw status | awk -v port="$SSH_PORT/tcp" '$1 == port && $2 == "ALLOW" {found=1} END {exit !found}'; then
+  if ! status_output="$(LC_ALL=C ufw status)"; then
+    error "Не удалось проверить статус UFW после добавления SSH-правила"
+    return 2
+  fi
+  if awk -v port="$SSH_PORT/tcp" '$1 == port && $2 == "ALLOW" {found=1} END {exit !found}' <<< "$status_output"; then
     ok "UFW разрешает $SSH_PORT/tcp"
   else
     error "После изменения UFW правило ALLOW для $SSH_PORT/tcp не найдено"
@@ -866,7 +885,7 @@ ensure_ufw_ssh_port() {
 
 configure_ufw() {
   section "UFW"
-  local answer action source_ip
+  local answer action source_ip status
 
   if ufw_is_active; then
     # Повторная проверка безопасна и идемпотентна. Старый SSH-порт не удаляем.
@@ -874,7 +893,11 @@ configure_ufw() {
       return 1
     fi
   else
-    ask "Настроить и активировать UFW? [Y/n]: " answer
+    status=$?
+    if [ "$status" -ne 1 ]; then return "$status"; fi
+    ask "Настроить и активировать UFW? [Y/n]: " answer || {
+      error "Не удалось прочитать ответ об активации UFW"; return 1;
+    }
     if yes_by_default "$answer"; then
       ufw default deny incoming || { error "Не удалось установить UFW default deny incoming"; return 1; }
       ufw default allow outgoing || { error "Не удалось установить UFW default allow outgoing"; return 1; }
@@ -887,20 +910,24 @@ configure_ufw() {
   fi
 
   echo "iPerf3: Enter) не менять; 1) открыть всем; 2) открыть одному IP; 3) закрыть общие правила"
-  ask "Правило для порта 5201: " action
+  ask "Правило для порта 5201: " action || {
+    error "Не удалось прочитать выбор правила iPerf3"; return 1;
+  }
   case "$action" in
     1)
       ufw allow 5201/tcp comment 'temporary iperf3' || { error "Не удалось разрешить 5201/tcp в UFW"; return 1; }
       ufw allow 5201/udp comment 'temporary iperf3' || { error "Не удалось разрешить 5201/udp в UFW"; return 1; }
       warn "Закройте 5201 после теста: выберите пункт 3" ;;
     2)
-      ask "IPv4 или IPv6-адрес клиента: " source_ip
+      ask "IPv4 или IPv6-адрес клиента: " source_ip || {
+        error "Не удалось прочитать IP-адрес клиента iPerf3"; return 1;
+      }
       if [[ "$source_ip" =~ ^[0-9A-Fa-f:.]+$ ]]; then
         ufw allow from "$source_ip" to any port 5201 proto tcp || { error "Не удалось разрешить iPerf3 TCP для $source_ip в UFW"; return 1; }
         ufw allow from "$source_ip" to any port 5201 proto udp || { error "Не удалось разрешить iPerf3 UDP для $source_ip в UFW"; return 1; }
         ok "iPerf3 разрешён только для $source_ip"
       else
-        error "Некорректный IP"; fi ;;
+        error "Некорректный IP"; return 1; fi ;;
     3)
       ufw --force delete allow 5201/tcp || { error "Не удалось удалить общее правило 5201/tcp в UFW"; return 1; }
       ufw --force delete allow 5201/udp || { error "Не удалось удалить общее правило 5201/udp в UFW"; return 1; }

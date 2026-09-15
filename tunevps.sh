@@ -764,7 +764,7 @@ authorized_keys_has_key() {
     if [ -z "$wanted" ] || [ "$fingerprint" = "$wanted" ]; then
       return 0
     fi
-  done <<< "$content"
+  done <<< "$content" || { error "Не удалось открыть прочитанные записи SSH-ключей"; return 2; }
   return 1
 }
 

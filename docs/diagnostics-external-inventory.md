@@ -15,7 +15,7 @@ checkout verified 2026-09-22). This is a targeted inventory, not a new full audi
 | F29/F30 | Eight remote choices stream code to bash or use process substitution; three start without HTTPS. Replace with checked private temporary regular file, HTTPS-only redirects, nonempty and bash syntax checks, checked runner and cleanup. |
 | F31 | part3 ignores ask failure; outer menu ignores diagnostic status. Propagate submenu failure; menu reports it, pauses and continues. Exit/back and invalid-choice policy unchanged. |
 | F32 | Existing `.github/workflows/bash-syntax.yml` runs syntax only on filtered PRs. Extend existing workflow to Ubuntu syntax, full isolated discovery and event-aware whitespace checks, PR and main push. |
-| F33 | Current tests already use a fixed DSA fixture from PR #26; no new portability redesign. |
+| F33 | Current test still requires DSA key generation, unsupported by OpenSSH 10. Replace generation with a fixed public-only DSA fixture; preserve rejection assertion. No key policy change. |
 
 ## Contracts and endpoint evidence
 

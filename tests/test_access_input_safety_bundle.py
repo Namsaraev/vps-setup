@@ -83,14 +83,14 @@ class BundleIntegrationTest(unittest.TestCase):
                     self.assertEqual(calls, '')
                     self.assertEqual(fstab, swap.FSTAB)
 
-    def test_ssh_prompt_failure_has_no_mutations(self):
+    def test_ssh_prompt_failure_has_no_policy_mutations(self):
         for failure in INPUT_FAILURES:
             for errexit in (False, True):
                 with self.subTest(failure=failure, errexit=errexit):
                     result, calls, config = self.run_ssh(
                         'ask() { ' + failure + '; }', outer=True, errexit=errexit)
                     self.assert_stopped(result)
-                    self.assertEqual(calls, 'sshd -T\n')
+                    self.assertEqual(calls, 'install\nsshd -T\n')
                     self.assertEqual(config, '#Port 22\n')
 
     def test_explicit_skip_stops_part2_without_generic_error(self):
@@ -104,16 +104,52 @@ class BundleIntegrationTest(unittest.TestCase):
                     self.assert_stopped(result)
                     self.assertNotIn('ERROR:', result.stderr)
                     self.assertIn('SSH пропущен', result.stdout)
-                    self.assertEqual(calls, 'sshd -T\n')
+                    self.assertEqual(calls, 'install\nsshd -T\n')
                     self.assertEqual(config, '#Port 22\n')
 
-    def test_compliant_fast_path_proceeds_without_prompt_or_mutation(self):
+    def test_compliant_fast_path_proceeds_without_prompt_or_policy_mutation(self):
         result, calls, config = self.run_ssh(
             'command touch "$ROOT/applied"\nask() { return 99; }', outer=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, 'sshd -T\nlistener\n')
+        self.assertEqual(calls, 'install\nsshd -T\nlistener\n')
         self.assertEqual(config, '#Port 22\n')
         self.assertIn('Часть 2 завершена', result.stdout)
+
+    def test_missing_runtime_directory_is_created_before_initial_probe(self):
+        setup = r'''
+[[ ! -e "$ROOT/run/sshd" ]] || exit 90
+install() {
+  op "install $*" || return 23
+  [[ "$*" == "-d -m 0755 $ROOT/run/sshd" ]] || return 91
+  command mkdir -p "$ROOT/run/sshd"
+}
+eval "$(declare -f sshd | command sed '1s/sshd/original_sshd/')"
+sshd() {
+  [[ -d "$ROOT/run/sshd" ]] || { op missing-runtime; return 23; }
+  original_sshd "$@"
+}
+ask() { op prompt; printf -v "$2" '%s' n; }
+'''
+        for errexit in (False, True):
+            with self.subTest(errexit=errexit):
+                result, calls, config = self.run_ssh(setup, outer=True, errexit=errexit)
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assert_stopped(result)
+                self.assertNotIn('ERROR:', result.stderr)
+                self.assertEqual(calls, 'install -d -m 0755 /run/sshd\nsshd -T\nprompt\n')
+                self.assertEqual(config, '#Port 22\n')
+
+    def test_runtime_directory_failure_stops_before_probe_prompt_and_apply(self):
+        for outer in (False, True):
+            for errexit in (False, True):
+                with self.subTest(outer=outer, errexit=errexit):
+                    result, calls, config = self.run_ssh(
+                        'ask() { op prompt; return 0; }', failure='install',
+                        outer=outer, errexit=errexit)
+                    self.assert_stopped(result)
+                    self.assertIn('Не удалось создать', result.stderr)
+                    self.assertEqual(calls, 'install\n')
+                    self.assertEqual(config, '#Port 22\n')
 
     def test_ssh_getent_invalid_results_stop_before_probes(self):
         records = ('return 23',

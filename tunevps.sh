@@ -1166,6 +1166,13 @@ configure_ssh() {
   fi
   ok "SSH-ключ для $PIN_USER найден"
 
+  # В Ubuntu/Debian sshd -t/-T может требовать этот runtime-каталог
+  # даже до запуска службы.
+  if ! install -d -m 0755 /run/sshd; then
+    error "Не удалось создать /run/sshd"
+    return 1
+  fi
+
   # Сначала смотрим эффективную конфигурацию sshd, а не только текст файлов.
   # Это делает повторный запуск идемпотентным и учитывает *.d/ и cloud-init.
   local effective
@@ -1212,13 +1219,6 @@ configure_ssh() {
   if [[ ! "$answer" =~ ^[Yy]$ ]]; then
     info "Настройка SSH пропущена по вашему выбору"
     return 3
-  fi
-
-  # Создаём runtime-каталог только после согласия, до проверки и применения.
-  # Ошибка начального read-only sshd -T выше безопасно останавливает настройку.
-  if ! install -d -m 0755 /run/sshd; then
-    error "Не удалось создать /run/sshd"
-    return 1
   fi
 
   # Критическая preflight-проверка: если UFW уже активен, новый SSH-порт

@@ -241,8 +241,8 @@ helper_checks() {
     status=0; ssh_key_fingerprint "$value" || status=$?
     [ "$status" = 1 ] || return 91
   done
-  ssh-keygen -q -t dsa -N '' -f "$ROOT/dsa" || return 92
-  status=0; ssh_key_fingerprint "$(cat "$ROOT/dsa.pub")" || status=$?
+# Fixed public-only DSA fixture: OpenSSH 10 no longer generates DSA keys.
+  status=0; ssh_key_fingerprint 'ssh-dss AAAAB3NzaC1kc3MAAACBAI85cTmib5reOrUaLpfh7BlBNAVW+xsu7YJ9ZLYLXUvb2utIk+K9DF/w8asn6VUp3HK87nCAjZzxOwshLTCbw6JenDFtebd5IkLxhAorg5AM7xF74ixh7NIdU0P19ndOMxRy6tRc8ZNba1dISY9YOTtpWKxml2bnXf+iIDOJvVs/AAAAFQC3EFkoZVNilvlgvJby3XWfx4nMBwAAAIBL2YvVCX3b9y4LQhCgG+4xYJwk20QqdDROMFyrWbZmMFJltfCAiGqOzFuKMlHuwJOOpl9RvUizYt2gJkLlO6HfxZCq7NTCaliVKrgU8H/iX5Lx6KVciyhC1z/+97vRsLOL9nJn3Xa+fpiHlwWPBwY9t0ATcBkuiKRKuBZXJ5+ShgAAAIAsg9cJR1LG3luLFJRGy7JAimdEnlTqypJWoNOCJqn9ojEFZPzPAfJ104wNZMBX79iA3iPs3S+tSraWCh7RRIXHbGS1mGDSus5+BtiDKJXOnhBclYrXD5l4QFR9G0Qsf/SiAto68q51HFqRBrnuC3xnhdEqOpL/lSi+vLEmy6+Ukg==' || status=$?
   [ "$status" = 1 ] || return 93
   fp=$(ssh_key_fingerprint "$NEW_KEY") || return 94
   printf 'restrict,command="echo hello" %s changed-comment' "$NEW_KEY" > "$keys_path"

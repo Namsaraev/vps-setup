@@ -1,18 +1,39 @@
-name: Bash syntax
+name: Ubuntu checks
 
 on:
   pull_request:
-    paths:
-      - 'tunevps.sh'
-      - '.github/workflows/bash-syntax.yml'
+  push:
+    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
   bash-syntax:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BASH: /bin/bash
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Check tunevps.sh syntax
         run: bash -n tunevps.sh
+      - name: Whitespace in changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            git diff --check "$PR_BASE...$PR_HEAD"
+          elif [ -n "$PUSH_BASE" ] && ! [[ "$PUSH_BASE" =~ ^0+$ ]] && git cat-file -e "$PUSH_BASE^{commit}"; then
+            git diff --check "$PUSH_BASE" HEAD
+          else
+            git diff --check "$(git hash-object -w -t tree /dev/null)" HEAD
+          fi
+      - name: Isolated unit tests
+        run: python3 -m unittest discover -s tests -v

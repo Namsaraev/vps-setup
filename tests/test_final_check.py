@@ -32,6 +32,9 @@ sshd() {
   elif [ "$FAIL_EFFECTIVE" = 1 ]; then
     return 1
   else
+    echo "port 5829"
+    echo "kbdinteractiveauthentication no"
+    echo "maxauthtries 3"
     echo "passwordauthentication ${PASSWORD_AUTH:-no}"
     echo "pubkeyauthentication yes"
     echo "permitrootlogin no"
@@ -40,6 +43,7 @@ sshd() {
 sysctl() { echo bbr; }
 swapon() { echo '/fake-swap'; }
 ufw() { echo 'Status: active'; }
+ufw_is_active() { return 0; }
 zoxide() { :; }
 ask() { choice=0; if [ "${ASKED:-0}" = 0 ]; then choice=2; ASKED=1; fi; }
 pause() { echo PAUSED; }

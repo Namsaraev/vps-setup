@@ -9,7 +9,7 @@ import unittest
 
 SOURCE = (Path(__file__).resolve().parents[1] / 'tunevps.sh').read_text(encoding='utf-8')
 FUNCTION = 'configure_needrestart() {' + SOURCE.split('configure_needrestart() {', 1)[1].split('\nconfigure_safe_sysctl()', 1)[0]
-SUCCESS = 'Автоматический перезапуск включён'
+SUCCESS = 'Режим автоматического перезапуска записан в основной конфиг needrestart'
 AUTO = b'$nrconf{restart} = "a";\n'
 PRELUDE = r'''
 set -euo pipefail

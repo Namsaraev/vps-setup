@@ -30,13 +30,21 @@ ask() {
   return 0
 }
 ask_password() {
-  local prompt="$1" variable="$2" read_status=0
-  printf '%s' "$prompt" > /dev/tty
+  local prompt="$1" variable="$2" read_status=0 write_status=0
+  printf '%s' "$prompt" > /dev/tty || {
+    write_status=$?
+    error "Не удалось вывести приглашение для пароля в /dev/tty"
+    return "$write_status"
+  }
   IFS= read -r -s "$variable" < /dev/tty || read_status=$?
-  printf '\n' > /dev/tty
+  printf '\n' > /dev/tty || write_status=$?
   if [ "$read_status" -ne 0 ]; then
     error "Не удалось прочитать пароль из /dev/tty"
     return "$read_status"
+  fi
+  if [ "$write_status" -ne 0 ]; then
+    error "Не удалось завершить ввод пароля в /dev/tty"
+    return "$write_status"
   fi
   return 0
 }
@@ -65,7 +73,12 @@ yes_by_default() { [[ -z "$1" || "$1" =~ ^[Yy]$ ]]; }
 # Надёжная проверка: порт должен быть в конце поля локального адреса (4-е поле)
 # Работает для 0.0.0.0:5829, [::]:5829, *:5829
 check_ssh_port() {
-  ss -ltn | awk -v suffix=":$SSH_PORT" '$4 ~ suffix"$" {found=1} END {exit !found}'
+  # 0 = listener present, 1 = absent, 2 = probe failure.
+  local listeners status=0
+  listeners="$(ss -ltn)" || return 2
+  awk -v suffix=":$SSH_PORT" '$4 ~ suffix"$" {found=1} END {exit !found}' <<< "$listeners" || status=$?
+  [ "$status" -le 1 ] || return 2
+  return "$status"
 }
 
 if [ "$EUID" -ne 0 ]; then
@@ -615,7 +628,8 @@ PY
         error "Не удалось включить и проверить автоматический перезапуск needrestart"
         return 1
       fi
-      ok "Автоматический перезапуск включён"
+      ok "Режим автоматического перезапуска записан в основной конфиг needrestart"
+      warn "Эффективный режим может быть переопределён conf.d или APT hook; здесь он не проверяется"
     else
       info "Настройки needrestart не изменены"
     fi
@@ -630,6 +644,7 @@ configure_safe_sysctl() {
   # BBR в Ubuntu может быть доступен как модуль tcp_bbr, но не загружен.
   # Сначала пробуем загрузить модуль, затем только при необходимости
   # отказываемся от BBR. Это важно для минимальных cloud-образов.
+  local available_algorithms
   local bbr_available=false
   local bbr_module=false
 
@@ -637,7 +652,11 @@ configure_safe_sysctl() {
     bbr_module=true
   fi
 
-  if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+  if ! available_algorithms=$(sysctl -n net.ipv4.tcp_available_congestion_control) || [ -z "$available_algorithms" ]; then
+    error "Не удалось прочитать доступные алгоритмы контроля перегрузки"
+    return 1
+  fi
+  if [[ ! "$available_algorithms" =~ (^|[[:space:]])bbr($|[[:space:]]) ]]; then
     if [ "$bbr_module" = true ]; then
       # Отсутствие модуля допустимо; сбой загрузки уже найденного модуля — ошибка.
       command -v modprobe >/dev/null 2>&1 || { error "tcp_bbr найден, но modprobe недоступен"; return 1; }
@@ -651,7 +670,11 @@ configure_safe_sysctl() {
     fi
   fi
 
-  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+  if ! available_algorithms=$(sysctl -n net.ipv4.tcp_available_congestion_control) || [ -z "$available_algorithms" ]; then
+    error "Не удалось прочитать доступные алгоритмы контроля перегрузки"
+    return 1
+  fi
+  if [[ "$available_algorithms" =~ (^|[[:space:]])bbr($|[[:space:]]) ]]; then
     bbr_available=true
     if [ "$bbr_module" = true ]; then
       mkdir -p /etc/modules-load.d || { error "Не удалось создать /etc/modules-load.d"; return 1; }
@@ -723,7 +746,7 @@ EOF
     return 1
   fi
   if systemctl daemon-reexec; then
-    ok "DefaultLimitNOFILE=1048576 применён ко всем сервисам"
+    ok "DefaultLimitNOFILE=1048576 задан по умолчанию для последующих запусков сервисов; per-unit overrides сохраняются"
   else
     error "Не удалось выполнить systemctl daemon-reexec"
     return 1
@@ -810,7 +833,10 @@ configure_swap() {
       return 0
     fi
   else
-    ram="$(LC_ALL=C free -m | awk '/^Mem:/ {print $2}')"
+    if ! ram="$(LC_ALL=C free -m | awk '/^Mem:/ {print $2}')"; then
+      error "Не удалось измерить объём RAM"
+      return 1
+    fi
     if ! [[ "$ram" =~ ^[0-9]+$ ]]; then
       error "Не удалось определить объём RAM; swap не изменён"
       return 1
@@ -1678,75 +1704,127 @@ EOF
   info "После нового SSH-входа под $CURRENT_USER мастер P10K стартует автоматически."
 }
 
+# Download completely before parsing/executing; traps are scoped to this subshell.
+run_remote_diagnostic() (
+  local url="$1" temporary status=0
+  shift
+  case "$url" in
+    https://*) ;;
+    *) error "Для загрузки диагностики требуется HTTPS"; return 1 ;;
+  esac
+  temporary=$(mktemp "${TMPDIR:-/tmp}/tunevps-diagnostic.XXXXXXXX") || {
+    error "Не удалось создать временный файл диагностики"; return 1;
+  }
+  trap 'status=$?; if ! rm -f -- "$temporary"; then error "Не удалось удалить временный файл диагностики"; [ "$status" -ne 0 ] || status=1; fi; exit "$status"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [ -L "$temporary" ] || [ ! -f "$temporary" ]; then
+    error "Временный файл диагностики должен быть обычным файлом"
+    return 1
+  fi
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --max-time 180 --output "$temporary" "$url" || {
+    status=$?; error "Не удалось полностью загрузить диагностику: $url"; return "$status";
+  }
+  if [ -L "$temporary" ] || [ ! -f "$temporary" ] || [ ! -s "$temporary" ]; then
+    error "Загруженный файл диагностики пуст или не является обычным файлом"
+    return 1
+  fi
+  bash -n -- "$temporary" || {
+    status=$?; error "Загруженная диагностика не прошла проверку синтаксиса"; return "$status";
+  }
+  bash -- "$temporary" "$@" || {
+    status=$?; error "Диагностика завершилась ошибкой (код $status)"; return "$status";
+  }
+  return 0
+)
+
 final_check() {
   local failed=0
   section "ФИНАЛЬНАЯ ПРОВЕРКА"
 
-  install -d -m 0755 /run/sshd 2>/dev/null || true
-
-  if check_ssh_port; then
-    ok "SSH слушает порт $SSH_PORT ✓"
-  else
-    error "SSH НЕ слушает порт $SSH_PORT! ⚠️"
+  if ! install -d -m 0755 /run/sshd; then
+    error "Не удалось подготовить /run/sshd для проверки SSH"
     failed=1
   fi
+
+  local status=0
+  check_ssh_port || status=$?
+  case "$status" in
+    0) ok "SSH слушает порт $SSH_PORT ✓" ;;
+    1) error "SSH НЕ слушает порт $SSH_PORT! ⚠️"; failed=1 ;;
+    *) error "Не удалось проверить listener на порту $SSH_PORT"; failed=1 ;;
+  esac
 
   if systemctl is-active --quiet ssh.service || systemctl is-active --quiet ssh.socket; then
     ok "SSH активен (service или socket) ✓"
   else
-    error "SSH НЕ активен! ⚠️"
+    error "Не удалось подтвердить активность SSH (service или socket)! ⚠️"
     failed=1
   fi
 
-  if sshd -t 2>/dev/null; then
+  if sshd -t; then
     ok "Синтаксис sshd_config корректен ✓"
   else
-    error "Ошибка синтаксиса sshd_config! ⚠️"
+    error "Проверка sshd_config (sshd -t) завершилась ошибкой! ⚠️"
     failed=1
   fi
 
-  local pass_auth pubkey_auth root_login
-  pass_auth=$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')
-  pubkey_auth=$(sshd -T 2>/dev/null | awk '$1 == "pubkeyauthentication" {print $2}')
-  root_login=$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}')
-
-  if [ "$pass_auth" = "no" ]; then
-    ok "PasswordAuthentication=no ✓"
+  local effective field expected actual
+  if effective="$(sshd -T)"; then
+    while read -r field expected; do
+      if ! actual=$(awk -v field="$field" '$1 == field {print $2}' <<< "$effective"); then
+        error "Не удалось прочитать поле SSH $field"
+        failed=1
+      elif [ "$actual" = "$expected" ]; then
+        ok "$field=$expected ✓"
+      else
+        error "$field=${actual:-не определён} (должно быть '$expected')"
+        failed=1
+      fi
+    done <<EOF
+port $SSH_PORT
+passwordauthentication no
+pubkeyauthentication yes
+permitrootlogin no
+kbdinteractiveauthentication no
+maxauthtries 3
+EOF
   else
-    error "PasswordAuthentication=$pass_auth (должно быть 'no')!"
+    error "Не удалось получить эффективную конфигурацию SSH (sshd -T)"
     failed=1
   fi
-  if [ "$pubkey_auth" = "yes" ]; then
-    ok "PubkeyAuthentication=yes ✓"
-  else
-    warn "PubkeyAuthentication=$pubkey_auth"
-  fi
-  if [ "$root_login" = "no" ]; then
-    ok "PermitRootLogin=no ✓"
-  else
-    warn "PermitRootLogin=$root_login"
-  fi
 
-  local bbr
-  bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "none")
-  if [ "$bbr" = "bbr" ]; then
+  local bbr swap_output
+  if ! bbr=$(sysctl -n net.ipv4.tcp_congestion_control); then
+    error "Не удалось прочитать алгоритм контроля перегрузки"
+    failed=1
+  elif [ -z "$bbr" ]; then
+    error "Получен пустой алгоритм контроля перегрузки"
+    failed=1
+  elif [ "$bbr" = "bbr" ]; then
     ok "BBR включён ✓"
   else
     info "Алгоритм контроля перегрузки: $bbr"
   fi
 
-  if swapon --show --noheadings | grep -q .; then
+  if ! swap_output=$(swapon --show --noheadings); then
+    error "Не удалось получить состояние swap"
+    failed=1
+  elif [ -n "$swap_output" ]; then
     ok "Swap настроен ✓"
   else
-    info "Swap не настроен (RAM > ${SWAP_RAM_THRESHOLD_MB}MB)"
+    info "Активный swap отсутствует"
   fi
 
   if command -v ufw >/dev/null 2>&1; then
-    if LC_ALL=C ufw status 2>/dev/null | grep -q "Status: active"; then
-      ok "UFW активен ✓"
-    else
-      warn "UFW НЕ активен"
-    fi
+    status=0
+    ufw_is_active || status=$?
+    case "$status" in
+      0) ok "UFW активен ✓" ;;
+      1) warn "UFW НЕ активен" ;;
+      *) error "Не удалось проверить состояние UFW"; failed=1 ;;
+    esac
   else
     warn "UFW не установлен"
   fi
@@ -1770,10 +1848,15 @@ final_check() {
     failed=1
   fi
 
-  # ЗАМЕЧАНИЕ 1: проверяем, что systemd реально использует лимит (не просто наличие файла)
+  # Manager default does not describe existing processes or per-unit overrides.
   local default_nofile
-  default_nofile=$(systemctl show --property=DefaultLimitNOFILE --value 2>/dev/null || true)
-  if [ "$default_nofile" = "1048576" ]; then
+  if ! default_nofile=$(systemctl show --property=DefaultLimitNOFILE --value); then
+    error "Не удалось прочитать systemd DefaultLimitNOFILE"
+    failed=1
+  elif [[ ! "$default_nofile" =~ ^[0-9]+$ && "$default_nofile" != infinity ]]; then
+    error "Некорректный ответ systemd DefaultLimitNOFILE"
+    failed=1
+  elif [ "$default_nofile" = "1048576" ]; then
     ok "systemd DefaultLimitNOFILE=1048576 ✓"
   else
     warn "systemd DefaultLimitNOFILE=$default_nofile"
@@ -1855,20 +1938,25 @@ part3_tests() {
   echo "  9) Тест на процессор, можно понять примерно какой процент CPU выделили"
   echo "  0) Назад"
   local choice
-  ask "Выбор: " choice
+  ask "Выбор: " choice || { error "Не удалось прочитать выбор диагностики"; return 1; }
+  local status=0
   case "$choice" in
-    1) bash <(wget -qO- https://ipregion.vrnt.xyz) ;;
-    2) bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode geoblock ;;
-    3) bash <(wget -qO- https://github.com/vernette/censorcheck/raw/master/censorcheck.sh) --mode dpi ;;
-    4) bash <(wget -qO- https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh) ;;
-    5) curl -sL yabs.sh | bash -s -- -4 ;;
-    6) bash <(curl -Ls IP.Check.Place) -l en ;;
-    7) wget -qO- bench.sh | bash ;;
-    8) bash <(curl -Ls https://Check.Place) -EI ;;
-    9) sysbench cpu run --threads=1 ;;
-    0) return ;;
+    1) run_remote_diagnostic https://ipregion.vrnt.xyz || status=$? ;;
+    2) run_remote_diagnostic https://github.com/vernette/censorcheck/raw/master/censorcheck.sh --mode geoblock || status=$? ;;
+    3) run_remote_diagnostic https://github.com/vernette/censorcheck/raw/master/censorcheck.sh --mode dpi || status=$? ;;
+    4) run_remote_diagnostic https://github.com/itdoginfo/russian-iperf3-servers/raw/main/speedtest.sh || status=$? ;;
+    5) run_remote_diagnostic https://yabs.sh -4 || status=$? ;;
+    6) run_remote_diagnostic https://IP.Check.Place -l en || status=$? ;;
+    7) run_remote_diagnostic https://bench.sh || status=$? ;;
+    8) run_remote_diagnostic https://Check.Place -EI || status=$? ;;
+    9) sysbench cpu run --threads=1 || status=$? ;;
+    0) return 0 ;;
     *) warn "Неверный выбор" ;;
   esac
+  if [ "$status" -ne 0 ]; then
+    error "Выбранная диагностика завершилась ошибкой (код $status)"
+  fi
+  return "$status"
 }
 
 while true; do
@@ -1885,7 +1973,7 @@ while true; do
   case "$choice" in
     1) part1_update || exit $? ;;
     2) part2_setup || exit $? ;;
-    3) part3_tests ;;
+    3) part3_tests || error "Тест не завершён успешно; возврат в главное меню" ;;
     0) exit 0 ;;
     *) warn "Неверный выбор" ;;
   esac

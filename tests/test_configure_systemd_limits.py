@@ -12,7 +12,7 @@ SOURCE = (Path(__file__).resolve().parents[1] / "tunevps.sh").read_text(encoding
 FUNCTION = "configure_systemd_limits() {" + SOURCE.split(
     "configure_systemd_limits() {", 1)[1].split("\nconfigure_swap()", 1)[0]
 CONFIG = "[Manager]\nDefaultLimitNOFILE=1048576\n"
-SUCCESS = "DefaultLimitNOFILE=1048576 применён ко всем сервисам"
+SUCCESS = "DefaultLimitNOFILE=1048576 задан по умолчанию для последующих запусков сервисов; per-unit overrides сохраняются"
 
 
 FUNCTION = HELPER + "\n" + FUNCTION

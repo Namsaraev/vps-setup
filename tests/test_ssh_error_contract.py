@@ -68,7 +68,7 @@ sleep() { :; }
 
 class SshErrorContractTest(unittest.TestCase):
     def run_ssh(self, failure='', append=False, redirect='', outer=False,
-                repeat=False, mode='socket', errexit=True, helper_stub=False):
+                repeat=False, mode='socket', errexit=True, helper_stub=False, extra_setup=""):
         with tempfile.TemporaryDirectory(prefix='ssh-contract-') as tmp:
             root = Path(tmp)
             bash = os.environ.get('BASH', 'bash')
@@ -90,6 +90,7 @@ class SshErrorContractTest(unittest.TestCase):
                 stubs += '\nset_sshd_line() { return 23; }\n'
             call = 'part2_setup' if outer else 'configure_ssh'
             script = PRELUDE + functions + '\n' + stubs + '\n' + PART2
+            script += '\n' + extra_setup + '\n'
             script += '\nset -e\n' if errexit else '\nset +e\n'
             script += (call + ' || exit $?\n') * (2 if repeat else 1)
             env = dict(os.environ, ROOT=posix, FAILURE=failure.replace('/etc/', posix + '/etc/'), MODE=mode)

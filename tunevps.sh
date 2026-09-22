@@ -24,7 +24,11 @@ warn() { echo -e "$YELLOW[WARN]$NC $*"; }
 error() { echo -e "$RED[ERROR]$NC $*" >&2; }
 section() { echo -e "\n$CYAN========== $* ==========$NC"; }
 
-ask() { echo -n "$1" > /dev/tty; read -r "$2" < /dev/tty; }
+ask() {
+  printf '%s' "$1" > /dev/tty || return $?
+  read -r "$2" < /dev/tty || return $?
+  return 0
+}
 ask_password() {
   local prompt="$1" variable="$2" read_status=0
   printf '%s' "$prompt" > /dev/tty
@@ -74,7 +78,19 @@ if ! id "$CURRENT_USER" >/dev/null 2>&1; then
   error "Не удалось определить пользователя, запустившего скрипт"
   exit 1
 fi
-USER_HOME="$(getent passwd "$CURRENT_USER" | cut -d: -f6)"
+if ! passwd_entry="$(getent passwd "$CURRENT_USER")"; then
+  error "Не удалось получить passwd-запись пользователя $CURRENT_USER"
+  exit 1
+fi
+if [[ "$passwd_entry" == *$'\n'* || ! "$passwd_entry" =~ ^([^:]+):[^:]*:[0-9]+:[0-9]+:[^:]*:([^:]+):[^:]*$ ]]; then
+  error "Некорректная passwd-запись пользователя $CURRENT_USER"
+  exit 1
+fi
+if [ "${BASH_REMATCH[1]}" != "$CURRENT_USER" ]; then
+  error "Получена passwd-запись другого пользователя"
+  exit 1
+fi
+USER_HOME="${BASH_REMATCH[2]}"
 if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
   error "Не найдена домашняя директория пользователя $CURRENT_USER"
   exit 1
@@ -606,13 +622,13 @@ configure_swap() {
     fi
     warn "Размер /swapfile ($own_bytes байт) отличается от $desired_human."
     warn "При замене только /swapfile будет временно отключён. Не делайте это при критической нехватке RAM."
-    ask "Заменить только /swapfile на $desired_human? [y/N]: " answer
+    ask "Заменить только /swapfile на $desired_human? [y/N]: " answer || { error "Не удалось прочитать подтверждение"; return 1; }
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
       info "/swapfile оставлен без изменений"
       return 0
     fi
   elif [ "$foreign_count" -gt 0 ]; then
-    ask "Чужой swap уже активен. Дополнительно создать /swapfile $desired_human? [y/N]: " answer
+    ask "Чужой swap уже активен. Дополнительно создать /swapfile $desired_human? [y/N]: " answer || { error "Не удалось прочитать подтверждение"; return 1; }
     if [[ ! "$answer" =~ ^[Yy]$ ]]; then
       info "Дополнительный /swapfile не создан"
       return 0
@@ -1112,9 +1128,21 @@ set_sshd_line() {
 configure_ssh() {
   section "SSH: ПОРТ, КЛЮЧИ И SOCKET ACTIVATION"
   local answer
-  local home keys_file
+  local home keys_file passwd_entry key_status
   PIN_HAS_KEY=false
-  home="$(getent passwd "$PIN_USER" | cut -d: -f6)"
+  if ! passwd_entry="$(getent passwd "$PIN_USER")"; then
+    error "Не удалось получить passwd-запись пользователя $PIN_USER"
+    return 1
+  fi
+  if [[ "$passwd_entry" == *$'\n'* || ! "$passwd_entry" =~ ^([^:]+):[^:]*:[0-9]+:[0-9]+:[^:]*:([^:]+):[^:]*$ ]]; then
+    error "Некорректная passwd-запись пользователя $PIN_USER"
+    return 1
+  fi
+  if [ "${BASH_REMATCH[1]}" != "$PIN_USER" ]; then
+    error "Получена passwd-запись другого пользователя"
+    return 1
+  fi
+  home="${BASH_REMATCH[2]}"
   if [ -z "$home" ] || [ ! -d "$home" ]; then
     error "Не найдена домашняя директория пользователя $PIN_USER"
     return 1
@@ -1122,11 +1150,13 @@ configure_ssh() {
   keys_file="$home/.ssh/authorized_keys"
 
   # Определяем наличие ключа непосредственно перед возможным отключением паролей.
-  if authorized_keys_has_key "$keys_file"; then
-    PIN_HAS_KEY=true
-  else
-    PIN_HAS_KEY=false
-  fi
+  key_status=0
+  authorized_keys_has_key "$keys_file" || key_status=$?
+  case "$key_status" in
+    0) PIN_HAS_KEY=true ;;
+    1) ;;
+    *) error "Не удалось проверить ключи пользователя $PIN_USER"; return 1 ;;
+  esac
 
   if [ "$PIN_HAS_KEY" != "true" ]; then
     error "У $PIN_USER НЕТ SSH-ключа."
@@ -1136,8 +1166,8 @@ configure_ssh() {
   fi
   ok "SSH-ключ для $PIN_USER найден"
 
-  # В Ubuntu/Debian sshd -t/-T может требовать этот runtime-каталог даже
-  # до запуска службы. Создаём его заранее, чтобы проверка была надёжной.
+  # В Ubuntu/Debian sshd -t/-T может требовать этот runtime-каталог
+  # даже до запуска службы.
   if ! install -d -m 0755 /run/sshd; then
     error "Не удалось создать /run/sshd"
     return 1
@@ -1185,10 +1215,10 @@ configure_ssh() {
   echo
   echo "Будет настроено: порт $SSH_PORT, вход по ключу, без паролей, root запрещён."
   warn "Не закрывайте текущую SSH-сессию до успешной проверки нового входа."
-  ask "Применить настройки SSH? [y/N]: " answer
+  ask "Применить настройки SSH? [y/N]: " answer || { error "Не удалось прочитать подтверждение"; return 1; }
   if [[ ! "$answer" =~ ^[Yy]$ ]]; then
     info "Настройка SSH пропущена по вашему выбору"
-    return 0
+    return 3
   fi
 
   # Критическая preflight-проверка: если UFW уже активен, новый SSH-порт
@@ -1301,33 +1331,31 @@ EOF
     warn "Порт 22 всё ещё слушается; покажите: systemctl cat ssh.socket"
   fi
 
-  info "Итоговая конфигурация SSH (sshd -T):"
-  echo ""
-  sshd -T 2>/dev/null | grep -E "^(port|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|permituserenvironment|usepam|tcpkeepalive|clientaliveinterval|clientalivecountmax|maxauthtries|loglevel) " | sort
-  echo ""
-
-  pass_auth=$(sshd -T 2>/dev/null | awk '$1 == "passwordauthentication" {print $2}')
-  pubkey_auth=$(sshd -T 2>/dev/null | awk '$1 == "pubkeyauthentication" {print $2}')
-  root_login=$(sshd -T 2>/dev/null | awk '$1 == "permitrootlogin" {print $2}')
-
-  if [ "$pass_auth" = "no" ]; then
-    ok "PasswordAuthentication=no применён ✓"
-  else
-    error "PasswordAuthentication=$pass_auth (должно быть 'no')!"
+  # One checked post-apply snapshot: display and validate the same output.
+  if ! effective="$(sshd -T 2>&1)"; then
+    error "Не удалось получить итоговую конфигурацию sshd (sshd -T)"
+    printf '%s\n' "$effective" >&2
     return 1
   fi
+  info "Итоговая конфигурация SSH (sshd -T):"
+  printf '%s\n' "$effective" | grep -E "^(port|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitrootlogin|permituserenvironment|usepam|tcpkeepalive|clientaliveinterval|clientalivecountmax|maxauthtries|loglevel) " | sort
 
-  if [ "$pubkey_auth" = "yes" ]; then
-    ok "PubkeyAuthentication=yes применён ✓"
-  else
-    warn "PubkeyAuthentication=$pubkey_auth"
-  fi
-
-  if [ "$root_login" = "no" ]; then
-    ok "PermitRootLogin=no применён ✓"
-  else
-    warn "PermitRootLogin=$root_login (должно быть 'no')"
-  fi
+  local field expected actual
+  while read -r field expected; do
+    actual=$(awk -v field="$field" '$1 == field {print $2}' <<< "$effective")
+    if [ "$actual" != "$expected" ]; then
+      error "$field=${actual:-не определён} (должно быть '$expected')"
+      return 1
+    fi
+  done <<EOF
+port $SSH_PORT
+passwordauthentication no
+pubkeyauthentication yes
+permitrootlogin no
+kbdinteractiveauthentication no
+maxauthtries 3
+EOF
+  ok "Обязательные настройки SSH применены"
 
   return 0
 }
@@ -1659,7 +1687,13 @@ part2_setup() {
 
   # configure_ssh сам делает UFW preflight: если UFW уже активен,
   # порт $SSH_PORT/tcp разрешается и проверяется ДО переключения sshd.
-  if ! configure_ssh; then
+  # SSH contract: 0 = compliant/applied, 3 = user skip, other = failure.
+  local ssh_status=0
+  configure_ssh || ssh_status=$?
+  if [ "$ssh_status" -eq 3 ]; then
+    info "Часть 2 остановлена: SSH пропущен; UFW и последующие шаги не выполнены"
+    return 3
+  elif [ "$ssh_status" -ne 0 ]; then
     error "Настройка SSH завершилась ошибкой — останавливаюсь"
     error "Доступ по текущей сессии сохранён, проверьте логи выше"
     return 1

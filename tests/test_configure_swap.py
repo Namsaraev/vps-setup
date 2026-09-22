@@ -45,7 +45,7 @@ FSTAB = ('# foreign swap configuration\n/dev/sda2 none swap sw 0 0\n'
 
 class SwapTest(unittest.TestCase):
     def run_swap(self, active='', answer='', ram='1024', fstab=FSTAB,
-                 repeat=False, list_fail='0', off_fail='0', symlink=False):
+                 repeat=False, list_fail='0', off_fail='0', symlink=False, extra_setup=''):
         with tempfile.TemporaryDirectory(prefix='swap-policy-') as tmp:
             root = Path(tmp)
             # cygpath also works with Git Bash; paths stay inside this temporary directory.
@@ -63,7 +63,7 @@ class SwapTest(unittest.TestCase):
             env = dict(os.environ, ROOT=posix, ANSWER=answer, RAM=ram,
                        LIST_FAIL=list_fail, OFF_FAIL=off_fail,
                        SWAP_SIZE='2G', SWAP_RAM_THRESHOLD_MB='2048')
-            result = subprocess.run([bash], input=PRELUDE + function + '\n' + setup +
+            result = subprocess.run([bash], input=PRELUDE + function + '\n' + setup + extra_setup + '\n' +
                                     'configure_swap\n' * (2 if repeat else 1),
                                     text=True, encoding='utf-8', capture_output=True, env=env, timeout=15)
             calls = (root / 'calls').read_text().replace(posix, '')

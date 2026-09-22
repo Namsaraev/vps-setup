@@ -28,7 +28,7 @@ TARGETS = [
     ('etc/fstab', 'fstab', ['/swapfile'], b'# keep\n/swapfile none swap defaults 0 0\n',
      b'# keep\n/swapfile none swap sw 0 0\n'),
     ('etc/ssh/sshd_config', 'sshd', ['Port', '5829'], b'#Port 22\n# keep\n', b'Port 5829\n# keep\n'),
-    ('etc/ssh/sshd_config.d/00-vps-hardening.conf', 'text', [], b'# old policy\n', b'Port 5829\nPasswordAuthentication no\n'),
+    ('etc/ssh/sshd_config.d/00-vps-hardening.conf', 'text', [], b'# old policy\n', b'PasswordAuthentication no\n'),
     ('etc/systemd/system/ssh.socket.d/99-vps-port.conf', 'text', [], b'[Socket]\nListenStream=22\n', b'[Socket]\nListenStream=\nListenStream=5829\n'),
 ] + [(path, 'text', [], b'# previous config\n', b'# complete generated config\n') for path in (
     'etc/apt/apt.conf.d/20auto-upgrades', 'etc/apt/apt.conf.d/50auto-remove',

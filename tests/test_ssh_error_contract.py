@@ -55,7 +55,7 @@ systemctl() {
 sshd() {
   op "sshd $*" || return 23
   [[ "$1" == -t ]] && return 0
-  if [[ -e "$ROOT/applied" ]] || command grep -q '^Port 5829$' "$ROOT/etc/ssh/sshd_config.d/00-vps-hardening.conf" 2>/dev/null; then
+  if [[ -e "$ROOT/applied" ]] || { [[ -f "$ROOT/etc/ssh/sshd_config" ]] && command grep -q '^Port 5829$' "$ROOT/etc/ssh/sshd_config" 2>/dev/null; }; then
     printf '%s\n' 'port 5829' 'passwordauthentication no' 'pubkeyauthentication yes' 'permitrootlogin no' 'kbdinteractiveauthentication no' 'maxauthtries 3'
   else
     printf '%s\n' 'port 22' 'passwordauthentication yes'

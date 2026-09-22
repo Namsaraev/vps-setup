@@ -1,5 +1,6 @@
 """Real function in a temporary filesystem; systemctl is always a shell stub."""
 import os
+from atomic_support import HELPER
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,6 +17,9 @@ CONFIG = ('APT::Periodic::Update-Package-Lists "1";\n'
           'APT::Periodic::Unattended-Upgrade "1";\n'
           'APT::Periodic::Download-Upgradeable-Packages "1";\n'
           'APT::Periodic::AutocleanInterval "7";\n')
+
+
+FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureUnattendedUpgradesTest(unittest.TestCase):

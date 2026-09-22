@@ -1,5 +1,6 @@
 """Real function, temporary config paths, and an unconditional systemctl stub."""
 import os
+from atomic_support import HELPER
 from pathlib import Path
 import subprocess
 import tempfile
@@ -12,6 +13,9 @@ FUNCTION = "configure_systemd_limits() {" + SOURCE.split(
     "configure_systemd_limits() {", 1)[1].split("\nconfigure_swap()", 1)[0]
 CONFIG = "[Manager]\nDefaultLimitNOFILE=1048576\n"
 SUCCESS = "DefaultLimitNOFILE=1048576 применён ко всем сервисам"
+
+
+FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureSystemdLimitsTest(unittest.TestCase):
@@ -88,7 +92,7 @@ DefaultLimitNOFILE=1048576" ] || return 97
                 self.assertNotIn(SUCCESS, result.stdout + result.stderr)
                 self.assertNotIn("Часть 2 завершена", result.stdout + result.stderr)
                 if failure == "write":
-                    self.assertEqual(config, "partial write\n")
+                    self.assertIsNone(config)
                 if failure == "reexec":
                     self.assertEqual(config, CONFIG)
                 if part2:

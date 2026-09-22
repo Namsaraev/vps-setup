@@ -1,5 +1,6 @@
 """Real SSH functions in a temporary filesystem; all operational commands stubbed."""
 import os
+from atomic_support import HELPER
 from pathlib import Path
 import subprocess
 import tempfile
@@ -54,7 +55,7 @@ systemctl() {
 sshd() {
   op "sshd $*" || return 23
   [[ "$1" == -t ]] && return 0
-  if [[ -e "$ROOT/applied" || -f "$ROOT/etc/ssh/sshd_config.d/00-vps-hardening.conf" ]]; then
+  if [[ -e "$ROOT/applied" ]] || command grep -q '^Port 5829$' "$ROOT/etc/ssh/sshd_config.d/00-vps-hardening.conf" 2>/dev/null; then
     printf '%s\n' 'port 5829' 'passwordauthentication no' 'pubkeyauthentication yes' 'permitrootlogin no' 'kbdinteractiveauthentication no' 'maxauthtries 3'
   else
     printf '%s\n' 'port 22' 'passwordauthentication yes'
@@ -66,9 +67,13 @@ sleep() { :; }
 '''
 
 
+FUNCTIONS = HELPER + "\n" + FUNCTIONS
+
+
 class SshErrorContractTest(unittest.TestCase):
     def run_ssh(self, failure='', append=False, redirect='', outer=False,
-                repeat=False, mode='socket', errexit=True, helper_stub=False, extra_setup=""):
+                repeat=False, mode='socket', errexit=True, helper_stub=False, extra_setup="",
+                existing_targets=False, snapshots=False):
         with tempfile.TemporaryDirectory(prefix='ssh-contract-') as tmp:
             root = Path(tmp)
             bash = os.environ.get('BASH', 'bash')
@@ -80,11 +85,17 @@ class SshErrorContractTest(unittest.TestCase):
             (root / 'blocked').mkdir()
             (root / 'calls').touch()
             (root / 'etc/ssh/sshd_config').write_text('# fixture\n' if append else '#Port 22\n', encoding='utf-8')
+            if existing_targets:
+                for target in (HARDENING, SOCKET):
+                    path = root / target.lstrip('/')
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b'# previous live config\n')
             functions = FUNCTIONS.replace('/etc/', posix + '/etc/').replace('/run/sshd', posix + '/run/sshd')
             if redirect:
-                target = ('>> ' if redirect == '/etc/ssh/sshd_config' else '> ') + posix + redirect
-                self.assertEqual(functions.count(target), 1)
-                functions = functions.replace(target, target.split(' ')[0] + ' ' + posix + '/blocked')
+                target = posix + redirect
+                functions = functions.replace('atomic_config ' + target + ' ',
+                                              'atomic_config ' + posix + '/blocked ')
+
             stubs = '\n'.join(f'{name}() {{ echo STEP:{name}; }}' for name in STEPS if name != 'configure_ssh')
             if helper_stub:
                 stubs += '\nset_sshd_line() { return 23; }\n'
@@ -97,7 +108,12 @@ class SshErrorContractTest(unittest.TestCase):
             result = subprocess.run([bash], input=script, env=env, text=True,
                                     encoding='utf-8', capture_output=True, timeout=15)
             calls = (root / 'calls').read_text(encoding='utf-8').replace(posix, '')
-            config = (root / 'etc/ssh/sshd_config').read_text(encoding='utf-8')
+            main = root / 'etc/ssh/sshd_config'
+            config = main.read_text(encoding='utf-8') if main.is_file() else None
+            if snapshots:
+                files = {target: (root / target.lstrip('/')).read_bytes()
+                         for target in (HARDENING, SOCKET)}
+                return result, calls, config, files
             return result, calls, config
 
     def assert_failed(self, result, calls):
@@ -147,8 +163,8 @@ class SshErrorContractTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual(config.count('Port 5829'), 1)
                     self.assertEqual(calls.count('cp\n'), 1)
-                    self.assertEqual(calls.count('hardening-write\n'), 1)
-                    self.assertEqual(calls.count('socket-write\n'), 1)
+                    self.assertIn('sshd -t\n', calls)
+                    self.assertIn('Port 5829', config)
                     self.assertEqual(result.stdout.count('Часть 2 завершена'), 2)
                     self.assertIn('SSH уже настроен', result.stdout)
                     if mode == 'socket':

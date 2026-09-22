@@ -1,5 +1,6 @@
 """Real autoremove function, stubbed apt/TTY, temporary configuration only."""
 import os
+from atomic_support import HELPER
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,6 +12,9 @@ FUNCTION = 'configure_autoremove() {' + SOURCE.split('configure_autoremove() {',
 SUCCESS = 'Удаление неиспользуемых пакетов завершено'
 POLICY = ('Unattended-Upgrade::Remove-Unused-Dependencies "false";\n'
           'Unattended-Upgrade::Remove-New-Unused-Dependencies "false";\n')
+
+
+FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureAutoremoveTest(unittest.TestCase):

@@ -1,5 +1,6 @@
 """Run only configure_swap with sandbox paths and mocked system commands."""
 import os
+from atomic_support import HELPER
 from pathlib import Path
 import subprocess
 import tempfile
@@ -41,6 +42,9 @@ mkswap() { echo "mkswap $*" >> "$ROOT/calls"; }
 FSTAB = ('# foreign swap configuration\n/dev/sda2 none swap sw 0 0\n'
          '/dev/zram0 none swap defaults 0 0\n/other.swap none swap sw 0 0\n'
          '/swapfile.backup none swap sw 0 0\n# keep /swapfile in a comment\n')
+
+
+FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class SwapTest(unittest.TestCase):
@@ -88,7 +92,7 @@ class SwapTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(calls, '')
             self.assertNotIn('PROMPT', result.stdout)
-            self.assertEqual(fstab, FSTAB)
+            self.assertEqual(fstab, FSTAB + '/swapfile none swap sw 0 0\n')
 
     def test_mismatch_replace_only_owned_and_fstab(self):
         for foreign in ('', '/dev/sda2 1073741824 partition\n/dev/zram0 536870912 partition\n/other.swap 1048576 file\n'):

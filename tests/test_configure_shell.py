@@ -4,6 +4,7 @@ No sudo, network, shell changes, or writes outside a temporary home.
 On POSIX, ownership is checked against the executing user's real UID.
 """
 import os
+from atomic_support import HELPER, WRAPPER
 import shutil
 from pathlib import Path
 import subprocess
@@ -20,6 +21,9 @@ FUNCTION = "configure_shell() {" + FUNCTION
 BLOCK = (b'# >>> tunevps managed block >>>\n'
          b'source "$HOME/.config/tunevps/zshrc"\n'
          b'# <<< tunevps managed block <<<\n')
+
+
+FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureShellTest(unittest.TestCase):
@@ -58,7 +62,7 @@ as_current_user() {
   [ "$FAILURE" != "$1" ] || return 23
   if [ "$1" = python3 ]; then
     shift
-    "$TEST_PYTHON" "$@"
+    "$TEST_PYTHON" "$TEST_ATOMIC_WRAPPER" "$@"
   else
     "$@"
   fi
@@ -66,6 +70,7 @@ as_current_user() {
 '''
         env = dict(os.environ, USER_HOME=self.home.as_posix(), CURRENT_USER="test-user",
                    TEST_PYTHON=Path(sys.executable).as_posix(), FAILURE=failure,
+                   TEST_ATOMIC_WRAPPER=WRAPPER.as_posix(),
                    P10K_REPOSITORY="https://example.invalid/p10k.git")
         invocation = "configure_shell || exit $?\n"
         if part2:
@@ -119,7 +124,7 @@ as_current_user() {
                     self.assertEqual(clones, ["CALL:clone:" + x for x in expected[:count]])
 
     def test_config_failures_stop_and_propagate(self):
-        for failure in ("mkdir", "tee", "python3"):
+        for failure in ("mkdir", "python3"):
             for part2 in (False, True):
                 with self.subTest(failure=failure, part2=part2):
                     self.rc.write_bytes(b"# user data\n")
@@ -128,7 +133,7 @@ as_current_user() {
                     self.assertNotIn("STEP:final_check", result.stdout)
                     self.assertEqual(self.rc.read_bytes(), b"# user data\n")
                     if failure == "mkdir":
-                        self.assertNotIn("CALL:tee", result.stderr)
+                        self.assertNotIn("CALL:python3", result.stderr)
                     if failure != "python3":
                         self.assertNotIn("CALL:python3", result.stderr)
 

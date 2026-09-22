@@ -1432,8 +1432,7 @@ configure_ssh() {
 # Этот файл загружается ПЕРВЫМ (номер 00), чтобы переопределить
 # настройки из 50-cloud-init.conf и других файлов.
 
-# Сетевой порт и аутентификация
-Port $SSH_PORT
+# Port управляется в основном sshd_config; здесь — аутентификация.
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -1527,7 +1526,8 @@ EOF
 
   local field expected actual
   while read -r field expected; do
-    actual=$(awk -v field="$field" '$1 == field {print $2}' <<< "$effective")
+    # OpenSSH can emit repeated identical ports; compare distinct port values.
+    actual=$(awk -v field="$field" '$1 == field && (field != "port" || !seen[$2]++) {print $2}' <<< "$effective")
     if [ "$actual" != "$expected" ]; then
       error "$field=${actual:-не определён} (должно быть '$expected')"
       return 1
@@ -1773,7 +1773,8 @@ final_check() {
   local effective field expected actual
   if effective="$(sshd -T)"; then
     while read -r field expected; do
-      if ! actual=$(awk -v field="$field" '$1 == field {print $2}' <<< "$effective"); then
+      # Port is a list in sshd -T; identical entries do not change its value.
+      if ! actual=$(awk -v field="$field" '$1 == field && (field != "port" || !seen[$2]++) {print $2}' <<< "$effective"); then
         error "Не удалось прочитать поле SSH $field"
         failed=1
       elif [ "$actual" = "$expected" ]; then

@@ -27,9 +27,9 @@ class SwapPersistenceTest(unittest.TestCase):
             (root / 'blocked').mkdir()
             function = FUNCTION.replace('/etc/fstab', posix + '/fstab').replace('/swapfile', own)
             if failure == 'redirect':
-                target = '>> ' + posix + '/fstab'
-                self.assertEqual(function.count(target), 1)
-                function = function.replace(target, '>> ' + posix + '/blocked')
+                function = function.replace('atomic_config ' + posix + '/fstab ',
+                                            'atomic_config ' + posix + '/blocked ')
+
             prelude = PRELUDE + r'''
 ok() { echo "OK:$*"; }
 error() { echo "ERROR:$*" >&2; }
@@ -66,7 +66,7 @@ printf() {
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn('ERROR:Не удалось записать', result.stderr)
         self.assertIn('может быть активен в текущей сессии', result.stderr)
-        self.assertIn('автоподключение после перезагрузки не настроено', result.stderr)
+        self.assertIn('автоподключение после перезагрузки не подтверждено', result.stderr)
         self.assertNotIn('OK:', result.stdout)
         self.assertNotIn('создан и активирован', result.stdout)
         self.assertIn('/swapfile 2147479552 file\n', active)
@@ -86,7 +86,7 @@ printf() {
     def test_successful_append_preserves_happy_path(self):
         result, calls, fstab, active = self.run_swap()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls.count('APPEND\n'), 1)
+        self.assertNotIn('APPEND', calls)
         self.assertEqual(fstab, FSTAB + '/swapfile none swap sw 0 0\n')
         self.assertIn('/swapfile 2147479552 file\n', active)
         self.assertEqual(result.stdout.count('OK:Swap 2G создан и активирован'), 1)
@@ -127,7 +127,7 @@ printf() {
     def test_successful_repeat_is_idempotent(self):
         result, calls, after, active = self.run_swap(repeat=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls.count('APPEND\n'), 1)
+        self.assertNotIn('APPEND', calls)
         self.assertEqual(calls.count('fallocate '), 1)
         self.assertEqual(calls.count('swapon /swapfile\n'), 1)
         self.assertNotIn('swapoff', calls)

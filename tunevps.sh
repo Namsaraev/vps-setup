@@ -262,10 +262,185 @@ configure_locale_time() {
   ok "Часовой пояс и локаль настроены"
 }
 
+# Single-file persistence only: no rollback of earlier files or runtime changes.
+# text reads stdin; fstab/sshd/zshrc transform a fully read snapshot.
+# --user runs the same writer as CURRENT_USER (never root in a writable home).
+atomic_config() {
+  local user=false program
+  if [ "${1-}" = --user ]; then user=true; shift; fi
+  program="$(command cat <<'PY_ATOMIC'
+import os
+import re
+import secrets
+import stat
+import sys
+
+
+def transform(original, kind, args):
+    if kind == "text":
+        return sys.stdin.buffer.read()
+    if kind == "fstab":
+        source = os.fsencode(args[0])
+        correct = source + b" none swap sw 0 0\n"
+        rows = original.splitlines(keepends=True)
+        managed = lambda row: len(row.split()) >= 3 and row.split()[0] == source and row.split()[2] == b"swap"
+        matches = [row for row in rows if managed(row)]
+        if matches == [correct]:
+            return original
+        result = b"".join(row for row in rows if not managed(row))
+        return result + (b"\n" if result and not result.endswith(b"\n") else b"") + correct
+    if kind == "sshd":
+        name, value = map(os.fsencode, args)
+        pattern = re.compile(rb"^#?" + re.escape(name) + rb"[ \t]+[^\r\n]*", re.M)
+        line = name + b" " + value
+        if pattern.search(original):
+            return pattern.sub(lambda match: line, original)
+        return original + (b"\n" if original and not original.endswith(b"\n") else b"") + line + b"\n"
+    if kind == "zshrc":
+        begin = b"# >>> tunevps managed block >>>"
+        end = b"# <<< tunevps managed block <<<"
+        block = begin + b'\nsource "$HOME/.config/tunevps/zshrc"\n' + end + b"\n"
+        lines = original.splitlines(keepends=True)
+        starts = [i for i, line in enumerate(lines) if line.rstrip(b"\r\n") == begin]
+        ends = [i for i, line in enumerate(lines) if line.rstrip(b"\r\n") == end]
+        if not starts and not ends:
+            return block + original
+        if len(starts) == len(ends) == 1 and starts[0] < ends[0]:
+            return b"".join(lines[:starts[0]]) + block + b"".join(lines[ends[0] + 1:])
+        raise ValueError("Invalid or duplicate tunevps managed markers; .zshrc unchanged")
+    raise ValueError("Unknown configuration transform")
+
+
+def open_parent(path):
+    # Anchor every component, refusing symlinks even in parent directories.
+    if not os.path.isabs(path) or ".." in path.split("/"):
+        raise ValueError("Expected an absolute configuration path without '..'")
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.split("/")[1:-1]:
+            if not part:
+                continue
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def snapshot(directory, name, missing=False):
+    try:
+        metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        if missing:
+            return None, b""
+        raise
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("Configuration must be a regular file: " + name)
+    descriptor = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
+    with os.fdopen(descriptor, "rb") as stream:
+        actual = os.fstat(stream.fileno())
+        if identity(actual) != identity(metadata):
+            raise ValueError("Configuration changed while opening: " + name)
+        data = stream.read()
+        if identity(os.fstat(stream.fileno())) != identity(metadata) or len(data) != metadata.st_size:
+            raise ValueError("Configuration changed or short read: " + name)
+    return metadata, data
+
+
+def identity(metadata):
+    if metadata is None:
+        return None
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+            metadata.st_gid, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+
+def persist(path, kind, args):
+    directory = open_parent(path)
+    name = os.path.basename(path)
+    temporary = None
+    replaced = False
+    try:
+        metadata, original = snapshot(directory, name, kind in ("text", "zshrc"))
+        updated = transform(original, kind, args)
+        if kind != "text" and transform(updated, kind, args) != updated:
+            raise ValueError("Configuration transform is not idempotent")
+        if metadata is not None and updated == original:
+            return
+        candidate = ".tunevps-" + secrets.token_hex(16)
+        descriptor = os.open(candidate, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+        temporary = candidate
+        with os.fdopen(descriptor, "w+b") as stream:
+            if stream.write(updated) != len(updated):
+                raise OSError("Short configuration write")
+            stream.flush()
+            # Ownership precedes chmod (chown may clear permission bits).
+            if metadata is not None:
+                os.fchown(stream.fileno(), metadata.st_uid, metadata.st_gid)
+            os.fchmod(stream.fileno(), stat.S_IMODE(metadata.st_mode) if metadata else 0o644)
+            os.fsync(stream.fileno())
+            stream.seek(0)
+            if stream.read() != updated:
+                raise OSError("Staged configuration verification failed")
+        current, contents = snapshot(directory, name, metadata is None)
+        if identity(current) != identity(metadata) or contents != original:
+            raise ValueError("Configuration changed before replacement")
+        # A renamed/replaced parent must not turn a successful write into an
+        # update of a detached directory. dir_fd still prevents redirection.
+        check = open_parent(path)
+        try:
+            before, now = os.fstat(directory), os.fstat(check)
+            if (before.st_dev, before.st_ino) != (now.st_dev, now.st_ino):
+                raise ValueError("Configuration parent changed before replacement")
+        finally:
+            os.close(check)
+        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        temporary = None
+        replaced = True
+        os.fsync(directory)
+        final, contents = snapshot(directory, name)
+        if contents != updated or stat.S_IMODE(final.st_mode) != (stat.S_IMODE(metadata.st_mode) if metadata else 0o644):
+            raise OSError("Persisted configuration verification failed")
+        if metadata and (final.st_uid, final.st_gid) != (metadata.st_uid, metadata.st_gid):
+            raise OSError("Persisted configuration ownership changed")
+    except (OSError, ValueError) as exc:
+        state = "replacement completed; no rollback attempted" if replaced else "replacement not completed"
+        raise OSError(str(exc) + "; " + state) from exc
+    finally:
+        try:
+            if temporary is not None:
+                os.unlink(temporary, dir_fd=directory)
+        finally:
+            os.close(directory)
+
+
+try:
+    persist(sys.argv[1], sys.argv[2], sys.argv[3:])
+except (OSError, ValueError) as exc:
+    sys.exit("Atomic configuration update failed: " + str(exc))
+PY_ATOMIC
+)" || return 1
+  if [ "$user" = true ]; then
+    as_current_user python3 -c "$program" "$@"
+  else
+    python3 -c "$program" "$@"
+  fi
+}
+
+persist_swap() {
+  if ! atomic_config /etc/fstab fstab /swapfile; then
+    error "Не удалось записать /swapfile в /etc/fstab; /swapfile может быть активен в текущей сессии, но автоподключение после перезагрузки не подтверждено"
+    return 1
+  fi
+}
+
+
 configure_unattended_upgrades() {
   section "АВТО-ОБНОВЛЕНИЯ БЕЗОПАСНОСТИ"
   mkdir -p /etc/apt/apt.conf.d || { error "Не удалось создать каталог /etc/apt/apt.conf.d"; return 1; }
-  if ! cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+  if ! atomic_config /etc/apt/apt.conf.d/20auto-upgrades text <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
@@ -299,7 +474,7 @@ configure_autoremove() {
   section "АВТООЧИСТКА НЕИСПОЛЬЗУЕМЫХ ПАКЕТОВ"
 
   # Автоудаление зависимостей ОТКЛЮЧЕНО для безопасности сервера
-  if ! cat > /etc/apt/apt.conf.d/50auto-remove <<'EOF'
+  if ! atomic_config /etc/apt/apt.conf.d/50auto-remove text <<'EOF'
 Unattended-Upgrade::Remove-Unused-Dependencies "false";
 Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
 EOF
@@ -480,7 +655,7 @@ configure_safe_sysctl() {
     bbr_available=true
     if [ "$bbr_module" = true ]; then
       mkdir -p /etc/modules-load.d || { error "Не удалось создать /etc/modules-load.d"; return 1; }
-      if ! printf '%s\n' tcp_bbr > /etc/modules-load.d/tcp_bbr.conf; then
+      if ! atomic_config /etc/modules-load.d/tcp_bbr.conf text <<< tcp_bbr; then
         error "Не удалось записать /etc/modules-load.d/tcp_bbr.conf"
         return 1
       fi
@@ -493,7 +668,7 @@ configure_safe_sysctl() {
   fi
 
   mkdir -p /etc/sysctl.d || { error "Не удалось создать /etc/sysctl.d"; return 1; }
-  if ! cat > /etc/sysctl.d/99-vps-tuning.conf <<EOF
+  if ! atomic_config /etc/sysctl.d/99-vps-tuning.conf text <<EOF
 # Совместимо с VPN, policy routing, туннелями и proxy.
 net.ipv4.tcp_syncookies = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
@@ -519,7 +694,7 @@ EOF
   fi
 
   mkdir -p /etc/security/limits.d || { error "Не удалось создать /etc/security/limits.d"; return 1; }
-  if ! cat > /etc/security/limits.d/99-vps.conf <<'EOF'
+  if ! atomic_config /etc/security/limits.d/99-vps.conf text <<'EOF'
 * soft nofile 524288
 * hard nofile 1048576
 root soft nofile 524288
@@ -539,7 +714,7 @@ configure_systemd_limits() {
   info "limits.d применяется только к интерактивным сессиям (через PAM)."
   info "Для системных сервисов (Xray, 3x-ui, Docker) задаём глобальный лимит."
   mkdir -p /etc/systemd/system.conf.d || { error "Не удалось создать /etc/systemd/system.conf.d"; return 1; }
-  if ! cat > /etc/systemd/system.conf.d/99-nofile.conf <<'EOF'
+  if ! atomic_config /etc/systemd/system.conf.d/99-nofile.conf text <<'EOF'
 [Manager]
 DefaultLimitNOFILE=1048576
 EOF
@@ -617,7 +792,8 @@ configure_swap() {
     [[ "$page_size" =~ ^[1-9][0-9]*$ ]] || page_size=4096
     if [ "$own_bytes" -le "$desired_bytes" ] &&
        [ "$((desired_bytes - own_bytes))" -le "$page_size" ]; then
-      ok "Размер /swapfile соответствует $desired_human — ничего не меняем"
+      persist_swap || return 1
+      ok "Размер /swapfile соответствует $desired_human; запись /etc/fstab проверена"
       return 0
     fi
     warn "Размер /swapfile ($own_bytes байт) отличается от $desired_human."
@@ -684,16 +860,7 @@ configure_swap() {
     return 1
   fi
 
-  # Нормализуем только записи swap с первым полем /swapfile.
-  # Чужие строки, включая комментарии, сохраняются дословно.
-  sed -Ei '\@^[[:space:]]*/swapfile[[:space:]]+[^[:space:]]+[[:space:]]+swap([[:space:]]|$)@d' /etc/fstab || {
-    error "Не удалось обновить /etc/fstab"
-    return 1
-  }
-  printf '%s\n' '/swapfile none swap sw 0 0' >> /etc/fstab || {
-    error "Не удалось записать /swapfile в /etc/fstab; /swapfile может быть активен в текущей сессии, но автоподключение после перезагрузки не настроено"
-    return 1
-  }
+  persist_swap || return 1
 
   if swapon --show=NAME,SIZE --bytes --noheadings 2>/dev/null | awk '$1 == "/swapfile" && $2 > 0 {found=1} END {exit !found}'; then
     ok "Swap $desired_human создан и активирован"
@@ -1106,22 +1273,9 @@ configure_ufw() {
 }
 
 set_sshd_line() {
-  local name="$1" value="$2" status
-  if grep -qE "^#?$name[[:space:]]+" /etc/ssh/sshd_config; then
-    sed -Ei "s|^#?$name[[:space:]]+.*|$name $value|" /etc/ssh/sshd_config || {
-      error "Не удалось обновить $name в /etc/ssh/sshd_config"
-      return 1
-    }
-  else
-    status=$?
-    if [ "$status" -ne 1 ]; then
-      error "Не удалось проверить $name в /etc/ssh/sshd_config"
-      return 1
-    fi
-    echo "$name $value" >> /etc/ssh/sshd_config || {
-      error "Не удалось добавить $name в /etc/ssh/sshd_config"
-      return 1
-    }
+  if ! atomic_config /etc/ssh/sshd_config sshd "$1" "$2"; then
+    error "Не удалось обновить $1 в /etc/ssh/sshd_config"
+    return 1
   fi
 }
 
@@ -1228,6 +1382,11 @@ configure_ssh() {
     return 1
   fi
 
+  # Refuse special files before the backup as well (cp could block on a FIFO).
+  if [ -L /etc/ssh/sshd_config ] || [ ! -f /etc/ssh/sshd_config ]; then
+    error "sshd_config должен быть обычным файлом, не symlink"
+    return 1
+  fi
   cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)" || {
     error "Не удалось создать резервную копию sshd_config"
     return 1
@@ -1242,7 +1401,7 @@ configure_ssh() {
     return 1
   }
 
-  if ! cat > /etc/ssh/sshd_config.d/00-vps-hardening.conf <<EOF
+  if ! atomic_config /etc/ssh/sshd_config.d/00-vps-hardening.conf text <<EOF
 # VPS hardening settings (создано tunevps.sh)
 # Этот файл загружается ПЕРВЫМ (номер 00), чтобы переопределить
 # настройки из 50-cloud-init.conf и других файлов.
@@ -1291,7 +1450,7 @@ EOF
     error "Не удалось создать /etc/systemd/system/ssh.socket.d"
     return 1
   }
-  if ! cat > /etc/systemd/system/ssh.socket.d/99-vps-port.conf <<EOF
+  if ! atomic_config /etc/systemd/system/ssh.socket.d/99-vps-port.conf text <<EOF
 [Socket]
 ListenStream=
 ListenStream=0.0.0.0:$SSH_PORT
@@ -1399,7 +1558,7 @@ configure_shell() {
     error "Не удалось создать каталог $managed_dir"
     return 1
   }
-  as_current_user tee "$managed_dir/zshrc" >/dev/null <<'EOF'
+  atomic_config --user "$managed_dir/zshrc" text <<'EOF'
 # PATH — до P10K и Oh My Zsh.
 export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
@@ -1509,30 +1668,8 @@ EOF
     return 1
   }
 
-  # Python is installed by install_packages(). Preserve user bytes, including
-  # CRLF and a missing final newline; never interpret the user's shell code.
-  if ! as_current_user python3 - "$USER_HOME/.zshrc" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-original = path.read_bytes() if path.exists() else b""
-begin = b"# >>> tunevps managed block >>>"
-end = b"# <<< tunevps managed block <<<"
-block = (begin + b'\nsource "$HOME/.config/tunevps/zshrc"\n' + end + b"\n")
-lines = original.splitlines(keepends=True)
-starts = [i for i, line in enumerate(lines) if line.rstrip(b"\r\n") == begin]
-ends = [i for i, line in enumerate(lines) if line.rstrip(b"\r\n") == end]
-if not starts and not ends:
-    # Put defaults first so the user's settings can override them afterwards.
-    updated = block + original
-elif len(starts) == len(ends) == 1 and starts[0] < ends[0]:
-    updated = b"".join(lines[:starts[0]]) + block + b"".join(lines[ends[0] + 1:])
-else:
-    sys.exit("Invalid or duplicate tunevps managed markers; .zshrc unchanged")
-if updated != original:
-    path.write_bytes(updated)
-PY
+  # Preserve user bytes; run the atomic writer without root privileges.
+  if ! atomic_config --user "$USER_HOME/.zshrc" zshrc
   then
     error "Не удалось обновить managed block в $USER_HOME/.zshrc"
     return 1

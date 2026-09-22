@@ -1,5 +1,6 @@
 """Extract the real function; all kernel commands are stubs, all writes temporary."""
 import os
+from atomic_support import HELPER
 from pathlib import Path
 import subprocess
 import tempfile
@@ -26,6 +27,9 @@ net.ipv4.tcp_max_syn_backlog = 65535
 '''
 BBR = 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr'
 FAILURES = ['modprobe', 'missing-modprobe', 'remove'] + [f'{kind}-{area}' for area in ('modules', 'sysctl', 'limits') for kind in ('mkdir', 'open', 'write', 'partial')] + ['apply']
+
+
+FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureSafeSysctlTest(unittest.TestCase):
@@ -132,7 +136,7 @@ rm() {
                 self.assertEqual(calls.count('apply'), int(failure == 'apply' or failure.endswith('-limits')))
                 if failure.startswith('partial-'):
                     area = failure[8:]
-                    self.assertEqual(configs[area], 'tcp_' if area == 'modules' else 'partial\n')
+                    self.assertIsNone(configs[area])
                 if part2:
                     self.assertEqual([s for s in result.stdout.splitlines() if s.startswith('STEP:')],
                                      [f'STEP:{s}' for s in STEPS[:STEPS.index('configure_safe_sysctl')]])

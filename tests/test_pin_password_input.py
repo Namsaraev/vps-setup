@@ -4,12 +4,13 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from access_support import HELPER as ACCESS
 
 from test_part2_error_propagation import PART2, STEPS
 
 SOURCE = (Path(__file__).resolve().parents[1] / 'tunevps.sh').read_text(encoding='utf-8')
 PASSWORD = 'ask_password() {' + SOURCE.split('ask_password() {', 1)[1].split('\npause()', 1)[0]
-PIN = 'configure_pin() {' + SOURCE.split('configure_pin() {', 1)[1].split('\nconfigure_ssh()', 1)[0]
+PIN = ACCESS + '\nconfigure_pin() {' + SOURCE.split('configure_pin() {', 1)[1].split('\nconfigure_ssh()', 1)[0]
 # Redirect only the terminal device to a disposable file. Keep the real read
 # builtin for success, empty input, partial EOF and EOF paths.
 PASSWORD = PASSWORD.replace('/dev/tty', './tty')
@@ -22,7 +23,7 @@ info() { echo "INFO:$*"; }
 warn() { echo "WARN:$*"; }
 error() { echo "ERROR:$*" >&2; }
 ok() { echo "OK:$*"; }
-id() { [ "$EXISTING" = yes ]; }
+id() { case "${1:-}" in -u|-g) command id "$1" ;; *) [ "$EXISTING" = yes ] ;; esac; }
 getent() { printf 'isolated_pin:x:1000:1000::%s:/bin/bash\n' "$PWD"; }
 authorized_keys_has_key() { return 1; }
 yes_by_default() { return 0; }

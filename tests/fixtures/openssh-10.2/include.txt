@@ -1,0 +1,3 @@
+Match User pin
+ AuthorizedKeysFile %h/.ssh/authorized_keys
+Match all

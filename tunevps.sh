@@ -214,7 +214,8 @@ def effective_path(home, user, context=''):
         # Refuse connection-dependent conditions rather than treating one
         # synthetic/current peer as proof for other clients. Unknown trace
         # formats/versions fail closed; this is not an sshd_config parser.
-        if not re.search(r'^debug1: sshd version OpenSSH_(?:8\.9|9\.[0-9]+)[, ]', text, re.M):
+        version = re.search(r'^debug1: sshd version OpenSSH_(8\.9|9\.[0-9]+|10\.2)[, ]', text, re.M)
+        if not version:
             raise ValueError('Unsupported OpenSSH Match trace; inspect sshd -T -C manually before retrying')
         if 'debug2: parse_server_config_depth:' not in text:
             raise ValueError('Missing OpenSSH configuration parse trace')
@@ -225,7 +226,9 @@ def effective_path(home, user, context=''):
         for line in text.splitlines():
             if 'checking syntax for ' not in line:
                 continue
-            match = re.fullmatch(r"debug3: checking syntax for 'Match (.*)'\r?", line, re.I)
+            # 10.2 adds the source line number; accept only its observed grammar.
+            suffix = r" on line [1-9][0-9]*" if version[1] == "10.2" else ""
+            match = re.fullmatch(r"debug3: checking syntax for 'Match (.*)'" + suffix + r"\r?", line, re.I)
             if not match:
                 raise ValueError('Unsupported OpenSSH Match trace format')
             tokens = shlex.split(match[1])

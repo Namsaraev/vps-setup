@@ -1,0 +1,6 @@
+HostKey /tmp/pr30-trace-1ds05t1u/key
+PidFile /tmp/pr30-trace-1ds05t1u/pid
+UsePAM no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+Include /tmp/pr30-trace-1ds05t1u/included.conf

@@ -4,14 +4,21 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import shlex
+import sys
+from access_support import HELPER as ACCESS
 
 from test_part2_error_propagation import PART2, STEPS
 
 
 SOURCE = (Path(__file__).resolve().parents[1] / 'tunevps.sh').read_text(encoding='utf-8')
-FUNCTIONS = 'ssh_key_fingerprint() {' + SOURCE.split('ssh_key_fingerprint() {', 1)[1].split('\nufw_is_active()', 1)[0]
+FUNCTIONS = ACCESS + '\nssh_key_fingerprint() {' + SOURCE.split('ssh_key_fingerprint() {', 1)[1].split('\nufw_is_active()', 1)[0]
+FUNCTIONS += ('\npython3() { ' + shlex.quote(sys.executable) + ' ' +
+              shlex.quote(str(Path(__file__).with_name('access_faults.py'))) + ' "$@"; }\n')
+
 PRELUDE = r'''
 set -uo pipefail
+umask 077
 ROOT="$PWD"
 export TMPDIR="$ROOT"
 PIN_USER=isolated_pin
@@ -29,7 +36,7 @@ info() { echo "INFO: $*"; }
 warn() { echo "WARN: $*"; }
 error() { echo "ERROR: $*" >&2; }
 ok() { echo "[OK] $*"; }
-id() { return 0; }
+id() { case "${1:-}" in -u|-g) command id "$1" ;; *) return 0 ;; esac; }
 getent() { printf 'isolated_pin:x:1000:1000::%s/home:/bin/bash\n' "$ROOT"; }
 ask() {
   case "$2" in
@@ -103,19 +110,9 @@ echo FLAG:$PIN_HAS_KEY
                     with self.subTest(failure=failure, existing=existing, action=action):
                         result, content, old, new, leftovers = self.run_install(failure, existing, action)
                         self.assert_failure(result)
-                        mode = '700' if failure == 'directory' else '600'
-                        self.assertIn(f'Не удалось установить права {mode} на ', result.stderr)
                         self.assertEqual(leftovers, [])
-                        if failure == 'temp':
-                            self.assertNotIn('MV', result.stdout)
-                            self.assertNotIn('CHOWN', result.stdout)
-                            self.assertEqual(content, old if existing else None)
-                        else:
-                            self.assertIn('MV', result.stdout)
-                            self.assertIn('CHOWN', result.stdout)
-                            self.assertEqual(content, old + b'\n' + new if existing and action == '2' else new)
-                        if failure == 'directory':
-                            self.assertNotIn('CHMOD:keys:', result.stdout)
+                        self.assertNotIn('MV', result.stdout)
+                        self.assertEqual(content, old if existing else None)
 
     def test_real_part2_propagates_each_chmod_failure(self):
         for failure in ('temp', 'directory', 'keys'):
@@ -135,7 +132,7 @@ echo FLAG:$PIN_HAS_KEY
                 self.assertIn('REPEAT_FLAG:true', result.stdout)
                 self.assertEqual(result.stdout.count('[OK] Ключ для isolated_pin установлен'), 1)
                 self.assertEqual(result.stdout.count('\nMV\n'), 1)
-                self.assertLess(result.stdout.index('CHMOD:keys:600'), result.stdout.index('[OK]'))
+                self.assertLess(result.stdout.index('MV'), result.stdout.index('[OK]'))
                 self.assertEqual(content, old + b'\n' + new if existing else new)
                 self.assertEqual(leftovers, [])
 

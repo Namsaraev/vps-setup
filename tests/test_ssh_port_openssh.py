@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from access_support import HELPER as ACCESS
 
 
 SOURCE = (Path(__file__).resolve().parents[1] / 'tunevps.sh').read_text(encoding='utf-8')
@@ -20,7 +21,7 @@ def function(start, end):
     return start + SOURCE.split(start, 1)[1].split(end, 1)[0]
 
 
-FUNCTIONS = '\n'.join((
+FUNCTIONS = ACCESS + '\n' + '\n'.join((
     function('atomic_config() {', '\nconfigure_unattended_upgrades()'),
     function('set_sshd_line() {', '\nas_current_user()'),
     function('final_check() {', '\npart2_setup()'),
@@ -30,7 +31,7 @@ AUTH = ('PubkeyAuthentication yes\nPasswordAuthentication no\n'
 STUBS = r'''
 set -eo pipefail
 SSH_PORT=5829
-PIN_USER=fixture
+PIN_USER=$(id -un)
 CURRENT_USER=fixture
 USER_HOME="$ROOT/home"
 IS_MINIMIZED=false
@@ -40,7 +41,7 @@ ok() { echo "OK:$*"; }
 warn() { echo "WARN:$*"; }
 error() { echo "ERROR:$*" >&2; }
 ask() { printf -v "$2" '%s' y; }
-getent() { echo "fixture:x:1000:1000::$ROOT/home:/bin/bash"; }
+getent() { echo "$PIN_USER:x:$(id -u):$(id -g)::$ROOT/home:/bin/bash"; }
 authorized_keys_has_key() { return 0; }
 install() { :; }
 ensure_ufw_ssh_port() { :; }
@@ -49,7 +50,10 @@ systemctl() {
   case "$1" in
     is-active|is-enabled) [[ -e "$ROOT/applied" ]] ;;
     restart|reload) touch "$ROOT/applied" ;;
-    show) echo 1048576 ;;
+    show)
+      if [[ "$2" == ssh.socket ]]; then
+        printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'UnitFileState=disabled'
+      else echo 1048576; fi ;;
   esac
 }
 check_ssh_port() { [[ -e "$ROOT/applied" ]]; }
@@ -60,7 +64,6 @@ swapon() { :; }
 ufw() { :; }
 ufw_is_active() { return 1; }
 sshd() {
-  case "$*" in -t|-T) ;; *) return 99 ;; esac
   /usr/sbin/sshd "$@" -f "$ROOT/etc/ssh/sshd_config"
 }
 '''
@@ -77,7 +80,7 @@ class SshPortOpenSSHTest(unittest.TestCase):
         self.main = self.root / 'etc/ssh/sshd_config'
         self.include = self.root / 'etc/ssh/sshd_config.d/00-vps-hardening.conf'
         self.include.parent.mkdir(parents=True)
-        (self.root / 'home').mkdir()
+        (self.root / 'home').mkdir(mode=0o700)
         (self.root / 'home/.zshrc').touch()
         (self.root / 'calls').touch()
         self.key = self.root / 'host_key'
@@ -124,6 +127,38 @@ class SshPortOpenSSHTest(unittest.TestCase):
                                       input=effective, text=True).strip()
         self.assertEqual(old, '5829\n5829')
         self.assertNotEqual(old, '5829')
+
+    def test_real_match_authorizedkeysfile_exclusion_stops_apply(self):
+        import pwd
+        user = pwd.getpwuid(os.getuid()).pw_name
+        self.main.write_text(self.main.read_text() + f'Match User {user}\n AuthorizedKeysFile .ssh/elsewhere\n')
+        before = self.main.read_bytes()
+        result = self.run_call('configure_ssh || exit $?')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('AuthorizedKeysFile', result.stderr)
+        self.assertEqual(self.main.read_bytes(), before)
+        self.assertFalse(self.include.exists())
+        self.assertNotIn('restart', (self.root / 'calls').read_text())
+
+    def test_real_nonmatching_address_policy_is_not_inferred_from_one_peer(self):
+        self.main.write_text(self.main.read_text() + 'Match Address 192.0.2.0/24\n AuthorizedKeysFile .ssh/elsewhere\n')
+        before = self.main.read_bytes()
+        r = self.run_call('configure_ssh || exit $?')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('Match', r.stderr)
+        self.assertEqual(self.main.read_bytes(), before)
+
+    def test_real_effective_absolute_percent_h_and_relative_paths(self):
+        from test_access_release_blockers import run
+        import pwd
+        user = pwd.getpwuid(os.getuid()).pw_name
+        for value in ('.ssh/authorized_keys', '%h/.ssh/authorized_keys', str(self.root / 'home/.ssh/authorized_keys')):
+            self.include.write_text('AuthorizedKeysFile ' + value + '\n')
+            result = subprocess.run(['/usr/sbin/sshd', '-T', '-C', f'user={user},host=127.0.0.1,addr=127.0.0.1',
+                                     '-f', str(self.main)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            checked = run('effective', self.root / 'home', user, data=result.stdout)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
 
     def test_generated_config_and_repeat_use_main_port_and_cloud_init_auth_order(self):
         self.assert_success(self.run_call('configure_ssh || exit $?'))
@@ -172,11 +207,11 @@ class SshPortOpenSSHTest(unittest.TestCase):
                 self.include.write_text('MaxAuthTries 6\n')
                 result = self.run_call('configure_ssh || exit $?')
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn('ERROR:port=', result.stderr)
+                self.assertRegex(result.stderr, r'ERROR:(port=|Explicit ListenAddress)')
                 self.assertIn('22', self.ports())
                 result = self.run_call('final_check')
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn('ERROR:port=', result.stderr)
+                self.assertRegex(result.stderr, r'ERROR:(port=|Explicit ListenAddress)')
 
 
 if __name__ == '__main__':

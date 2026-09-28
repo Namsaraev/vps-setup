@@ -70,15 +70,386 @@ set_pin_password() {
 pause() { local v; ask "Нажмите Enter для продолжения..." v; }
 yes_by_default() { [[ -z "$1" || "$1" =~ ^[Yy]$ ]]; }
 
-# Надёжная проверка: порт должен быть в конце поля локального адреса (4-е поле)
-# Работает для 0.0.0.0:5829, [::]:5829, *:5829
+# SSH-only path, effective-context, persistence and evidence helpers.
+access_safety() {
+  local program
+  program="$(command cat <<'PY_ACCESS'
+import base64
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shlex
+import stat
+import sys
+
+
+def identity(s):
+    return None if s is None else (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid,
+                                   s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+
+
+def directory(path):
+    if not path.startswith('/') or '..' in path.split('/'):
+        raise ValueError('Expected absolute path without parent traversal')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in filter(None, path.split('/')):
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_at(fd, name):
+    try:
+        before = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None, b''
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError('Expected regular non-linked file: ' + name)
+    f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    with os.fdopen(f, 'rb') as stream:
+        if identity(os.fstat(f)) != identity(before):
+            raise ValueError('File changed during open: ' + name)
+        data = stream.read()
+        if identity(os.fstat(f)) != identity(before) or len(data) != before.st_size:
+            raise ValueError('File changed during read: ' + name)
+    return before, data
+
+
+def same_directory(fd, path):
+    check = directory(path)
+    try:
+        a, b = os.fstat(fd), os.fstat(check)
+        if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
+            raise ValueError('Parent directory changed: ' + path)
+    finally:
+        os.close(check)
+
+
+def replace_at(fd, parent, name, old, data, uid, gid, mode, times=None):
+    temp = '.tunevps-access-' + secrets.token_hex(16)
+    try:
+        f = os.open(temp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        with os.fdopen(f, 'w+b') as stream:
+            if stream.write(data) != len(data):
+                raise OSError('Short staged write')
+            stream.flush()
+            os.fchown(f, uid, gid)
+            os.fchmod(f, mode)
+            if times is not None:
+                os.utime(f, ns=tuple(times))
+            os.fsync(f)
+            stream.seek(0)
+            if stream.read() != data:
+                raise OSError('Staged bytes mismatch')
+        now = read_at(fd, name)
+        if identity(now[0]) != identity(old[0]) or now[1] != old[1]:
+            raise ValueError('Target changed before replacement: ' + name)
+        same_directory(fd, parent)
+        os.replace(temp, name, src_dir_fd=fd, dst_dir_fd=fd)
+        temp = None
+        os.fsync(fd)
+        s, actual = read_at(fd, name)
+        if actual != data or (s.st_uid, s.st_gid, stat.S_IMODE(s.st_mode)) != (uid, gid, mode):
+            raise OSError('Live bytes/metadata verification failed: ' + name)
+        if times is not None and s.st_mtime_ns != times[1]:
+            raise OSError('Restored timestamp verification failed: ' + name)
+        same_directory(fd, parent)
+    finally:
+        if temp is not None:
+            try:
+                os.unlink(temp, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+
+
+def key_path(home, uid, gid, action):
+    h = directory(home)
+    d = None
+    try:
+        hs = os.fstat(h)
+        if hs.st_uid != uid or hs.st_mode & 0o022:
+            raise ValueError('Unsafe home ownership or write permissions')
+        try:
+            d = os.open('.ssh', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=h)
+        except FileNotFoundError:
+            if action == 'check':
+                return
+            os.mkdir('.ssh', 0o700, dir_fd=h)
+            d = os.open('.ssh', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=h)
+            os.fchown(d, uid, gid)
+        ds = os.fstat(d)
+        if ds.st_uid != uid or ds.st_mode & 0o022:
+            raise ValueError('Unsafe .ssh ownership or write permissions')
+        old = read_at(d, 'authorized_keys')
+        if old[0] and (old[0].st_uid != uid or old[0].st_mode & 0o022):
+            raise ValueError('Unsafe authorized_keys ownership or write permissions')
+        same_directory(h, home)
+        same_directory(d, home + '/.ssh')
+        if action == 'check':
+            return
+        key = sys.stdin.buffer.read()
+        if not key or b'\x00' in key:
+            raise ValueError('Empty or invalid key input')
+        data = key if action == 'replace' else old[1] + (b'\n' if old[1] and not old[1].endswith(b'\n') else b'') + key
+        os.fchmod(d, 0o700)
+        replace_at(d, home + '/.ssh', 'authorized_keys', old, data, uid, gid, 0o600)
+    finally:
+        if d is not None:
+            os.close(d)
+        os.close(h)
+
+
+def effective_path(home, user, context=''):
+    text = sys.stdin.read()
+    if context == 'checked-context':
+        # OpenSSH itself expands Includes and parses Match. Its debug trace
+        # exposes every Match expression, including non-matching branches.
+        # Refuse connection-dependent conditions rather than treating one
+        # synthetic/current peer as proof for other clients. Unknown trace
+        # formats/versions fail closed; this is not an sshd_config parser.
+        version = re.search(r'^debug1: sshd version OpenSSH_(8\.9|9\.[0-9]+|10\.2)[, ]', text, re.M)
+        if not version:
+            raise ValueError('Unsupported OpenSSH Match trace; inspect sshd -T -C manually before retrying')
+        if 'debug2: parse_server_config_depth:' not in text:
+            raise ValueError('Missing OpenSSH configuration parse trace')
+        for field, allowed in (('pubkeyauthentication', {'yes'}), ('authenticationmethods', {'any', 'publickey'})):
+            values = [l.split(maxsplit=1)[1] for l in text.splitlines() if l.startswith(field + ' ')]
+            if len(values) != 1 or values[0] not in allowed:
+                raise ValueError('Effective ' + field + ' does not confirm standalone public-key access')
+        for line in text.splitlines():
+            if 'checking syntax for ' not in line:
+                continue
+            # 10.2 adds the source line number; accept only its observed grammar.
+            suffix = r" on line [1-9][0-9]*" if version[1] == "10.2" else ""
+            match = re.fullmatch(r"debug3: checking syntax for 'Match (.*)'" + suffix + r"\r?", line, re.I)
+            if not match:
+                raise ValueError('Unsupported OpenSSH Match trace format')
+            tokens = shlex.split(match[1])
+            if [t.lower() for t in tokens] == ['all']:
+                continue
+            if not tokens or len(tokens) % 2 or any(t.lower() not in ('user', 'group') for t in tokens[::2]):
+                raise ValueError('Connection-dependent/unsupported Match policy; verify key access and simplify Match before automatic password disabling')
+    rows = [l.split()[1:] for l in text.splitlines() if l.startswith('authorizedkeysfile ')]
+    if len(rows) != 1 or not rows[0]:
+        raise ValueError('Missing or ambiguous effective AuthorizedKeysFile')
+    paths = []
+    for value in rows[0]:
+        if value == 'none':
+            continue
+        if re.search(r'%(?![%hu])', value) or any(c in value for c in '*?"\\'):
+            raise ValueError('Unsupported effective AuthorizedKeysFile token or path')
+        value = re.sub(r'%([%hu])', lambda m: {'%': '%', 'h': home, 'u': user}[m[1]], value)
+        paths.append(os.path.normpath(value if value.startswith('/') else home + '/' + value))
+    if os.path.normpath(home + '/.ssh/authorized_keys') not in paths:
+        raise ValueError('Effective AuthorizedKeysFile excludes installed key path')
+
+
+def properties(text):
+    result = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition('=')
+        if not sep:
+            raise ValueError('Malformed systemd evidence')
+        result.setdefault(key, []).append(value)
+    return result
+
+
+def one(p, key):
+    if len(p.get(key, [])) != 1:
+        raise ValueError('Missing/ambiguous systemd property: ' + key)
+    return p[key][0]
+
+
+def endpoints(p):
+    result = []
+    for value in p.get('Listen', []):
+        for address, kind in re.findall(r'(\S+) \((\w+)\)', value):
+            if kind != 'Stream':
+                raise ValueError('Unsupported non-stream socket policy')
+            match = re.fullmatch(r'(\[[0-9a-fA-F:]+\]|[0-9.]+):(\d+)', address)
+            if not match:
+                raise ValueError('Unsupported socket address; inspect systemctl cat ssh.socket')
+            ipaddress.ip_address(match[1].strip('[]'))
+            result.append((match[1], match[2]))
+        if not value or ' '.join(a + ' (' + k + ')' for a, k in re.findall(r'(\S+) \((\w+)\)', value)) != value:
+            raise ValueError('Ambiguous systemd Listen evidence')
+    if not result or len(set(result)) != len(result):
+        raise ValueError('Empty or duplicate socket policy')
+    return result
+
+
+def socket_plan(port):
+    p = properties(sys.stdin.read())
+    load, active, enabled = one(p, 'LoadState'), one(p, 'ActiveState'), one(p, 'UnitFileState')
+    if active == 'inactive' and enabled in ('disabled', 'masked', '') and load in ('loaded', 'not-found', 'masked'):
+        print('service')
+        return
+    if load != 'loaded' or active not in ('active', 'inactive') or enabled not in ('enabled', 'enabled-runtime', 'disabled', 'static', 'generated'):
+        raise ValueError('Ambiguous ssh.socket state; inspect systemctl status ssh.socket')
+    if one(p, 'Accept') != 'no' or one(p, 'Triggers') != 'ssh.service':
+        raise ValueError('Unsupported socket activation target')
+    if one(p, 'NeedDaemonReload') != 'no':
+        raise ValueError('Stale systemd configuration; review/reload units before retrying')
+    for path in one(p, 'DropInPaths').split():
+        if os.path.basename(path) > '99-vps-port.conf':
+            raise ValueError('Later socket drop-in could override managed policy: ' + path)
+    entries = endpoints(p)
+    if len({p for _, p in entries}) != 1:
+        raise ValueError('Multiple existing ports; configure ssh.socket explicitly')
+    print('socket')
+    print('[Socket]\nListenStream=')
+    for address, _ in entries:
+        print('ListenStream=' + address + ':' + port)
+
+
+def listener(port, service, socket):
+    rows = [l for l in sys.stdin.read().splitlines() if len(l.split()) >= 4 and l.split()[3].endswith(':' + port)]
+    if not rows:
+        return 1
+    s, p = properties(service), properties(socket)
+    pid = one(s, 'MainPID')
+    service_ok = (one(s, 'LoadState') == 'loaded' and one(s, 'ActiveState') == 'active'
+                  and pid.isdigit() and int(pid) > 1 and 'path=/usr/sbin/sshd ;' in one(s, 'ExecStart'))
+    socket_ok = one(p, 'LoadState') == 'loaded' and one(p, 'ActiveState') == 'active'
+    if socket_ok:
+        socket_ok = one(p, 'Triggers') == 'ssh.service' and one(p, 'Accept') == 'no'
+        allowed = {a + ':' + n for a, n in endpoints(p)} if socket_ok else set()
+    else:
+        allowed = set()
+    for row in rows:
+        owners = re.findall(r'pid=(\d+),', row)
+        if not owners:
+            return 2
+        endpoint = row.split()[3]
+        if endpoint == '*:' + port and '[::]:' + port in allowed:
+            endpoint = '[::]:' + port
+        if not all((service_ok and owner == pid) or (owner == '1' and socket_ok and endpoint in allowed) for owner in owners):
+            return 4
+    return 0
+
+
+def snapshot_files(paths):
+    records = []
+    for path in paths:
+        parent, name = os.path.split(path)
+        try:
+            fd = directory(parent)
+        except FileNotFoundError:
+            records.append([path, None, ''])
+            continue
+        try:
+            s, data = read_at(fd, name)
+            records.append([path, [s.st_uid, s.st_gid, stat.S_IMODE(s.st_mode), [s.st_atime_ns, s.st_mtime_ns]] if s else None,
+                            base64.b64encode(data).decode()])
+        finally:
+            os.close(fd)
+    print(json.dumps(records))
+
+
+def restore_files():
+    failures = []
+    for path, meta, encoded in json.loads(sys.stdin.read()):
+        parent, name = os.path.split(path)
+        try:
+            try:
+                fd = directory(parent)
+            except FileNotFoundError:
+                if meta is None:
+                    continue
+                raise
+            try:
+                old = read_at(fd, name)
+                same_directory(fd, parent)
+                if meta is None:
+                    if old[0] is not None:
+                        os.unlink(name, dir_fd=fd)
+                        os.fsync(fd)
+                    if read_at(fd, name)[0] is not None:
+                        raise OSError('Expected restored absence')
+                else:
+                    replace_at(fd, parent, name, old, base64.b64decode(encoded), *meta)
+            finally:
+                os.close(fd)
+        except (ValueError, OSError):
+            failures.append(path)
+    if failures:
+        raise ValueError('FATAL: SSH rollback failed: ' + ', '.join(failures))
+
+
+def ufw_order(port):
+    text = sys.stdin.read()
+    if not text.startswith('Status: active\n'):
+        raise ValueError('Expected active numbered UFW state')
+    seen_allow = set()
+    rules = 0
+    for line in text.splitlines():
+        if not line.lstrip().startswith('['):
+            continue
+        match = re.fullmatch(r'\[\s*(\d+)\]\s+(.+?)\s{2,}(ALLOW|DENY|REJECT|LIMIT)(?: IN)?\s+(.+?)(?:\s+#.*)?', line)
+        if not match:
+            raise ValueError('Unsupported UFW rule; inspect ufw status numbered')
+        rules += 1
+        destination, action, source = match[2].strip(), match[3], match[4].strip()
+        family = 6 if '(v6)' in destination else 4
+        destination = destination.replace(' (v6)', '')
+        source = source.replace(' (v6)', '')
+        # An earlier unknown deny may be an app profile/range/interface rule.
+        # Do not infer non-conflict from a display alias we cannot resolve.
+        harmless = re.fullmatch(r'(\d+)(?:/(tcp|udp))?', destination)
+        unrelated = harmless and (harmless[1] != port or harmless[2] == 'udp')
+        if action in ('DENY', 'REJECT', 'LIMIT') and family not in seen_allow and not unrelated:
+            raise ValueError('Earlier UFW blocking/ambiguous rule ' + match[1] + '; inspect ufw status numbered and place a scoped SSH allow before it')
+        if destination == port + '/tcp' and action == 'ALLOW' and source == 'Anywhere':
+            seen_allow.add(family)
+    # IPv6 coverage is required only if numbered output contains IPv6 rules.
+    needed = {4, 6} if '(v6)' in text else {4}
+    return 0 if needed <= seen_allow else 1
+
+
+try:
+    op, *args = sys.argv[1:]
+    result = 0
+    if op == 'key':
+        key_path(args[0], int(args[1]), int(args[2]), args[3])
+    elif op == 'effective':
+        effective_path(*args)
+    elif op == 'socket':
+        socket_plan(*args)
+    elif op == 'listener':
+        result = listener(*args)
+    elif op == 'snapshot':
+        snapshot_files(args)
+    elif op == 'restore':
+        restore_files()
+    elif op == 'ufw':
+        result = ufw_order(*args)
+    else:
+        raise ValueError('Unknown access safety operation')
+    sys.exit(result)
+except (OSError, ValueError, KeyError) as exc:
+    # Never include input content or key bytes in diagnostics.
+    print('Access safety check failed: ' + str(exc), file=sys.stderr)
+    sys.exit(2)
+PY_ACCESS
+)" || return 2
+  python3 -c "$program" "$@"
+}
+
 check_ssh_port() {
-  # 0 = listener present, 1 = absent, 2 = probe failure.
-  local listeners status=0
-  listeners="$(ss -ltn)" || return 2
-  awk -v suffix=":$SSH_PORT" '$4 ~ suffix"$" {found=1} END {exit !found}' <<< "$listeners" || status=$?
-  [ "$status" -le 1 ] || return 2
-  return "$status"
+  # 0 = expected SSH listener, 1 = absent, 2 = probe failure, 4 = foreign.
+  local listeners service socket
+  listeners="$(ss -ltnp)" || return 2
+  service="$(systemctl show ssh.service -p LoadState -p ActiveState -p MainPID -p ExecStart)" || return 2
+  socket="$(systemctl show ssh.socket -p LoadState -p ActiveState -p Listen -p Triggers -p Accept)" || return 2
+  access_safety listener "$SSH_PORT" "$service" "$socket" <<< "$listeners"
+
 }
 
 if [ "$EUID" -ne 0 ]; then
@@ -944,7 +1315,7 @@ authorized_keys_has_key() {
   # 0 = match, 1 = ordinary no-match, 2 = operational failure.
   local file="$1" wanted="${2:-}" line fingerprint content status
   [ -e "$file" ] || { [ ! -L "$file" ] && return 1; }
-  if [ ! -f "$file" ]; then
+  if [ -L "$file" ] || [ ! -f "$file" ]; then
     error "Не удалось прочитать обычный файл ключей: $file"
     return 2
   fi
@@ -1002,6 +1373,9 @@ configure_pin() {
     if [ -z "$home" ] || [ ! -d "$home" ]; then
       error "Не найдена домашняя директория пользователя $PIN_USER"
       return 1
+    fi
+    if ! access_safety key "$home" "$(id -u "$PIN_USER")" "$(id -g "$PIN_USER")" check; then
+      error "Небезопасный путь SSH-ключа пользователя $PIN_USER"; return 1
     fi
     status=0
     authorized_keys_has_key "$keys" || status=$?
@@ -1129,57 +1503,11 @@ configure_pin() {
   fi
 
   PIN_HAS_KEY=false
-  # ЗАМЕЧАНИЕ 2: проверяем создание директории
-  if ! mkdir -p "$sshdir"; then
-    error "Не удалось создать $sshdir"
-    return 1
-  fi
-
-  # Атомарная запись через временный файл с проверками
-  local tmp_keys="${keys}.tmp.$$"
-  if [ "$is_new" = true ] || [ "$replace_mode" = true ]; then
-    if ! printf '%s\n' "$public_key" > "$tmp_keys"; then
-      rm -f "$tmp_keys"
-      error "Не удалось записать ключ во временный файл"
-      return 1
-    fi
-  else
-    if ! (
-      if [ -e "$keys" ]; then
-        cat "$keys" || exit 1
-        # Отделяем новый ключ, даже если последняя запись не заканчивается LF.
-        printf '\n' || exit 1
-      fi
-      printf '%s\n' "$public_key"
-    ) > "$tmp_keys"; then
-      rm -f "$tmp_keys"
-      error "Не удалось записать ключ во временный файл"
-      return 1
-    fi
-  fi
-  if ! chmod 600 "$tmp_keys"; then
-    error "Не удалось установить права 600 на $tmp_keys"
-    rm -f "$tmp_keys"
-    return 1
-  fi
-
-  # ЗАМЕЧАНИЕ 2: проверяем атомарную замену
-  if ! mv -f "$tmp_keys" "$keys"; then
-    error "Не удалось записать ключ в $keys"
-    rm -f "$tmp_keys"
-    return 1
-  fi
-
-  if ! chown -R "$PIN_USER:$PIN_USER" "$sshdir"; then
-    error "Не удалось установить владельца для $sshdir"
-    return 1
-  fi
-  if ! chmod 700 "$sshdir"; then
-    error "Не удалось установить права 700 на $sshdir"
-    return 1
-  fi
-  if ! chmod 600 "$keys"; then
-    error "Не удалось установить права 600 на $keys"
+  local key_action=append pin_uid pin_gid
+  pin_uid="$(id -u "$PIN_USER")" && pin_gid="$(id -g "$PIN_USER")" || return 1
+  if [ "$is_new" = true ] || [ "$replace_mode" = true ]; then key_action=replace; fi
+  if ! printf '%s\n' "$public_key" | access_safety key "$home" "$pin_uid" "$pin_gid" "$key_action"; then
+    error "Не удалось безопасно записать SSH-ключ для $PIN_USER"
     return 1
   fi
 
@@ -1225,21 +1553,24 @@ ensure_ufw_ssh_port() {
     return 0
   fi
 
-  info "UFW активен — заранее разрешаем SSH-порт $SSH_PORT/tcp"
+  if ! status_output="$(LC_ALL=C ufw status numbered)"; then
+    error "Не удалось прочитать порядок правил UFW"; return 2
+  fi
+  status=0
+  access_safety ufw "$SSH_PORT" <<< "$status_output" || status=$?
+  case "$status" in
+    0) return 0 ;;
+    1) [ "${1:-}" = check ] && return 0 ;;
+    *) error "Порядок UFW не подтверждён; SSH не изменён"; return 2 ;;
+  esac
   if ! ufw allow "$SSH_PORT/tcp" comment 'SSH'; then
-    error "Не удалось разрешить $SSH_PORT/tcp в UFW"
-    return 1
+    error "Не удалось разрешить $SSH_PORT/tcp в UFW"; return 1
   fi
-
-  if ! status_output="$(LC_ALL=C ufw status)"; then
-    error "Не удалось проверить статус UFW после добавления SSH-правила"
-    return 2
+  if ! status_output="$(LC_ALL=C ufw status numbered)"; then
+    error "Не удалось проверить порядок правил UFW"; return 2
   fi
-  if awk -v port="$SSH_PORT/tcp" '$1 == port && $2 == "ALLOW" {found=1} END {exit !found}' <<< "$status_output"; then
-    ok "UFW разрешает $SSH_PORT/tcp"
-  else
-    error "После изменения UFW правило ALLOW для $SSH_PORT/tcp не найдено"
-    return 1
+  if ! access_safety ufw "$SSH_PORT" <<< "$status_output"; then
+    error "Эффективное правило ALLOW для $SSH_PORT/tcp не подтверждено"; return 1
   fi
 
   return 0
@@ -1329,6 +1660,9 @@ configure_ssh() {
   fi
   keys_file="$home/.ssh/authorized_keys"
 
+  if ! access_safety key "$home" "$(id -u "$PIN_USER")" "$(id -g "$PIN_USER")" check; then
+    error "Небезопасный путь SSH-ключа $PIN_USER"; return 1
+  fi
   # Определяем наличие ключа непосредственно перед возможным отключением паролей.
   key_status=0
   authorized_keys_has_key "$keys_file" || key_status=$?
@@ -1362,6 +1696,23 @@ configure_ssh() {
     printf '%s\n' "$effective" >&2
     error "Проверка: sshd -t"
     return 1
+  fi
+
+  local key_effective context_addr=127.0.0.1 context_laddr=127.0.0.1 context_client_port context_server_port
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    read -r context_addr context_client_port context_laddr context_server_port <<< "$SSH_CONNECTION"
+    if [[ ! "$context_addr" =~ ^[0-9a-fA-F:.]+$ || ! "$context_laddr" =~ ^[0-9a-fA-F:.]+$ ]]; then
+      error "Некорректный SSH connection context"; return 1
+    fi
+  fi
+  if ! key_effective="$(sshd -T -C "user=$PIN_USER,host=$context_addr,addr=$context_addr,laddr=$context_laddr,lport=$SSH_PORT" -ddd 2>&1)"; then
+    error "Не удалось подтвердить effective SSH Match context для $PIN_USER"; return 1
+  fi
+  if ! access_safety effective "$home" "$PIN_USER" checked-context <<< "$key_effective"; then
+    error "OpenSSH не подтверждает путь установленного ключа $PIN_USER"; return 1
+  fi
+  if ! access_safety key "$home" "$(id -u "$PIN_USER")" "$(id -g "$PIN_USER")" check; then
+    error "Небезопасный путь SSH-ключа $PIN_USER"; return 1
   fi
 
   local current_port pass_auth pubkey_auth root_login kbd_auth max_auth
@@ -1403,7 +1754,7 @@ configure_ssh() {
 
   # Критическая preflight-проверка: если UFW уже активен, новый SSH-порт
   # должен быть разрешён до изменения sshd. Старый порт намеренно сохраняем.
-  if ! ensure_ufw_ssh_port; then
+  if ! ensure_ufw_ssh_port check; then
     error "Новый SSH-порт не подтверждён в UFW — конфигурация SSH не изменена"
     return 1
   fi
@@ -1418,6 +1769,35 @@ configure_ssh() {
     return 1
   }
 
+  local listener_status=0
+  check_ssh_port || listener_status=$?
+  case "$listener_status" in
+    0|1) ;;
+    4) error "Порт $SSH_PORT занят чужим listener; SSH не изменён"; return 1 ;;
+    *) error "Не удалось проверить владельца SSH listener; SSH не изменён"; return 1 ;;
+  esac
+  local socket_state socket_plan socket_mode ssh_snapshot
+  if ! socket_state="$(systemctl show ssh.socket -p LoadState -p ActiveState -p UnitFileState -p Listen -p Triggers -p Accept -p NeedDaemonReload -p DropInPaths)"; then
+    error "Не удалось определить bind policy ssh.socket"; return 1
+  fi
+  if ! socket_plan="$(access_safety socket "$SSH_PORT" <<< "$socket_state")"; then
+    error "Не удалось безопасно сохранить bind policy; проверьте systemctl cat ssh.socket"; return 1
+  fi
+  socket_mode="${socket_plan%%$'\n'*}"
+  if [ "$socket_mode" = service ]; then
+    local proposed
+    proposed="$(sshd -T -o "Port=$SSH_PORT")" || { error "Не удалось проверить service bind policy"; return 1; }
+    if ! awk -v port="$SSH_PORT" '$1 == "listenaddress" {n++; if ($2 !~ ":"port"$") bad=1} END {exit (!n || bad)}' <<< "$proposed"; then
+      error "Explicit ListenAddress port несовместим; сохраните адреса и настройте порт вручную"; return 1
+    fi
+  fi
+  local targets=(/etc/ssh/sshd_config /etc/ssh/sshd_config.d/00-vps-hardening.conf)
+  if [ "$socket_mode" = socket ]; then targets+=(/etc/systemd/system/ssh.socket.d/99-vps-port.conf); fi
+  ssh_snapshot="$(access_safety snapshot "${targets[@]}")" || {
+    error "Не удалось сохранить SSH snapshots"; return 1;
+  }
+
+  if ! (
   if ! set_sshd_line Port "$SSH_PORT"; then
     error "Не удалось настроить Port в sshd_config"
     return 1
@@ -1461,32 +1841,29 @@ EOF
     return 1
   fi
 
+  if [ "$socket_mode" = socket ]; then
+    mkdir -p /etc/systemd/system/ssh.socket.d || return 1
+    if ! atomic_config /etc/systemd/system/ssh.socket.d/99-vps-port.conf text <<< "${socket_plan#*$'\n'}"; then
+      error "Не удалось записать socket bind policy"; return 1
+    fi
+  fi
   if ! sshd -t; then
-    error "Ошибка sshd_config. Конфиг не перезапущен."
+    error "Aggregate sshd -t failed; restoring managed SSH files"; return 1
+  fi
+  key_effective="$(sshd -T -C "user=$PIN_USER,host=$context_addr,addr=$context_addr,laddr=$context_laddr,lport=$SSH_PORT" -ddd 2>&1)" || return 1
+  access_safety effective "$home" "$PIN_USER" checked-context <<< "$key_effective" || return 1
+  if ! ensure_ufw_ssh_port; then
+    error "UFW SSH access verification failed"; return 1
+  fi
+  ); then
+    if ! access_safety restore <<< "$ssh_snapshot"; then
+      error "FATAL: SSH rollback incomplete; managed paths: ${targets[*]}"; return 1
+    fi
+    error "SSH apply failed; managed files restored and verified; no restart"
     return 1
   fi
 
-  if ! sshd -T | awk -v port="$SSH_PORT" '$1 == "port" && $2 == port {found=1} END {exit !found}'; then
-    error "sshd не принял порт $SSH_PORT; проверьте /etc/ssh/sshd_config и *.d"
-    return 1
-  fi
-
-  mkdir -p /etc/systemd/system/ssh.socket.d || {
-    error "Не удалось создать /etc/systemd/system/ssh.socket.d"
-    return 1
-  }
-  if ! atomic_config /etc/systemd/system/ssh.socket.d/99-vps-port.conf text <<EOF
-[Socket]
-ListenStream=
-ListenStream=0.0.0.0:$SSH_PORT
-ListenStream=[::]:$SSH_PORT
-EOF
-  then
-    error "Не удалось записать /etc/systemd/system/ssh.socket.d/99-vps-port.conf"
-    return 1
-  fi
-
-  if systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket; then
+  if [ "$socket_mode" = socket ]; then
     if ! systemctl daemon-reload; then
       error "Не удалось выполнить systemctl daemon-reload для SSH"
       return 1
@@ -1506,7 +1883,12 @@ EOF
   if check_ssh_port; then
     ok "SSH слушает $SSH_PORT"
   else
-    error "Порт $SSH_PORT не слушается; текущую сессию не закрывайте"
+    listener_status=$?
+    case "$listener_status" in
+      1) error "Порт $SSH_PORT не слушается; текущую сессию не закрывайте" ;;
+      4) error "Порт $SSH_PORT занят чужим listener; текущую сессию не закрывайте" ;;
+      *) error "Не удалось проверить SSH listener; текущую сессию не закрывайте" ;;
+    esac
     systemctl status ssh.socket ssh.service --no-pager || true
     return 1
   fi
@@ -1752,6 +2134,7 @@ final_check() {
   check_ssh_port || status=$?
   case "$status" in
     0) ok "SSH слушает порт $SSH_PORT ✓" ;;
+    4) error "Порт $SSH_PORT занят чужим listener"; failed=1 ;;
     1) error "SSH НЕ слушает порт $SSH_PORT! ⚠️"; failed=1 ;;
     *) error "Не удалось проверить listener на порту $SSH_PORT"; failed=1 ;;
   esac

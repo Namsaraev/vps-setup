@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from access_support import HELPER as ACCESS
 
 SOURCE = (Path(__file__).resolve().parents[1] / 'tunevps.sh').read_text(encoding='utf-8')
 
@@ -15,7 +16,18 @@ def function(name, end):
 FINAL = function('final_check() {', '\npart2_setup()')
 REMOTE = function('run_remote_diagnostic() (', '\nfinal_check()')
 PART3 = function('part3_tests() {', '\nwhile true; do')
-PORT = function('check_ssh_port() {', '\nif [ "$EUID"')
+PORT = ACCESS + '\n' + function('check_ssh_port() {', '\nif [ "$EUID"')
+EVIDENCE = r'''
+eval "$(declare -f systemctl | command sed '1s/systemctl/original_systemctl/')"
+systemctl() {
+  if [[ "$*" == 'show ssh.service -p LoadState'* ]]; then
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'MainPID=42' 'ExecStart={ path=/usr/sbin/sshd ; }'
+  elif [[ "$*" == 'show ssh.socket -p LoadState'* ]]; then
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive'
+  else original_systemctl "$@"; fi
+}
+'''
+
 UFW = function('ufw_is_active() {', '\n# Если UFW')
 PASSWORD = function('ask_password() {', '\nset_pin_password()')
 MENU = 'while true; do' + SOURCE.rsplit('while true; do', 1)[1]
@@ -49,7 +61,7 @@ class DiagnosticsExternalTest(unittest.TestCase):
     def final(self, override=''):
         prelude = '''
 install() { :; }
-ss() { echo 'LISTEN 0 128 *:5829 *:*'; }
+ss() { echo 'LISTEN 0 128 0.0.0.0:5829 *:* users:((sshd,pid=42,fd=3))'; }
 systemctl() { if [ "$1" = show ]; then echo 1048576; fi; }
 sshd() {
   if [ "$1" = -T ]; then
@@ -62,7 +74,7 @@ swapon() { echo /swapfile; }
 ufw() { echo 'Status: active'; }
 command() { [ "$*" != '-v zoxide' ] || return 1; builtin command "$@"; }
 '''
-        return self.run_shell(prelude + PORT + UFW + FINAL + override + '\nfinal_check\n')
+        return self.run_shell(prelude + PORT + UFW + FINAL + override + EVIDENCE + '\nfinal_check\n')
 
     def test_one_snapshot_optional_absence_nonfatal(self):
         r = self.final()
@@ -123,8 +135,8 @@ systemctl() { if [ "$1" = show ]; then echo 65536; fi; }
 
     def test_listener_absent_vs_command_failure(self):
         for stub, status in [('ss() { :; }', 1), ('ss() { return 23; }', 2),
-                             ("ss() { echo 'LISTEN 0 128 *:5829 *:*'; }", 0)]:
-            r = self.run_shell(PORT + stub + '\ncheck_ssh_port\n')
+                             ("ss() { echo 'LISTEN 0 128 0.0.0.0:5829 *:* users:((sshd,pid=42,fd=3))'; }", 0)]:
+            r = self.run_shell(PORT + 'systemctl() { :; }\n' + EVIDENCE + stub + '\ncheck_ssh_port\n')
             self.assertEqual(r.returncode, status)
 
     def remote(self, choice='1', mode='success', extra='', menu=False):

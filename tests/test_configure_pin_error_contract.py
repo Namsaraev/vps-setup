@@ -16,7 +16,7 @@ from test_part2_error_propagation import PART2, STEPS
 HARNESS = r'''
 NEW_KEY=$(cat "$ROOT/new.pub")
 printf '%s\n' "$NEW_KEY" > "$ROOT/tty"
-id() { [ "$USER_EXISTS" = yes ]; }
+id() { case "${1:-}" in -u|-g) command id "$1" ;; *) [ "$USER_EXISTS" = yes ] ;; esac; }
 adduser() { echo ADDUSER; }
 usermod() { echo USERMOD; }
 set_pin_password() { echo PASSWORD; }
@@ -206,7 +206,7 @@ authorized_keys_has_key() {
     def test_separator_printf_failure_preserves_keys(self):
         result, content, old, _ = self.run_case(extra=r'''
 printf() {
-  [ "$#" != 1 ] || [ "$1" != '\n' ] || return 23
+  [[ "${2:-}" != ssh-ed25519* ]] || return 23
   builtin printf "$@"
 }
 ''', invocation='part2_setup')
@@ -218,7 +218,7 @@ printf() {
             with self.subTest(existing=existing, action=action):
                 # Repeat the new account as an existing account, just as real id would.
                 extra = '''
-id() { [ "$USER_EXISTS" = yes ] || [ -e "$ROOT/created" ]; }
+id() { case "${1:-}" in -u|-g) command id "$1" ;; *) [ "$USER_EXISTS" = yes ] || [ -e "$ROOT/created" ] ;; esac; }
 adduser() { echo ADDUSER; touch "$ROOT/created"; }
 '''
                 result, content, old, new = self.run_case(

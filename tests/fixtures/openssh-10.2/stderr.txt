@@ -1,0 +1,27 @@
+debug1: sshd version OpenSSH_10.2, OpenSSL 3.5.5 27 Jan 2026
+debug3: Running on Linux 7.0.0-1012-oracle #12-Ubuntu SMP PREEMPT Fri Sep 11 03:21:48 UTC 2026 aarch64
+debug3: Started with: /usr/sbin/sshd -T -f /tmp/pr30-trace-1ds05t1u/sshd_config -C user=pin,host=127.0.0.1,addr=127.0.0.1,laddr=127.0.0.1,lport=5829 -ddd
+debug2: load_server_config: filename /tmp/pr30-trace-1ds05t1u/sshd_config
+debug2: load_server_config: done config len = 189
+debug2: parse_server_config_depth: config /tmp/pr30-trace-1ds05t1u/sshd_config len 189
+debug3: /tmp/pr30-trace-1ds05t1u/sshd_config:1 setting HostKey /tmp/pr30-trace-1ds05t1u/key
+debug3: /tmp/pr30-trace-1ds05t1u/sshd_config:2 setting PidFile /tmp/pr30-trace-1ds05t1u/pid
+debug3: /tmp/pr30-trace-1ds05t1u/sshd_config:3 setting UsePAM no
+debug3: /tmp/pr30-trace-1ds05t1u/sshd_config:4 setting PubkeyAuthentication yes
+debug3: /tmp/pr30-trace-1ds05t1u/sshd_config:5 setting AuthenticationMethods publickey
+debug2: /tmp/pr30-trace-1ds05t1u/sshd_config line 6: new include /tmp/pr30-trace-1ds05t1u/included.conf
+debug2: /tmp/pr30-trace-1ds05t1u/sshd_config line 6: including /tmp/pr30-trace-1ds05t1u/included.conf
+debug2: load_server_config: filename /tmp/pr30-trace-1ds05t1u/included.conf
+debug2: load_server_config: done config len = 69
+debug2: parse_server_config_depth: config /tmp/pr30-trace-1ds05t1u/included.conf len 69
+debug3: checking syntax for 'Match User pin' on line 1
+debug3: checking syntax for 'Match all' on line 3
+debug1: private host key #0: ssh-ed25519 SHA256:98FTb7z6Mc/Ivejuwq3eneUa/ZjR7DZA9//lYGsYKtM
+debug2: parse_server_config_depth: config reprocess config len 189
+debug2: parse_server_config_depth: config /tmp/pr30-trace-1ds05t1u/included.conf len 69
+debug3: checking match for 'User pin' user pin host 127.0.0.1 addr 127.0.0.1 laddr 127.0.0.1 lport 5829 on line 1
+debug1: user pin matched 'User pin' at line 1
+debug3: match found on line 1
+debug3: /tmp/pr30-trace-1ds05t1u/included.conf:2 setting AuthorizedKeysFile %h/.ssh/authorized_keys
+debug3: checking match for 'all' user pin host 127.0.0.1 addr 127.0.0.1 laddr 127.0.0.1 lport 5829 on line 3
+debug3: match found on line 3

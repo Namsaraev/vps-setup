@@ -90,7 +90,7 @@ class BundleIntegrationTest(unittest.TestCase):
                     result, calls, config = self.run_ssh(
                         'ask() { ' + failure + '; }', outer=True, errexit=errexit)
                     self.assert_stopped(result)
-                    self.assertEqual(calls, 'install\nsshd -T\n')
+                    self.assertEqual(calls, 'install\nsshd -T\nsshd -T -C user=fixture,host=127.0.0.1,addr=127.0.0.1,laddr=127.0.0.1,lport=5829 -ddd\n')
                     self.assertEqual(config, '#Port 22\n')
 
     def test_explicit_skip_stops_part2_without_generic_error(self):
@@ -104,14 +104,14 @@ class BundleIntegrationTest(unittest.TestCase):
                     self.assert_stopped(result)
                     self.assertNotIn('ERROR:', result.stderr)
                     self.assertIn('SSH пропущен', result.stdout)
-                    self.assertEqual(calls, 'install\nsshd -T\n')
+                    self.assertEqual(calls, 'install\nsshd -T\nsshd -T -C user=fixture,host=127.0.0.1,addr=127.0.0.1,laddr=127.0.0.1,lport=5829 -ddd\n')
                     self.assertEqual(config, '#Port 22\n')
 
     def test_compliant_fast_path_proceeds_without_prompt_or_policy_mutation(self):
         result, calls, config = self.run_ssh(
             'command touch "$ROOT/applied"\nask() { return 99; }', outer=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, 'install\nsshd -T\nlistener\n')
+        self.assertEqual(calls, 'install\nsshd -T\nsshd -T -C user=fixture,host=127.0.0.1,addr=127.0.0.1,laddr=127.0.0.1,lport=5829 -ddd\nlistener\n')
         self.assertEqual(config, '#Port 22\n')
         self.assertIn('Часть 2 завершена', result.stdout)
 
@@ -136,7 +136,7 @@ ask() { op prompt; printf -v "$2" '%s' n; }
                 self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
                 self.assert_stopped(result)
                 self.assertNotIn('ERROR:', result.stderr)
-                self.assertEqual(calls, 'install -d -m 0755 /run/sshd\nsshd -T\nprompt\n')
+                self.assertEqual(calls, 'install -d -m 0755 /run/sshd\nsshd -T\nsshd -T -C user=fixture,host=127.0.0.1,addr=127.0.0.1,laddr=127.0.0.1,lport=5829 -ddd\nprompt\n')
                 self.assertEqual(config, '#Port 22\n')
 
     def test_runtime_directory_failure_stops_before_probe_prompt_and_apply(self):

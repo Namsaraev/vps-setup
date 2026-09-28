@@ -1,6 +1,7 @@
 """Real SSH functions in a temporary filesystem; all operational commands stubbed."""
 import os
 from atomic_support import HELPER
+from access_support import HELPER as ACCESS
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ SOCKET = '/etc/systemd/system/ssh.socket.d/99-vps-port.conf'
 PRELUDE = r'''
 set -o pipefail
 SSH_PORT=5829
+unset SSH_CONNECTION
 PIN_USER=fixture
 section() { :; }
 info() { echo "INFO:$*"; }
@@ -24,6 +26,7 @@ warn() { echo "WARN:$*"; }
 ask() { printf -v "$2" '%s' y; }
 getent() { echo "fixture:x:1000:1000::$ROOT/home:/bin/bash"; }
 authorized_keys_has_key() { return 0; }
+id() { command id "${1:-}"; }
 op() { echo "$*" >> "$ROOT/calls"; [[ "$*" != "$FAILURE" ]]; }
 install() { op install; }
 ensure_ufw_ssh_port() { op preflight; }
@@ -47,6 +50,14 @@ cat() {
 }
 systemctl() {
   case "$1" in
+    show)
+      op "systemctl $*" || return 23
+      if [[ "$MODE" == socket ]]; then
+        printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'UnitFileState=enabled' 'NeedDaemonReload=no' 'DropInPaths=' 'Accept=no' 'Triggers=ssh.service' 'Listen=0.0.0.0:22 (Stream)' 'Listen=[::]:22 (Stream)'
+      else
+        printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'UnitFileState=disabled'
+      fi
+      return 0 ;;
     is-active|is-enabled) [[ "$MODE" == socket ]]; return $? ;;
   esac
   op "systemctl $*" || return 23
@@ -55,19 +66,24 @@ systemctl() {
 sshd() {
   op "sshd $*" || return 23
   [[ "$1" == -t ]] && return 0
+  if [[ "$*" == *' -C '* ]]; then
+    printf '%s\n' 'debug1: sshd version OpenSSH_9.6, OpenSSL fixture' 'debug2: parse_server_config_depth: fixture' 'authorizedkeysfile .ssh/authorized_keys' 'pubkeyauthentication yes' 'authenticationmethods any'
+    return 0
+  fi
+  if [[ "$*" == *' -o '* ]]; then echo 'listenaddress 0.0.0.0:5829'; return 0; fi
   if [[ -e "$ROOT/applied" ]] || { [[ -f "$ROOT/etc/ssh/sshd_config" ]] && command grep -q '^Port 5829$' "$ROOT/etc/ssh/sshd_config" 2>/dev/null; }; then
     printf '%s\n' 'port 5829' 'passwordauthentication no' 'pubkeyauthentication yes' 'permitrootlogin no' 'kbdinteractiveauthentication no' 'maxauthtries 3'
   else
     printf '%s\n' 'port 22' 'passwordauthentication yes'
   fi
 }
-check_ssh_port() { op listener && [[ -e "$ROOT/applied" ]]; }
+check_ssh_port() { if [[ ! -e "$ROOT/applied" ]]; then return 1; fi; op listener; }
 ss() { :; }
 sleep() { :; }
 '''
 
 
-FUNCTIONS = HELPER + "\n" + FUNCTIONS
+FUNCTIONS = ACCESS + "\n" + HELPER + "\n" + FUNCTIONS
 
 
 class SshErrorContractTest(unittest.TestCase):
@@ -81,7 +97,7 @@ class SshErrorContractTest(unittest.TestCase):
                 [bash, '-c', 'cygpath -u "$1" 2>/dev/null || printf "%s" "$1"',
                  '_', root.as_posix()], text=True).strip()
             (root / 'etc/ssh').mkdir(parents=True)
-            (root / 'home').mkdir()
+            (root / 'home').mkdir(mode=0o700)
             (root / 'blocked').mkdir()
             (root / 'calls').touch()
             (root / 'etc/ssh/sshd_config').write_text('# fixture\n' if append else '#Port 22\n', encoding='utf-8')
@@ -111,7 +127,7 @@ class SshErrorContractTest(unittest.TestCase):
             main = root / 'etc/ssh/sshd_config'
             config = main.read_text(encoding='utf-8') if main.is_file() else None
             if snapshots:
-                files = {target: (root / target.lstrip('/')).read_bytes()
+                files = {target: ((root / target.lstrip('/')).read_bytes() if (root / target.lstrip('/')).is_file() else None)
                          for target in (HARDENING, SOCKET)}
                 return result, calls, config, files
             return result, calls, config

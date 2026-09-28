@@ -46,7 +46,7 @@ class UfwErrorContractTest(unittest.TestCase):
 
     def test_later_status_failure_even_with_valid_stdout(self):
         # Status 2 is preflight; status 3 verifies the added SSH rule.
-        for at, mutations in ((2, []), (3, [COMMANDS[2]])):
+        for at, mutations in ((2, []), (3, []), (4, [COMMANDS[2]])):
             for pipefail in (False, True):
                 result = self.run_ufw(active=True, status_failure_at=at,
                                       part2=True, pipefail=pipefail)
@@ -110,7 +110,7 @@ class UfwErrorContractTest(unittest.TestCase):
     def test_active_repeat_keeps_only_ssh_allow(self):
         result = self.run_ufw(active=True, repeat=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.mutations(result), [COMMANDS[2]] * 2)
+        self.assertEqual(self.mutations(result), [COMMANDS[2]])
 
     def test_ipv6_optional_success_unchanged(self):
         result = self.run_ufw(refuse=True, action='2', source_ip='2001:db8::1')

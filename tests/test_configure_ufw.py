@@ -3,11 +3,12 @@ import os
 from pathlib import Path
 import subprocess
 import unittest
+from access_support import HELPER as ACCESS
 
 from test_part2_error_propagation import PART2, STEPS
 
 SOURCE = (Path(__file__).resolve().parents[1] / 'tunevps.sh').read_text(encoding='utf-8')
-FUNCTIONS = 'ufw_is_active() {' + SOURCE.split('ufw_is_active() {', 1)[1].split('\nset_sshd_line()', 1)[0]
+FUNCTIONS = ACCESS + '\nufw_is_active() {' + SOURCE.split('ufw_is_active() {', 1)[1].split('\nset_sshd_line()', 1)[0]
 COMMANDS = ['default deny incoming', 'default allow outgoing',
             'allow 5829/tcp comment SSH', 'allow 80/tcp comment HTTP',
             'allow 443/tcp comment HTTPS', '--force enable']
@@ -53,10 +54,11 @@ ufw() {
     count=$((count + 1))
     printf '%s\n' "$count" > "$STATUS_COUNT"
     echo "Status: $STATE"
-    if [[ "$MISSING_RULE" == no ]]; then echo '5829/tcp ALLOW Anywhere'; fi
+    if [[ "$MISSING_RULE" == no && -f "$STATUS_COUNT.allowed" ]]; then echo '[ 1] 5829/tcp  ALLOW IN  Anywhere'; fi
     if [[ "$count" == "$STATUS_FAILURE_AT" ]]; then return 23; fi
     return 0
   fi
+  if [[ "$1" == allow && "$2" == 5829/tcp ]]; then touch "$STATUS_COUNT.allowed"; fi
   return 0
 }
 '''
@@ -66,7 +68,7 @@ ufw() {
                    STATUS_FAILURE_AT=str(status_failure_at), READ_ERROR='yes' if read_error else 'no')
         stubs = '\n'.join(f'{name}() {{ echo STEP:{name}; }}' for name in STEPS if name != 'configure_ufw')
         call = call_override or ('part2_setup' if part2 else 'configure_ufw')
-        prelude += '\nSTATUS_COUNT=$(mktemp)\ntrap \'rm -f "$STATUS_COUNT"\' EXIT\n'
+        prelude += '\nSTATUS_COUNT=$(mktemp)\ntrap \'rm -f "$STATUS_COUNT" "$STATUS_COUNT.allowed"\' EXIT\n'
         if not pipefail:
             prelude += 'set +o pipefail\n'
         if missing_ufw:
@@ -80,13 +82,13 @@ ufw() {
 
     def mutations(self, result):
         return [line[4:] for line in result.stderr.splitlines()
-                if line.startswith('CMD:') and line != 'CMD:status']
+                if line.startswith('CMD:') and not line.startswith('CMD:status')]
 
     def test_active_ensures_only_ssh(self):
         result = self.run_ufw(active=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.mutations(result), [COMMANDS[2]])
-        self.assertIn('OK: UFW разрешает 5829/tcp', result.stdout)
+        self.assertNotIn('ERROR:', result.stdout)
         self.assertNotIn(SUCCESS, result.stdout)
 
     def test_active_ssh_failure(self):

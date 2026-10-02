@@ -1129,7 +1129,7 @@ configure_swap() {
 
   local ram desired_bytes desired_human active_output
   local own_bytes=0 foreign_count=0
-  local source size_bytes type answer
+  local source size_bytes type answer page_size expected_bytes
 
   # Проверяем, что SWAP_SIZE задан в формате, который понимает fallocate.
   if ! [[ "$SWAP_SIZE" =~ ^[1-9][0-9]*([KMGTP]i?B?|[KMGTP])?$ ]]; then
@@ -1139,18 +1139,24 @@ configure_swap() {
 
   # Переводим SWAP_SIZE в байты без зависимости от numfmt.
   swap_size_to_bytes() {
-    local value="$1" number suffix multiplier
+    local value="$1" number suffix multiplier exponent radix=1024
     number="${value%%[KMGTPiB]*}"
     suffix="${value#$number}"
     case "${suffix^^}" in
-      ""|B) multiplier=1 ;;
-      K|KB|KI|KIB) multiplier=1024 ;;
-      M|MB|MI|MIB) multiplier=1048576 ;;
-      G|GB|GI|GIB) multiplier=1073741824 ;;
-      T|TB|TI|TIB) multiplier=1099511627776 ;;
-      P|PB|PI|PIB) multiplier=1125899906842624 ;;
+      "") exponent=0 ;;
+      K|KB|KI|KIB) exponent=1 ;;
+      M|MB|MI|MIB) exponent=2 ;;
+      G|GB|GI|GIB) exponent=3 ;;
+      T|TB|TI|TIB) exponent=4 ;;
+      P|PB|PI|PIB) exponent=5 ;;
       *) return 1 ;;
     esac
+    [[ "$suffix" != [KMGTP]B ]] || radix=1000
+    multiplier=$((radix ** exponent))
+    # Check before Bash signed arithmetic; never permit wraparound.
+    [ "${#number}" -le 19 ] || return 1
+    if [ "${#number}" -eq 19 ] && [[ "$number" > 9223372036854775807 ]]; then return 1; fi
+    [ "$number" -le "$((9223372036854775807 / multiplier))" ] || return 1
     printf '%s\n' "$((number * multiplier))"
   }
 
@@ -1159,6 +1165,27 @@ configure_swap() {
     return 1
   }
   desired_human="$SWAP_SIZE"
+  page_size=$(getconf PAGESIZE) || { error "Не удалось определить размер страницы"; return 1; }
+  [[ "$page_size" =~ ^[1-9][0-9]{0,6}$ ]] || { error "Некорректный размер страницы"; return 1; }
+  # mkswap discards the last incomplete page and reserves one header page.
+  expected_bytes=$(((desired_bytes / page_size - 1) * page_size))
+  [ "$expected_bytes" -gt 0 ] || { error "SWAP_SIZE слишком мал для swap"; return 1; }
+
+  swap_read_owned() {
+    local listing row_source row_size row_type extra found=0 bytes=0
+    listing=$(swapon --show=NAME,SIZE,TYPE --bytes --noheadings) || return 1
+    while read -r row_source row_size row_type extra; do
+      [ -n "$row_source" ] || continue
+      [[ "$row_size" =~ ^[1-9][0-9]{0,18}$ ]] &&
+        { [ "${#row_size}" -lt 19 ] || [[ "$row_size" < 9223372036854775808 ]]; } &&
+        [[ "$row_type" = file || "$row_type" = partition ]] && [ -z "$extra" ] || return 1
+      if [ "$row_source" = /swapfile ]; then
+        [ "$found" -eq 0 ] && [ "$row_type" = file ] || return 1
+        found=1; bytes="$row_size"
+      fi
+    done <<< "$listing"
+    printf '%s\n' "$bytes"
+  }
 
   # Ошибка чтения списка не означает отсутствие swap: ничего не меняем.
   if ! active_output=$(swapon --show=NAME,SIZE,TYPE --bytes --noheadings); then
@@ -1167,11 +1194,14 @@ configure_swap() {
   fi
   while read -r source size_bytes type; do
     [ -n "$source" ] || continue
-    if ! [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
+    if ! [[ "$size_bytes" =~ ^[1-9][0-9]{0,18}$ ]] ||
+       { [ "${#size_bytes}" -eq 19 ] && [[ "$size_bytes" > 9223372036854775807 ]]; } ||
+       [[ "$type" != file && "$type" != partition ]]; then
       error "Не удалось разобрать размер swap: $source; swap не изменён"
       return 1
     fi
     if [ "$source" = /swapfile ]; then
+      [ "$own_bytes" -eq 0 ] && [ "$type" = file ] || { error "Неоднозначный /swapfile"; return 1; }
       own_bytes="$size_bytes"
     else
       foreign_count=$((foreign_count + 1))
@@ -1180,12 +1210,10 @@ configure_swap() {
   done <<< "$active_output"
 
   if [ "$own_bytes" -gt 0 ]; then
-    # mkswap резервирует одну страницу под заголовок.
-    local page_size
-    page_size=$(getconf PAGESIZE 2>/dev/null || echo 4096)
-    [[ "$page_size" =~ ^[1-9][0-9]*$ ]] || page_size=4096
-    if [ "$own_bytes" -le "$desired_bytes" ] &&
-       [ "$((desired_bytes - own_bytes))" -le "$page_size" ]; then
+    if [ -L /swapfile ] || [ ! -f /swapfile ]; then
+      error "Активный /swapfile не является обычным файлом"; return 1
+    fi
+    if [ "$own_bytes" -eq "$expected_bytes" ]; then
       persist_swap || return 1
       ok "Размер /swapfile соответствует $desired_human; запись /etc/fstab проверена"
       return 0
@@ -1224,47 +1252,82 @@ configure_swap() {
     error "/swapfile существует, но это не обычный файл — отказываюсь его изменять"
     return 1
   fi
-  if [ "$own_bytes" -gt 0 ] && ! swapoff /swapfile; then
-    error "Не удалось отключить /swapfile"
-    return 1
-  fi
-  [ ! -f /swapfile ] || rm -f -- /swapfile || {
-    error "Не удалось удалить старый /swapfile"
-    return 1
-  }
-
-  # Создаём новый swap-файл. fallocate быстрее; dd — запасной вариант для FS,
-  # где fallocate создаёт неподходящий файл.
-  if ! fallocate -l "$SWAP_SIZE" /swapfile; then
-    local count_mb=$((desired_bytes / 1048576))
-    if [ "$count_mb" -lt 1 ]; then count_mb=1; fi
-    if ! dd if=/dev/zero of=/swapfile bs=1M count="$count_mb" status=progress; then
-      error "Не удалось создать /swapfile"
-      rm -f /swapfile
-      return 1
+  # Prepare on the same filesystem while the old swap is still available.
+  local staged backup='' old_moved=false new_moved=false runtime_bytes file_bytes
+  staged=$(mktemp /swapfile.new.XXXXXX) || { error "Не удалось подготовить swap"; return 1; }
+  if ! fallocate -l "$desired_bytes" "$staged"; then
+    # GNU dd counts bytes exactly, including a final partial block.
+    if ! dd if=/dev/zero of="$staged" bs=1M count="$desired_bytes" iflag=count_bytes status=progress; then
+      error "Не удалось создать swap"; rm -f -- "$staged" || return 1; return 1
     fi
   fi
-
-  chmod 600 /swapfile || { error "Не удалось установить права 600 на /swapfile"; return 1; }
-  if ! mkswap /swapfile >/dev/null; then
-    error "mkswap завершился с ошибкой"
-    rm -f /swapfile
-    return 1
+  file_bytes=$(stat -c %s -- "$staged") || file_bytes=''
+  if [ "$file_bytes" != "$desired_bytes" ] || ! chmod 600 "$staged" || ! mkswap "$staged" >/dev/null; then
+    error "Не удалось подготовить swap точного размера"
+    rm -f -- "$staged" || return 1; return 1
   fi
+  if [ -f /swapfile ]; then
+    backup=$(mktemp /swapfile.old.XXXXXX) || { rm -f -- "$staged" || return 1; return 1; }
+  fi
+
+  swap_recover() {
+    # Never unlink/rename a possibly active replacement after a failed probe.
+    if [ "$new_moved" = true ]; then
+      runtime_bytes=$(swap_read_owned) || { error "FATAL: runtime swap неизвестен; сохранены /swapfile и $backup"; return 1; }
+      if [ "$runtime_bytes" -gt 0 ]; then
+        swapoff /swapfile || { error "FATAL: replacement не отключён; сохранён $backup"; return 1; }
+        runtime_bytes=$(swap_read_owned) && [ "$runtime_bytes" -eq 0 ] || {
+          error "FATAL: отключение replacement не подтверждено; сохранён $backup"; return 1;
+        }
+      fi
+      rm -f -- /swapfile || { error "FATAL: не удалось убрать replacement; сохранён $backup"; return 1; }
+    fi
+    if [ "$old_moved" = true ]; then
+      mv -T -- "$backup" /swapfile || { error "FATAL: восстановите /swapfile из $backup"; return 1; }
+      backup=''
+    fi
+    if [ "$own_bytes" -gt 0 ]; then
+      runtime_bytes=$(swap_read_owned) || { error "FATAL: не удалось проверить старый swap"; return 1; }
+      if [ "$runtime_bytes" -eq 0 ]; then
+        swapon /swapfile || { error "FATAL: старый /swapfile сохранён, но не активирован"; return 1; }
+      fi
+      runtime_bytes=$(swap_read_owned) && [ "$runtime_bytes" -eq "$own_bytes" ] || {
+        error "FATAL: восстановление старого runtime swap не подтверждено"; return 1;
+      }
+    fi
+    rm -f -- "$staged" ${backup:+"$backup"} || { error "Не удалось очистить swap scratch files"; return 1; }
+  }
+
+  if [ "$own_bytes" -gt 0 ] && ! swapoff /swapfile; then
+    error "Не удалось отключить /swapfile"; swap_recover || return 1; return 1
+  fi
+  runtime_bytes=$(swap_read_owned) || { error "Runtime swap неизвестен; сохранены /swapfile и $staged"; return 1; }
+  if [ "$runtime_bytes" -ne 0 ]; then
+    error "Отключение /swapfile не подтверждено"; swap_recover || return 1; return 1
+  fi
+  if [ -n "$backup" ]; then
+    if ! mv -T -- /swapfile "$backup"; then
+      error "Не удалось сохранить старый swap"; swap_recover || return 1; return 1
+    fi
+    old_moved=true
+  fi
+  if ! mv -T -- "$staged" /swapfile; then
+    error "Не удалось установить replacement"; swap_recover || return 1; return 1
+  fi
+  new_moved=true
   if ! swapon /swapfile; then
-    error "swapon завершился с ошибкой"
-    rm -f /swapfile
-    return 1
+    error "swapon завершился с ошибкой"; swap_recover || return 1; return 1
   fi
-
+  runtime_bytes=$(swap_read_owned) || { error "FATAL: активация не проверена; сохранены /swapfile и $backup"; return 1; }
+  if [ "$runtime_bytes" -ne "$expected_bytes" ]; then
+    error "Swap активирован с неверным размером"; swap_recover || return 1; return 1
+  fi
+  # Persistence errors retain the verified active swap; the next run repairs fstab.
+  if [ -n "$backup" ]; then
+    rm -f -- "$backup" || { error "Не удалось очистить старый swap $backup"; return 1; }
+  fi
   persist_swap || return 1
-
-  if swapon --show=NAME,SIZE --bytes --noheadings 2>/dev/null | awk '$1 == "/swapfile" && $2 > 0 {found=1} END {exit !found}'; then
-    ok "Swap $desired_human создан и активирован"
-  else
-    error "Swap создан, но проверка активации не пройдена"
-    return 1
-  fi
+  ok "Swap $desired_human создан и активирован"
   return 0
 }
 

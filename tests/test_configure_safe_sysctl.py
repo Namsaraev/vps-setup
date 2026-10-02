@@ -8,7 +8,7 @@ import unittest
 
 from test_part2_error_propagation import PART2, STEPS
 
-SOURCE = Path(os.environ.get('F20_AUDIT_SOURCE', Path(__file__).resolve().parents[1] / 'tunevps.sh')).read_text(encoding='utf-8')
+SOURCE = Path(os.environ.get('BUNDLE_AUDIT_SOURCE', os.environ.get('F20_AUDIT_SOURCE', Path(__file__).resolve().parents[1] / 'tunevps.sh'))).read_text(encoding='utf-8')
 FUNCTION = 'configure_safe_sysctl() {' + SOURCE.split('configure_safe_sysctl() {', 1)[1].split('\n# Глобальный лимит', 1)[0]
 SUCCESS = 'Безопасные sysctl применены'
 BASE = '''# Совместимо с VPN, policy routing, туннелями и proxy.
@@ -33,7 +33,7 @@ FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureSafeSysctlTest(unittest.TestCase):
-    def run_setup(self, failure='', mode='module', part2=False, repeat=False, errexit=False, probe='ok', config=None, seed=False):
+    def run_setup(self, failure='', mode='module', part2=False, repeat=False, errexit=False, probe='ok', config=None, seed=False, extra=''):
         with tempfile.TemporaryDirectory(prefix='sysctl test ') as tmp:
             root = Path(tmp)
             targets = {'modules': root / 'modules-load.d/tcp_bbr.conf',
@@ -98,6 +98,7 @@ sysctl() {
       echo apply >> "$ROOT/calls"
       [ -s "$ROOT/sysctl.d/99-vps-tuning.conf" ] || return 97
       [ "$FAILURE" != apply ] || return 23 ;;
+    -n*) awk -v key="$2" '$1 == key {print $3}' "$ROOT/sysctl.d/99-vps-tuning.conf" ;;
     *) return 98 ;;
   esac
 }
@@ -138,7 +139,7 @@ rm() {
             function = FUNCTION.replace('/etc/', '"$ROOT"/').replace('/boot/config-$kernel_release', '$ROOT/kernel-config')
             self.assertNotIn('/etc/', function)
             call = 'part2_setup' if part2 else 'configure_safe_sysctl'
-            script = prelude + '\n' + function + '\n' + PART2 + '\n'
+            script = prelude + '\n' + extra + '\n' + function + '\n' + PART2 + '\n'
             script += 'set -e\n' if errexit else ''
             script += f'{call} || exit $?\n'
             if repeat:
@@ -188,7 +189,7 @@ rm() {
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(configs['sysctl'], BASE.format(bbr='' if mode == 'unavailable' else BBR))
                     self.assertEqual(configs['modules'], 'tcp_bbr\n' if mode == 'module' else None)
-                    self.assertEqual(configs['limits'], '* soft nofile 524288\n* hard nofile 1048576\nroot soft nofile 524288\nroot hard nofile 1048576\n')
+                    self.assertEqual(configs['limits'], '* soft nofile 1024\n* hard nofile 1048576\nroot soft nofile 1024\nroot hard nofile 1048576\n')
                     self.assertEqual(calls.count('apply'), 1 + repeat)
                     self.assertEqual(calls.count('modprobe'), int(mode == 'module'))
                     self.assertEqual(result.stdout.count(SUCCESS), 1 + repeat)

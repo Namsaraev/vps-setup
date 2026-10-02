@@ -8,7 +8,7 @@ import unittest
 
 from test_part2_error_propagation import PART2, STEPS
 
-SOURCE = (Path(__file__).resolve().parents[1] / "tunevps.sh").read_text(encoding="utf-8")
+SOURCE = Path(os.environ.get("BUNDLE_AUDIT_SOURCE", Path(__file__).resolve().parents[1] / "tunevps.sh")).read_text(encoding="utf-8")
 FUNCTION = "configure_unattended_upgrades() {" + SOURCE.split(
     "configure_unattended_upgrades() {", 1)[1].split("\nconfigure_autoremove()", 1)[0]
 TIMERS = ["apt-daily.timer", "apt-daily-upgrade.timer"]
@@ -23,7 +23,7 @@ FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureUnattendedUpgradesTest(unittest.TestCase):
-    def run_setup(self, failure="", failed_timers=(), enabled=(), part2=False, errexit=False):
+    def run_setup(self, failure="", failed_timers=(), enabled=(), part2=False, errexit=False, extra=""):
         with tempfile.TemporaryDirectory(prefix="unattended test ") as tmp:
             root = Path(tmp)
             target = root / "apt.conf.d/20auto-upgrades"
@@ -31,6 +31,15 @@ class ConfigureUnattendedUpgradesTest(unittest.TestCase):
                 target.mkdir(parents=True)  # Opening a directory for writing must fail.
             prelude = r'''
 set -o pipefail
+
+apt-config() {
+  [ "$1" != dump ] || return 0
+  case "$3" in
+    *AutocleanInterval) echo "value='7'" ;;
+    *Remove-*) echo "value='false'" ;;
+    *) echo "value='1'" ;;
+  esac
+}
 section() { :; }
 ok() { echo "OK: $*"; }
 warn() { echo "WARN: $*"; }
@@ -49,8 +58,9 @@ cat() {
 systemctl() {
   printf '%s\n' "$*" >> "$CALLS"
   case "$1" in
-    is-enabled) [[ " $ENABLED " = *" $2 "* ]] ;;
+    is-enabled) if [[ " $ENABLED " = *" $2 "* ]]; then echo enabled; else echo disabled; return 1; fi ;;
     enable) [[ " $FAILED_TIMERS " != *" $2 "* ]] ;;
+    show) printf '%s\n' LoadState=loaded UnitFileState=enabled ActiveState=active SubState=waiting 'NextElapseUSecRealtime=Sat 2026-10-03 01:51:55 UTC' NextElapseUSecMonotonic=0 NeedDaemonReload=no ;;
     *) return 98 ;;
   esac
 }
@@ -64,7 +74,7 @@ systemctl() {
                        ENABLED=" ".join(enabled), CONFIG_DIR=(root / "apt.conf.d").as_posix(),
                        CALLS=(root / "calls").as_posix())
             result = subprocess.run([os.environ.get("BASH", "bash")],
-                input=prelude + "\n" + function + "\n" + PART2 + "\n"
+                input=prelude + "\n" + extra + "\n" + function + "\n" + PART2 + "\n"
                       + ("set -e\n" if errexit else "") + f"{call} || exit $?\n",
                 env=env, text=True, encoding="utf-8", capture_output=True, timeout=10)
             calls = (root / "calls").read_text().splitlines() if (root / "calls").exists() else []
@@ -103,7 +113,7 @@ systemctl() {
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(config, CONFIG)
         self.assertEqual(calls, [f"{action} {timer}" for timer in TIMERS
-                                 for action in ("is-enabled", "enable")])
+                                 for action in ("is-enabled", "enable")] + [f"show {timer} -p LoadState -p UnitFileState -p ActiveState -p SubState -p NextElapseUSecRealtime -p NextElapseUSecMonotonic -p NeedDaemonReload" for timer in TIMERS])
         self.assertIn(SUCCESS, result.stdout)
         self.assertNotIn("WARN:", result.stdout)
 
@@ -111,7 +121,7 @@ systemctl() {
         result, calls, config = self.run_setup(enabled=TIMERS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(config, CONFIG)
-        self.assertEqual(calls, [f"is-enabled {timer}" for timer in TIMERS])
+        self.assertEqual(calls, [f"is-enabled {timer}" for timer in TIMERS] + [f"show {timer} -p LoadState -p UnitFileState -p ActiveState -p SubState -p NextElapseUSecRealtime -p NextElapseUSecMonotonic -p NeedDaemonReload" for timer in TIMERS])
         self.assertIn(SUCCESS, result.stdout)
 
     def check_timer_failures(self, failed):
@@ -123,7 +133,7 @@ systemctl() {
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(config, CONFIG)
                     self.assertEqual(calls, [f"{action} {timer}" for timer in TIMERS
-                                             for action in ("is-enabled", "enable")])
+                                             for action in ("is-enabled", "enable")] + [f"show {timer} -p LoadState -p UnitFileState -p ActiveState -p SubState -p NextElapseUSecRealtime -p NextElapseUSecMonotonic -p NeedDaemonReload" for timer in TIMERS])
                     for timer in TIMERS:
                         self.assertEqual(f"WARN: Не удалось включить {timer}" in result.stdout,
                                          timer in failed)

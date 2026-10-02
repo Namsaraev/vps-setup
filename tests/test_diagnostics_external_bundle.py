@@ -309,7 +309,7 @@ ask_password prompt password
         for fail_at in (1, 2):
             # Counter is a file because the probe runs in command substitution.
             r = self.run_shell(body + f'''
-modinfo() {{ return 1; }}
+modinfo() {{ echo '(builtin)'; }}
 sysctl() {{
   local count=0
   [ ! -f count ] || read -r count < count

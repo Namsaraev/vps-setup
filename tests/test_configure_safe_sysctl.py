@@ -8,7 +8,7 @@ import unittest
 
 from test_part2_error_propagation import PART2, STEPS
 
-SOURCE = (Path(__file__).resolve().parents[1] / 'tunevps.sh').read_text(encoding='utf-8')
+SOURCE = Path(os.environ.get('F20_AUDIT_SOURCE', Path(__file__).resolve().parents[1] / 'tunevps.sh')).read_text(encoding='utf-8')
 FUNCTION = 'configure_safe_sysctl() {' + SOURCE.split('configure_safe_sysctl() {', 1)[1].split('\n# Глобальный лимит', 1)[0]
 SUCCESS = 'Безопасные sysctl применены'
 BASE = '''# Совместимо с VPN, policy routing, туннелями и proxy.
@@ -33,7 +33,7 @@ FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureSafeSysctlTest(unittest.TestCase):
-    def run_setup(self, failure='', mode='module', part2=False, repeat=False, errexit=False):
+    def run_setup(self, failure='', mode='module', part2=False, repeat=False, errexit=False, probe='ok', config=None, seed=False):
         with tempfile.TemporaryDirectory(prefix='sysctl test ') as tmp:
             root = Path(tmp)
             targets = {'modules': root / 'modules-load.d/tcp_bbr.conf',
@@ -42,12 +42,21 @@ class ConfigureSafeSysctlTest(unittest.TestCase):
             # Start with absent directories except where an open failure needs a directory target.
             if failure.startswith('open-'):
                 targets[failure[5:]].mkdir(parents=True)
+            if seed:
+                for target in targets.values():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text('old configuration\n')
             neighbor = root / 'unrelated.conf'
             neighbor.write_text('untouched\n')
             stamp = neighbor.stat().st_mtime_ns
             if mode == 'unavailable' or failure == 'remove':
                 targets['modules'].parent.mkdir(exist_ok=True)
                 targets['modules'].write_text('tcp_bbr\n')
+            if config is None:
+                config = {'module': 'CONFIG_TCP_CONG_BBR=m', 'builtin': 'CONFIG_TCP_CONG_BBR=y',
+                          'unavailable': '# CONFIG_TCP_CONG_BBR is not set'}[mode]
+            if failure == 'remove': config = '# CONFIG_TCP_CONG_BBR is not set'
+            (root / 'kernel-config').write_text(config + '\n')
             prelude = r'''
 set -o pipefail
 section() { :; }
@@ -56,15 +65,30 @@ ok() { echo "OK: $*"; }
 warn() { echo "WARN: $*"; }
 error() { echo "ERROR: $*" >&2; }
 command() {
+  if [ "$*" = '-v modinfo' ] && [ "$PROBE" = missing ]; then return 1; fi
   if [ "$*" = '-v modprobe' ] && [ "$FAILURE" = missing-modprobe ]; then return 1; fi
   builtin command "$@"
 }
-modinfo() { [ "$MODE" = module ] && [ "$FAILURE" != remove ]; }
+uname() { echo fixture; [ "$PROBE" != uname-fail ]; }
+modinfo() {
+  [ "$*" = '-F filename tcp_bbr' ] || return 98
+  [ "$PROBE" != builtin-info ] || { echo '(builtin)'; return 0; }
+  [ "$PROBE" != malformed ] || { echo invalid; return 0; }
+  [ "$PROBE" != empty ] || return 0
+  [ "$PROBE" != partial ] || { echo /fake/tcp_bbr.ko; return 23; }
+  [ "$PROBE" = ok ] && [ "$MODE" = module ] && [ "$FAILURE" != remove ] || return 23
+  echo /fake/tcp_bbr.ko
+}
 modprobe() {
+  if [ "$*" = '--dry-run tcp_bbr' ]; then
+    echo dry-run >> "$ROOT/calls"
+    [ "$FAILURE" != dry-run ]
+    return $?
+  fi
   echo modprobe >> "$ROOT/calls"
   [ "$*" = tcp_bbr ] || return 98
   [ "$FAILURE" != modprobe ] || return 23
-  LOADED=true
+  [ "$FAILURE" = no-algorithm ] || LOADED=true
 }
 sysctl() {
   case "$*" in
@@ -95,6 +119,12 @@ printf() {
   builtin printf "$@"
 }
 cat() {
+  if [ "$*" = "$ROOT/kernel-config" ]; then
+    [ "$PROBE" != config-fail ] || return 23
+    builtin command cat "$@"
+    [ "$PROBE" != config-partial ]
+    return $?
+  fi
   [ "$FAILURE" != "write-$AREA" ] || return 23
   if [ "$FAILURE" = "partial-$AREA" ]; then builtin printf 'partial\n'; return 23; fi
   builtin command cat "$@"
@@ -105,7 +135,7 @@ rm() {
 }
 '''
             prelude += '\n'.join(f'{step}() {{ echo STEP:{step}; }}' for step in STEPS if step != 'configure_safe_sysctl')
-            function = FUNCTION.replace('/etc/', '"$ROOT"/')
+            function = FUNCTION.replace('/etc/', '"$ROOT"/').replace('/boot/config-$kernel_release', '$ROOT/kernel-config')
             self.assertNotIn('/etc/', function)
             call = 'part2_setup' if part2 else 'configure_safe_sysctl'
             script = prelude + '\n' + function + '\n' + PART2 + '\n'
@@ -115,13 +145,14 @@ rm() {
                 script += 'builtin command cp "$ROOT/sysctl.d/99-vps-tuning.conf" "$ROOT/first"\n'
                 script += f'{call} || exit $?\n'
             result = subprocess.run([os.environ.get('BASH', 'bash')], input=script,
-                                    env=dict(os.environ, ROOT=root.as_posix(), MODE=mode, FAILURE=failure),
+                                    env=dict(os.environ, ROOT=root.as_posix(), MODE=mode, FAILURE=failure, PROBE=probe),
                                     text=True, encoding='utf-8', capture_output=True, timeout=10)
             configs = {k: p.read_text(encoding='utf-8') if p.is_file() else None for k, p in targets.items()}
             calls = (root / 'calls').read_text(encoding='utf-8').splitlines() if (root / 'calls').exists() else []
             self.assertEqual(neighbor.read_text(encoding='utf-8'), 'untouched\n')
             self.assertEqual(neighbor.stat().st_mtime_ns, stamp)
             if repeat:
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual((root / 'first').read_text(encoding='utf-8'), configs['sysctl'])
             return result, configs, calls
 

@@ -26,6 +26,15 @@ BLOCK = (b'# >>> tunevps managed block >>>\n'
 FUNCTION = HELPER + "\n" + FUNCTION
 
 
+ENTRYPOINTS = (
+    ".oh-my-zsh/oh-my-zsh.sh",
+    ".oh-my-zsh/custom/themes/powerlevel10k/powerlevel10k.zsh-theme",
+    ".oh-my-zsh/custom/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh",
+    ".oh-my-zsh/custom/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh",
+    ".oh-my-zsh/custom/plugins/zsh-completions/src/_fixture",
+)
+
+
 class ConfigureShellTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="tunevps test ")
@@ -37,6 +46,11 @@ class ConfigureShellTest(unittest.TestCase):
         for name in ("themes/powerlevel10k", "plugins/zsh-autosuggestions",
                      "plugins/zsh-syntax-highlighting", "plugins/zsh-completions"):
             (custom / name).mkdir(parents=True)
+
+        for name in ENTRYPOINTS:
+            path = self.home / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# valid fixture\n: \n")
 
     def run_shell(self, success=True, failure="", part2=False):
         # Only external/system operations are replaced. mkdir, tee and Python
@@ -56,6 +70,16 @@ git() {
   echo "CALL:clone:${destination##*/}"
   [ "$FAILURE" != "${destination##*/}" ] || return 23
   mkdir -p "$destination"
+  local entry
+  case "${destination##*/}" in
+    .oh-my-zsh) entry=oh-my-zsh.sh;;
+    powerlevel10k) entry=powerlevel10k.zsh-theme;;
+    zsh-autosuggestions) entry=zsh-autosuggestions.zsh;;
+    zsh-syntax-highlighting) entry=zsh-syntax-highlighting.zsh;;
+    zsh-completions) mkdir -p "$destination/src"; entry=src/_fixture;;
+  esac
+  printf '# fixture\n: \n' > "$destination/$entry"
+  [ "$FAILURE" != empty-clone ] || : > "$destination/$entry"
 }
 as_current_user() {
   echo "CALL:$1" >&2
@@ -109,18 +133,23 @@ as_current_user() {
             for part2 in (False, True):
                 with self.subTest(failure=failure, part2=part2):
                     shutil.rmtree(self.home / ".oh-my-zsh", ignore_errors=True)
+                    shutil.rmtree(self.managed.parent, ignore_errors=True)
                     self.rc.write_bytes(b"# user data\n")
                     result = self.run_shell(success=False, failure=failure, part2=part2)
                     self.assertEqual(result.returncode, 1)
-                    self.assertNotIn("CALL:mkdir", result.stderr)
+                    if failure != "chsh":
+                        self.assertNotIn("CALL:mkdir", result.stderr)
+                        self.assertNotIn("CALL:chsh:", result.stdout)
                     self.assertNotIn("STEP:final_check", result.stdout)
-                    self.assertFalse(self.managed.exists())
-                    self.assertEqual(self.rc.read_bytes(), b"# user data\n")
+                    if failure != "chsh":
+                        self.assertFalse(self.managed.exists())
+                    if failure != "chsh":
+                        self.assertEqual(self.rc.read_bytes(), b"# user data\n")
                     clones = [line for line in result.stdout.splitlines()
                               if line.startswith("CALL:clone:")]
                     expected = [".oh-my-zsh", "powerlevel10k", "zsh-autosuggestions",
                                 "zsh-syntax-highlighting", "zsh-completions"]
-                    count = 0 if failure == "chsh" else expected.index(failure) + 1
+                    count = 5 if failure == "chsh" else expected.index(failure) + 1
                     self.assertEqual(clones, ["CALL:clone:" + x for x in expected[:count]])
 
     def test_config_failures_stop_and_propagate(self):

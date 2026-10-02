@@ -301,7 +301,13 @@ ask_password prompt password
                          'bash -n tunevps.sh', 'git diff --check', 'fetch-depth: 0'):
             self.assertIn(expected, workflow)
         self.assertNotIn('paths:', workflow)
-        self.assertNotIn('sudo ', workflow)
+        # Native zsh fixtures need a CI-only dependency. No privileged script run.
+        self.assertEqual([line.strip() for line in workflow.splitlines() if 'sudo ' in line], [
+            'sudo apt-get update -o APT::Update::Error-Mode=any',
+            'sudo apt-get install -y zsh',
+        ])
+        self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}', workflow)
+        self.assertEqual(workflow.count('test -z "$(git status --porcelain)"'), 2)
         self.assertNotIn('HEAD^', workflow)
 
     def test_bbr_availability_failure_preserves_persistence(self):

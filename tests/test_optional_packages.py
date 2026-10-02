@@ -108,7 +108,7 @@ exec 3>&1
         self.assert_success(result)
         operations = [line for line in result.stdout.splitlines()
                       if line.startswith(("APT:", "PROBE:", "LINK:"))]
-        self.assertEqual(operations[0], "APT:update")
+        self.assertEqual(operations[0], "APT:update -o APT::Update::Error-Mode=any")
         self.assertTrue(operations[1].startswith("APT:install -y nano git curl "))
         self.assertEqual(operations[2:], [
             "APT:install -y rng-tools5", "PROBE:show eza", "APT:install -y eza",

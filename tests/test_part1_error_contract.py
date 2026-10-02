@@ -200,8 +200,8 @@ class Part1ErrorContractTest(unittest.TestCase):
         r = self.run_case('IS_MINIMIZED=true; reply=""; reboot_reply=""')
         self.assertEqual(r.returncode, 0, r.stderr)
         actions = [x for x in r.stdout.splitlines() if x.startswith(('APT:', 'UNMINIMIZE', 'SLEEP:', 'REBOOT'))]
-        self.assertEqual(actions, ['APT:update', 'APT:install -y unminimize', 'UNMINIMIZE',
-                                  'APT:update', 'APT:full-upgrade -y', 'SLEEP:5', 'REBOOT'])
+        self.assertEqual(actions, ['APT:update -o APT::Update::Error-Mode=any', 'APT:install -y unminimize', 'UNMINIMIZE',
+                                  'APT:update -o APT::Update::Error-Mode=any', 'APT:full-upgrade -y', 'SLEEP:5', 'REBOOT'])
 
     def test_existing_unminimize_skips_install(self):
         r = self.run_case('IS_MINIMIZED=true; reply=y; available=true')

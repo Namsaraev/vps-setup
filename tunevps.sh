@@ -1019,8 +1019,36 @@ configure_safe_sysctl() {
   local bbr_available=false
   local bbr_module=false
 
-  if command -v modinfo >/dev/null 2>&1 && modinfo tcp_bbr >/dev/null 2>&1; then
-    bbr_module=true
+  local module_file kernel_release kernel_config bbr_config='' config_line config_count=0
+  # modinfo failure does not prove absence (missing tool/metadata/read errors).
+  if command -v modinfo >/dev/null 2>&1 &&
+     module_file=$(modinfo -F filename tcp_bbr) &&
+     [[ "$module_file" = '(builtin)' || "$module_file" = /*.ko || "$module_file" = /*.ko.gz || "$module_file" = /*.ko.xz || "$module_file" = /*.ko.zst ]]; then
+    if [ "$module_file" != '(builtin)' ]; then bbr_module=true; fi
+  else
+    module_file=''
+    # Only an explicit setting from the running kernel can authorize fallback.
+    kernel_release=$(uname -r) && [ -n "$kernel_release" ] || {
+      error "Не удалось определить ядро для проверки BBR"; return 1;
+    }
+    kernel_config=$(cat "/boot/config-$kernel_release") || {
+      error "modinfo не определил tcp_bbr; конфигурация текущего ядра недоступна"; return 1;
+    }
+    while IFS= read -r config_line; do
+      case "$config_line" in
+        CONFIG_TCP_CONG_BBR=*|'# CONFIG_TCP_CONG_BBR is not set')
+          bbr_config="$config_line"; config_count=$((config_count + 1)) ;;
+      esac
+    done <<< "$kernel_config"
+    [ "$config_count" -eq 1 ] || {
+      error "Неоднозначная конфигурация BBR; файлы не изменены"; return 1;
+    }
+    case "$bbr_config" in
+      CONFIG_TCP_CONG_BBR=m) bbr_module=true ;;
+      CONFIG_TCP_CONG_BBR=y) ;;
+      '# CONFIG_TCP_CONG_BBR is not set') ;;
+      *) error "Некорректная конфигурация BBR; файлы не изменены"; return 1 ;;
+    esac
   fi
 
   if ! available_algorithms=$(sysctl -n net.ipv4.tcp_available_congestion_control) || [ -z "$available_algorithms" ]; then
@@ -1031,6 +1059,9 @@ configure_safe_sysctl() {
     if [ "$bbr_module" = true ]; then
       # Отсутствие модуля допустимо; сбой загрузки уже найденного модуля — ошибка.
       command -v modprobe >/dev/null 2>&1 || { error "tcp_bbr найден, но modprobe недоступен"; return 1; }
+      if ! modprobe --dry-run tcp_bbr; then
+        error "Не удалось проверить загрузку tcp_bbr"; return 1
+      fi
       info "BBR найден как модуль tcp_bbr, загружаем его"
       if modprobe tcp_bbr 2>/dev/null; then
         ok "Модуль tcp_bbr загружен"
@@ -1044,6 +1075,10 @@ configure_safe_sysctl() {
   if ! available_algorithms=$(sysctl -n net.ipv4.tcp_available_congestion_control) || [ -z "$available_algorithms" ]; then
     error "Не удалось прочитать доступные алгоритмы контроля перегрузки"
     return 1
+  fi
+  if [[ ! "$available_algorithms" =~ (^|[[:space:]])bbr($|[[:space:]]) ]] &&
+     { [ "$bbr_module" = true ] || [ "${module_file:-}" = '(builtin)' ] || [ "$bbr_config" = CONFIG_TCP_CONG_BBR=y ]; }; then
+    error "BBR заявлен ядром, но алгоритм недоступен после проверки/загрузки"; return 1
   fi
   if [[ "$available_algorithms" =~ (^|[[:space:]])bbr($|[[:space:]]) ]]; then
     bbr_available=true

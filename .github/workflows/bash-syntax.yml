@@ -35,5 +35,9 @@ jobs:
           else
             git diff --check "$(git hash-object -w -t tree /dev/null)" HEAD
           fi
+      - name: Install native shell fixture dependency
+        run: |
+          sudo apt-get update -o APT::Update::Error-Mode=any
+          sudo apt-get install -y zsh
       - name: Isolated unit tests
         run: python3 -m unittest discover -s tests -v

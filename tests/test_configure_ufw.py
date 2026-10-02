@@ -19,7 +19,8 @@ class ConfigureUfwTest(unittest.TestCase):
     def run_ufw(self, active=False, failure='', refuse=False, missing_rule=False,
                 part2=False, errexit=False, action='', ask_failure='',
                 source_ip='192.0.2.1', call_override='', status_failure_at=0,
-                pipefail=True, repeat=False, missing_ufw=False, read_error=False):
+                pipefail=True, repeat=False, missing_ufw=False, read_error=False,
+                pending='(None)', enable_state='active'):
         prelude = '''
 set -o pipefail
 SSH_PORT=5829
@@ -48,6 +49,11 @@ yes_by_default() { [[ "$1" != n ]]; }
 ufw() {
   echo "CMD:$*" >&2
   if [[ "$*" == "$FAILURE" ]]; then return 23; fi
+  if [[ "$*" == 'show added' ]]; then
+    printf '%s\n' "Added user rules (see 'ufw status' for running firewall):" "$PENDING"
+    return 0
+  fi
+  if [[ "$*" == '--force enable' ]]; then STATE="$ENABLE_STATE"; fi
   if [[ "$1" == status ]]; then
     local count=0
     if [[ -f "$STATUS_COUNT" ]]; then read -r count < "$STATUS_COUNT"; fi
@@ -65,7 +71,8 @@ ufw() {
         env = dict(os.environ, STATE='active' if active else 'inactive', FAILURE=failure,
                    ANSWER='n' if refuse else '', MISSING_RULE='yes' if missing_rule else 'no',
                    ACTION=action, ASK_FAILURE=ask_failure, SOURCE_IP=source_ip,
-                   STATUS_FAILURE_AT=str(status_failure_at), READ_ERROR='yes' if read_error else 'no')
+                   STATUS_FAILURE_AT=str(status_failure_at), READ_ERROR='yes' if read_error else 'no',
+                   PENDING=pending, ENABLE_STATE=enable_state)
         stubs = '\n'.join(f'{name}() {{ echo STEP:{name}; }}' for name in STEPS if name != 'configure_ufw')
         call = call_override or ('part2_setup' if part2 else 'configure_ufw')
         prelude += '\nSTATUS_COUNT=$(mktemp)\ntrap \'rm -f "$STATUS_COUNT" "$STATUS_COUNT.allowed"\' EXIT\n'
@@ -82,7 +89,7 @@ ufw() {
 
     def mutations(self, result):
         return [line[4:] for line in result.stderr.splitlines()
-                if line.startswith('CMD:') and not line.startswith('CMD:status')]
+                if line.startswith('CMD:') and not line.startswith(('CMD:status', 'CMD:show'))]
 
     def test_active_ensures_only_ssh(self):
         result = self.run_ufw(active=True)

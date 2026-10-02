@@ -383,6 +383,43 @@ def restore_files():
         raise ValueError('FATAL: SSH rollback failed: ' + ', '.join(failures))
 
 
+def ufw_pending(port):
+    # Inactive status hides saved rules. show added is read-only and includes
+    # both families, but coalesces duplicates; do not infer per-family order.
+    rows = sys.stdin.read().splitlines()
+    header = "Added user rules (see 'ufw status' for running firewall):"
+    if not rows or rows[0] != header or len(rows) < 2:
+        raise ValueError('Missing/unsupported saved UFW evidence')
+    if rows[1:] == ['(None)']:
+        return
+    for number, line in enumerate(rows[1:], 1):
+        tokens = shlex.split(line)
+        if len(tokens) < 3 or tokens[0] != 'ufw':
+            raise ValueError('Unsupported saved UFW rule ' + str(number))
+        if 'comment' in tokens:
+            index = tokens.index('comment')
+            if len(tokens) != index + 2:
+                raise ValueError('Unsupported saved UFW comment')
+            tokens = tokens[:index]
+        action, *args = tokens[1:]
+        if action == 'allow':
+            continue
+        if action not in ('deny', 'reject', 'limit'):
+            raise ValueError('Unsupported saved UFW rule ' + str(number))
+        # Only simple unrelated numeric-port rules are proved harmless here.
+        if args and args[0] in ('in', 'out'):
+            direction = args.pop(0)
+        else:
+            direction = 'in'
+        if args and args[0] in ('log', 'log-all'):
+            args.pop(0)
+        simple = re.fullmatch(r'(\d+)(?:/(tcp|udp))?', args[0]) if len(args) == 1 else None
+        if simple and (direction == 'out' or int(simple[1]) != int(port) or simple[2] == 'udp'):
+            continue
+        raise ValueError('Potentially blocking saved UFW rule ' + str(number) +
+                         '; inspect ufw show added and resolve SSH access before enabling')
+
+
 def ufw_order(port):
     text = sys.stdin.read()
     if not text.startswith('Status: active\n'):
@@ -430,6 +467,8 @@ try:
         restore_files()
     elif op == 'ufw':
         result = ufw_order(*args)
+    elif op == 'ufw-pending':
+        ufw_pending(*args)
     else:
         raise ValueError('Unknown access safety operation')
     sys.exit(result)
@@ -1829,12 +1868,22 @@ configure_ufw() {
       error "Не удалось прочитать ответ об активации UFW"; return 1;
     }
     if yes_by_default "$answer"; then
+      local pending_rules
+      pending_rules="$(LC_ALL=C ufw show added)" || {
+        error "Не удалось прочитать сохранённые правила UFW; firewall не включён"; return 1;
+      }
+      if ! access_safety ufw-pending "$SSH_PORT" <<< "$pending_rules"; then
+        error "Сохранённые правила UFW могут блокировать SSH; firewall не включён"; return 1
+      fi
       ufw default deny incoming || { error "Не удалось установить UFW default deny incoming"; return 1; }
       ufw default allow outgoing || { error "Не удалось установить UFW default allow outgoing"; return 1; }
       ufw allow "$SSH_PORT/tcp" comment 'SSH' || { error "Не удалось разрешить $SSH_PORT/tcp в UFW"; return 1; }
       ufw allow 80/tcp comment 'HTTP' || { error "Не удалось разрешить 80/tcp в UFW"; return 1; }
       ufw allow 443/tcp comment 'HTTPS' || { error "Не удалось разрешить 443/tcp в UFW"; return 1; }
       ufw --force enable || { error "Не удалось включить UFW"; return 1; }
+      if ! ufw_is_active || ! ensure_ufw_ssh_port; then
+        error "После включения UFW доступ к SSH не подтверждён; текущую сессию не закрывайте"; return 1
+      fi
       ok "UFW включён: SSH $SSH_PORT, HTTP/HTTPS"
     fi
   fi

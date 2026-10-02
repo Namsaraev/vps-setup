@@ -304,7 +304,7 @@ ask_password prompt password
         # Native zsh fixtures need a CI-only dependency. No privileged script run.
         self.assertEqual([line.strip() for line in workflow.splitlines() if 'sudo ' in line], [
             'sudo apt-get update -o APT::Update::Error-Mode=any',
-            'sudo apt-get install -y zsh',
+            'sudo apt-get install -y zsh ufw',
         ])
         self.assertIn('ref: ${{ github.event.pull_request.head.sha || github.sha }}', workflow)
         self.assertEqual(workflow.count('test -z "$(git status --porcelain)"'), 2)

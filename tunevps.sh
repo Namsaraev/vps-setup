@@ -544,7 +544,7 @@ part1_update() {
       return 1
     fi
     if yes_by_default "$answer"; then
-      apt-get update || { error "apt-get update завершился с ошибкой"; return 1; }
+      apt-get update -o APT::Update::Error-Mode=any || { error "apt-get update завершился с ошибкой"; return 1; }
       if command -v unminimize >/dev/null 2>&1; then
         :
       else
@@ -579,7 +579,7 @@ part1_update() {
     fi
   fi
 
-  apt-get update || { error "apt-get update завершился с ошибкой"; return 1; }
+  apt-get update -o APT::Update::Error-Mode=any || { error "apt-get update завершился с ошибкой"; return 1; }
 
   if [ ! -f "$FIRST_UPDATE_MARKER" ]; then
     info "ПЕРВОЕ обновление системы — используем full-upgrade"
@@ -609,7 +609,7 @@ part1_update() {
 
 install_packages() {
   section "БАЗОВЫЕ ПАКЕТЫ"
-  apt-get update || { error "apt-get update завершился с ошибкой"; return 1; }
+  apt-get update -o APT::Update::Error-Mode=any || { error "apt-get update завершился с ошибкой"; return 1; }
 
   if ! apt-get install -y nano git curl wget unzip jq htop tmux net-tools dnsutils \
     bat fd-find ripgrep fzf python3 python3-pip python3-venv build-essential \
@@ -2170,10 +2170,6 @@ as_current_user() {
 
 configure_shell() {
   section "ZSH, OH MY ZSH И POWERLEVEL10K"
-  chsh -s /usr/bin/zsh "$CURRENT_USER" || {
-    error "Не удалось изменить shell для $CURRENT_USER на /usr/bin/zsh"
-    return 1
-  }
   if [ ! -d "$USER_HOME/.oh-my-zsh" ]; then
     as_current_user git clone --depth=1 https://github.com/ohmyzsh/ohmyzsh.git "$USER_HOME/.oh-my-zsh" || {
       error "Не удалось установить Oh My Zsh"
@@ -2198,6 +2194,33 @@ configure_shell() {
     }
   done
 
+  # Check as the initiating user; keep incomplete user directories for repair.
+  local entry
+  for entry in \
+    "$USER_HOME/.oh-my-zsh/oh-my-zsh.sh" \
+    "$custom/themes/powerlevel10k/powerlevel10k.zsh-theme" \
+    "$custom/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh" \
+    "$custom/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"; do
+    if ! as_current_user test -s "$entry" || ! as_current_user test -r "$entry" ||
+       ! as_current_user /usr/bin/zsh -fn -- "$entry"; then
+      error "Неполный или повреждённый shell component: $entry; исправьте каталог вручную"
+      return 1
+    fi
+  done
+  # Completions are loaded from src rather than a plugin entrypoint.
+  local completions_found=false
+  for entry in "$custom/plugins/zsh-completions/src"/_*; do
+    [ -f "$entry" ] || continue
+    if ! as_current_user test -s "$entry" || ! as_current_user test -r "$entry" ||
+       ! as_current_user /usr/bin/zsh -fn -- "$entry"; then
+      error "Повреждённый completion: $entry"; return 1
+    fi
+    completions_found=true
+  done
+  if [ "$completions_found" != true ]; then
+    error "Не найдены completions в $custom/plugins/zsh-completions/src"; return 1
+  fi
+
   local managed_dir="$USER_HOME/.config/tunevps"
   as_current_user mkdir -p "$managed_dir" || {
     error "Не удалось создать каталог $managed_dir"
@@ -2214,6 +2237,8 @@ fi
 
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="powerlevel10k/powerlevel10k"
+# Register completion functions before Oh My Zsh initializes compinit.
+fpath=("$ZSH/custom/plugins/zsh-completions/src" $fpath)
 plugins=(
   git
   zsh-autosuggestions
@@ -2319,8 +2344,18 @@ EOF
     error "Не удалось обновить managed block в $USER_HOME/.zshrc"
     return 1
   fi
+  # Parse only: never execute arbitrary existing user startup code as root.
+  if ! as_current_user /usr/bin/zsh -fn -- "$managed_dir/zshrc" ||
+     ! as_current_user /usr/bin/zsh -fn -- "$USER_HOME/.zshrc"; then
+    error "Не удалось проверить синтаксис zshrc; login shell не изменён"
+    return 1
+  fi
+  chsh -s /usr/bin/zsh "$CURRENT_USER" || {
+    error "Не удалось изменить shell для $CURRENT_USER на /usr/bin/zsh"
+    return 1
+  }
   ok "Zsh и P10K настроены для $CURRENT_USER"
-  info "После нового SSH-входа под $CURRENT_USER мастер P10K стартует автоматически."
+  info "Login shell изменён для следующего входа $CURRENT_USER; текущая сессия не меняется. Мастер P10K запускается при отсутствии .p10k.zsh."
 }
 
 # Download completely before parsing/executing; traps are scoped to this subshell.
@@ -2457,13 +2492,13 @@ EOF
   fi
 
   if [ -d "$USER_HOME/.oh-my-zsh/custom/themes/powerlevel10k" ]; then
-    ok "Powerlevel10k установлен ✓"
+    info "Каталог Powerlevel10k существует; entrypoints проверяются в configure_shell"
   else
     warn "Powerlevel10k не найден"
   fi
 
   if [ -f "$USER_HOME/.zshrc" ]; then
-    ok ".zshrc создан для $CURRENT_USER ✓"
+    info ".zshrc существует для $CURRENT_USER; синтаксис проверяется в configure_shell"
   else
     error ".zshrc НЕ найден! ⚠️"
     failed=1

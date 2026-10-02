@@ -8,6 +8,8 @@ import unittest
 
 from test_part2_error_propagation import PART2, STEPS, SOURCE
 
+SOURCE = Path(os.environ.get('BUNDLE_AUDIT_SOURCE', Path(__file__).resolve().parents[1] / 'tunevps.sh')).read_text(encoding='utf-8')
+
 FUNCTION = 'configure_autoremove() {' + SOURCE.split('configure_autoremove() {', 1)[1].split('\nconfigure_needrestart()', 1)[0]
 SUCCESS = 'Удаление неиспользуемых пакетов завершено'
 POLICY = ('Unattended-Upgrade::Remove-Unused-Dependencies "false";\n'
@@ -18,7 +20,7 @@ FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureAutoremoveTest(unittest.TestCase):
-    def run_setup(self, mode='success', answer='y', part2=False, repeat=False, errexit=False, count=2):
+    def run_setup(self, mode='success', answer='y', part2=False, repeat=False, errexit=False, count=2, extra=''):
         with tempfile.TemporaryDirectory(prefix='autoremove test ') as tmp:
             root = Path(tmp)
             target = root / '50auto-remove'
@@ -26,6 +28,15 @@ class ConfigureAutoremoveTest(unittest.TestCase):
                 target.mkdir()
             prelude = r'''
 set -o pipefail
+
+apt-config() {
+  [ "$1" != dump ] || return 0
+  case "$3" in
+    *AutocleanInterval) echo "value='7'" ;;
+    *Remove-*) echo "value='false'" ;;
+    *) echo "value='1'" ;;
+  esac
+}
 section() { :; }
 info() { echo "INFO: $*"; }
 ok() { echo "OK: $*"; }
@@ -58,7 +69,7 @@ apt-get() {
                               for name in STEPS if name != 'configure_autoremove')
             function = FUNCTION.replace('/etc/apt/apt.conf.d/50auto-remove', '"$ROOT/50auto-remove"')
             invoke = 'part2_setup' if part2 else 'configure_autoremove'
-            script = prelude + function + '\n' + stubs + '\n' + PART2 + '\n'
+            script = prelude + extra + '\n' + function + '\n' + stubs + '\n' + PART2 + '\n'
             script += 'set -e\n' if errexit else ''
             script += f'{invoke} || exit $?\n' * (2 if repeat else 1)
             result = subprocess.run([os.environ.get('BASH', 'bash')], input=script,

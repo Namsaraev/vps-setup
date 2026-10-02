@@ -835,14 +835,57 @@ EOF
     return 1
   fi
 
-  # Конфигурация обязательна; включение таймеров остаётся best-effort.
-  local timers_ok=true
+  local key expected actual
+  for key in Update-Package-Lists Unattended-Upgrade Download-Upgradeable-Packages AutocleanInterval; do
+    expected=1; [ "$key" != AutocleanInterval ] || expected=7
+    actual=$(apt-config shell value "APT::Periodic::$key") || { error "Не удалось проверить APT::$key"; return 1; }
+    [ "$actual" = "value='$expected'" ] || { error "Конфликт effective APT::$key; проверьте overrides"; return 1; }
+  done
+
+  # Конфигурация обязательна; таймеры остаются best-effort.
+  local timers_ok=true enablement enable_status
   for timer in apt-daily.timer apt-daily-upgrade.timer; do
-    if ! systemctl is-enabled "$timer" >/dev/null 2>&1; then
+    enable_status=0
+    enablement=$(systemctl is-enabled "$timer" 2>/dev/null) || enable_status=$?
+    if [ "$enablement" = disabled ] && [ "$enable_status" -eq 1 ]; then
       systemctl enable "$timer" 2>/dev/null || {
         warn "Не удалось включить $timer"
         timers_ok=false
       }
+    elif [ "$enablement" != enabled ] || [ "$enable_status" -ne 0 ]; then
+      warn "Не удалось подтвердить persistent enablement $timer ($enablement); проверьте unit state"
+      timers_ok=false
+    fi
+  done
+
+  local timer_state
+  for timer in apt-daily.timer apt-daily-upgrade.timer; do
+    if ! timer_state=$(systemctl show "$timer" -p LoadState -p UnitFileState -p ActiveState -p SubState -p NextElapseUSecRealtime -p NextElapseUSecMonotonic -p NeedDaemonReload); then
+      warn "Не удалось проверить runtime scheduling $timer"; timers_ok=false; continue
+    fi
+    if ! python3 -c 'import datetime, re, sys
+rows = sys.stdin.read().splitlines()
+keys = ("LoadState", "UnitFileState", "ActiveState", "SubState", "NextElapseUSecRealtime", "NextElapseUSecMonotonic", "NeedDaemonReload")
+data = dict(row.split("=", 1) for row in rows if "=" in row)
+def scheduled(v):
+    if re.fullmatch(r"[1-9][0-9]*", v):
+        return True
+    if re.fullmatch(r"(?:[0-9]+(?:us|ms|s|min|h|d|w|month|y) ?)+", v) and re.search(r"[1-9]", v):
+        return True
+    if re.fullmatch(r"[A-Za-z]{3} [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} \S+", v):
+        try:
+            datetime.datetime.strptime(" ".join(v.split()[1:3]), "%Y-%m-%d %H:%M:%S")
+            return True
+        except ValueError:
+            pass
+    return False
+sys.exit(0 if len(rows) == len(keys) and set(data) == set(keys) and
+data["LoadState"] == "loaded" and data["UnitFileState"] == "enabled" and
+data["ActiveState"] == "active" and data["SubState"] == "waiting" and
+data["NeedDaemonReload"] == "no" and
+any(scheduled(data[k]) for k in keys[4:6]) else 1)' <<< "$timer_state"; then
+      warn "$timer: active scheduling не подтверждено; проверьте systemctl list-timers"
+      timers_ok=false
     fi
   done
 
@@ -866,6 +909,11 @@ EOF
     error "Не удалось отключить автоудаление зависимостей"
     return 1
   fi
+  local key actual
+  for key in Remove-Unused-Dependencies Remove-New-Unused-Dependencies; do
+    actual=$(apt-config shell value "Unattended-Upgrade::$key") || { error "Не удалось проверить APT::$key"; return 1; }
+    [ "$actual" = "value='false'" ] || { error "Конфликт effective APT::$key; проверьте overrides"; return 1; }
+  done
   ok "Автоудаление зависимостей отключено (безопасно для Xray/3x-ui/Docker)"
 
   local packages=0 preview line package rest listing=""
@@ -920,6 +968,48 @@ configure_needrestart() {
       error "Не удалось прочитать подтверждение настройки needrestart"; return 1;
     }
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+      local apt_hooks
+      apt_hooks=$(apt-config dump) || { error "Не удалось проверить APT hooks needrestart"; return 1; }
+      if ! python3 -c 'import re, sys
+text = sys.stdin.read()
+for line in text.splitlines():
+    if "needrestart" in line.lower() and re.search(r"(?:-r\s*(?:\\?[\"\x27])?[^a\s;\"\x27]|NEEDRESTART_MODE\s*=\s*(?:\\?[\"\x27])?[^a\s;\"\x27]|NEEDRESTART_SUSPEND\s*=|--restart(?:=|\s+)[^a])", line):
+        sys.exit("Conflicting APT needrestart hook; manual review required")' <<< "$apt_hooks"; then
+        error "APT hook переопределяет needrestart"; return 1
+      fi
+      # Inspect snippets without executing administrator-provided Perl.
+      if ! python3 - /etc/needrestart/conf.d <<'PY_SNIPPETS'
+from pathlib import Path
+import re
+import sys
+try:
+    directory = Path(sys.argv[1])
+    try:
+        paths = sorted(directory.iterdir())
+    except FileNotFoundError:
+        if directory.is_symlink():
+            raise
+        paths = []
+    for path in paths:
+        if not path.name.endswith('.conf'):
+            continue
+        for line in path.read_text().splitlines():
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            if not re.fullmatch(r'''\s*\$nrconf\s*\{\s*(?:restart|'restart'|"restart")\s*\}\s*=\s*(['"])a\1\s*;\s*(?:#.*)?''', line):
+                raise ValueError('Conflicting or unsupported needrestart snippet: ' + str(path))
+except (OSError, ValueError) as exc:
+    sys.exit(str(exc))
+PY_SNIPPETS
+      then
+        error "Не удалось проверить needrestart conf.d; основной конфиг не изменён"; return 1
+      fi
+      if [ -n "${NEEDRESTART_MODE:-}" ] && [ "$NEEDRESTART_MODE" != a ]; then
+        error "NEEDRESTART_MODE переопределяет автоматический режим"; return 1
+      fi
+      if [ -n "${NEEDRESTART_SUSPEND:-}" ]; then
+        error "NEEDRESTART_SUSPEND отключает запуск needrestart"; return 1
+      fi
       # Python 3 is installed by install_packages(); do not execute Perl config.
       if ! python3 - /etc/needrestart/needrestart.conf <<'PY'
 import os
@@ -1000,7 +1090,8 @@ PY
         return 1
       fi
       ok "Режим автоматического перезапуска записан в основной конфиг needrestart"
-      warn "Эффективный режим может быть переопределён conf.d или APT hook; здесь он не проверяется"
+      info "conf.d проверен без выполнения Perl; автоматический перезапуск каждого сервиса не гарантируется"
+      warn "Параметры будущего APT hook/окружения и произвольный Perl основного конфига могут менять режим; это не runtime-проверка"
     else
       info "Настройки needrestart не изменены"
     fi
@@ -1121,18 +1212,61 @@ EOF
     error "Не удалось применить некоторые sysctl"
     return 1
   fi
+  # A successful aggregate loader can still leave later overrides in effect.
+  local setting expected actual managed_sysctl verified_count=0 expected_count=11
+  [ "$bbr_available" != true ] || expected_count=13
+  managed_sysctl=$(cat /etc/sysctl.d/99-vps-tuning.conf) || { error "Не удалось прочитать managed sysctl"; return 1; }
+  while read -r setting equals expected; do
+    [[ "$setting" = \#* || -z "$setting" ]] && continue
+    [ "$equals" = = ] || { error "Некорректный managed sysctl"; return 1; }
+    actual=$(sysctl -n "$setting") || { error "Не удалось проверить sysctl $setting"; return 1; }
+    [ "$actual" = "$expected" ] || { error "Конфликт effective sysctl $setting; проверьте overrides"; return 1; }
+    verified_count=$((verified_count + 1))
+  done <<< "$managed_sysctl"
+  [ "$verified_count" -eq "$expected_count" ] || { error "Неполный managed sysctl snapshot"; return 1; }
 
   mkdir -p /etc/security/limits.d || { error "Не удалось создать /etc/security/limits.d"; return 1; }
   if ! atomic_config /etc/security/limits.d/99-vps.conf text <<'EOF'
-* soft nofile 524288
+* soft nofile 1024
 * hard nofile 1048576
-root soft nofile 524288
+root soft nofile 1024
 root hard nofile 1048576
 EOF
   then
     error "Не удалось записать /etc/security/limits.d/99-vps.conf"
     return 1
   fi
+  # Conservative conflict check; PAM limits take effect only at a new login.
+  if ! python3 - /etc/security <<'PY_LIMITS'
+from pathlib import Path
+import sys
+try:
+    root = Path(sys.argv[1])
+    try:
+        (root / 'limits.conf').lstat()
+        paths = [root / 'limits.conf']
+    except FileNotFoundError:
+        paths = []
+    paths += sorted((root / 'limits.d').iterdir())
+    for path in paths:
+        if path.name != 'limits.conf' and not path.name.endswith('.conf'):
+            continue
+        for line in path.read_text().splitlines():
+            row = line.split('#', 1)[0].split()
+            if 'nofile' not in row:
+                continue
+            if len(row) != 4 or row[1] not in ('soft', 'hard') or row[2] != 'nofile':
+                raise ValueError('Unsupported PAM nofile entry: ' + str(path))
+            expected = '1048576' if row[1] == 'hard' else '1024'
+            if row[3] != expected:
+                raise ValueError('PAM nofile override requires manual review: ' + str(path))
+except (OSError, ValueError) as exc:
+    sys.exit(str(exc))
+PY_LIMITS
+  then
+    error "Не удалось проверить aggregate PAM limits"; return 1
+  fi
+  info "PAM nofile: soft=1024, hard=1048576 записаны для новых pam_limits-сессий; текущие процессы не изменены"
   ok "Безопасные sysctl применены"
   return 0
 }
@@ -1145,14 +1279,19 @@ configure_systemd_limits() {
   mkdir -p /etc/systemd/system.conf.d || { error "Не удалось создать /etc/systemd/system.conf.d"; return 1; }
   if ! atomic_config /etc/systemd/system.conf.d/99-nofile.conf text <<'EOF'
 [Manager]
-DefaultLimitNOFILE=1048576
+DefaultLimitNOFILE=1024:1048576
 EOF
   then
     error "Не удалось записать /etc/systemd/system.conf.d/99-nofile.conf"
     return 1
   fi
   if systemctl daemon-reexec; then
-    ok "DefaultLimitNOFILE=1048576 задан по умолчанию для последующих запусков сервисов; per-unit overrides сохраняются"
+    local limits
+    limits=$(systemctl show -p DefaultLimitNOFILE -p DefaultLimitNOFILESoft) || { error "Не удалось проверить effective systemd limits"; return 1; }
+    if [[ "$limits" != $'DefaultLimitNOFILE=1048576\nDefaultLimitNOFILESoft=1024' && "$limits" != $'DefaultLimitNOFILESoft=1024\nDefaultLimitNOFILE=1048576' ]]; then
+      error "Конфликт effective systemd limits; проверьте overrides"; return 1
+    fi
+    ok "DefaultLimitNOFILE=1024:1048576 проверен для последующих запусков сервисов; per-unit overrides сохраняются"
   else
     error "Не удалось выполнить systemctl daemon-reexec"
     return 1

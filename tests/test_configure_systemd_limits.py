@@ -8,18 +8,18 @@ import unittest
 
 from test_part2_error_propagation import PART2, STEPS
 
-SOURCE = (Path(__file__).resolve().parents[1] / "tunevps.sh").read_text(encoding="utf-8")
+SOURCE = Path(os.environ.get("BUNDLE_AUDIT_SOURCE", Path(__file__).resolve().parents[1] / "tunevps.sh")).read_text(encoding="utf-8")
 FUNCTION = "configure_systemd_limits() {" + SOURCE.split(
     "configure_systemd_limits() {", 1)[1].split("\nconfigure_swap()", 1)[0]
-CONFIG = "[Manager]\nDefaultLimitNOFILE=1048576\n"
-SUCCESS = "DefaultLimitNOFILE=1048576 задан по умолчанию для последующих запусков сервисов; per-unit overrides сохраняются"
+CONFIG = "[Manager]\nDefaultLimitNOFILE=1024:1048576\n"
+SUCCESS = "DefaultLimitNOFILE=1024:1048576 проверен для последующих запусков сервисов; per-unit overrides сохраняются"
 
 
 FUNCTION = HELPER + "\n" + FUNCTION
 
 
 class ConfigureSystemdLimitsTest(unittest.TestCase):
-    def run_setup(self, failure="", part2=False, errexit=False, repeat=False):
+    def run_setup(self, failure="", part2=False, errexit=False, repeat=False, extra=""):
         with tempfile.TemporaryDirectory(prefix="systemd limits test ") as tmp:
             root = Path(tmp)
             directory = root / "system.conf.d"
@@ -49,11 +49,15 @@ cat() {
 }
 systemctl() {
   printf '%s\n' "$*" >> "$CALLS"
+  if [ "$1" = show ]; then
+    printf '%s\n' DefaultLimitNOFILE=1048576 DefaultLimitNOFILESoft=1024
+    return 0
+  fi
   [ "$*" = daemon-reexec ] || return 98
   [ "$FAILURE" != reexec ] || return 23
   # Verify the complete config exists before activation, without a real service call.
   [ "$(command cat "$CONFIG_DIR/99-nofile.conf")" = "[Manager]
-DefaultLimitNOFILE=1048576" ] || return 97
+DefaultLimitNOFILE=1024:1048576" ] || return 97
 }
 '''
             prelude += "\n".join(f'{step}() {{ echo STEP:{step}; return 0; }}'
@@ -62,7 +66,7 @@ DefaultLimitNOFILE=1048576" ] || return 97
             call = "part2_setup" if part2 else "configure_systemd_limits"
             env = dict(os.environ, FAILURE=failure, CONFIG_DIR=directory.as_posix(),
                        CALLS=(root / "calls").as_posix())
-            script = prelude + "\n" + function + "\n" + PART2 + "\n"
+            script = prelude + "\n" + extra + "\n" + function + "\n" + PART2 + "\n"
             script += "set -e\n" if errexit else ""
             script += f"{call} || exit $?\n"
             if repeat:
@@ -119,7 +123,7 @@ DefaultLimitNOFILE=1048576" ] || return 97
         for errexit in (False, True):
             result, calls, config = self.run_setup(errexit=errexit)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(calls, ["daemon-reexec"])
+            self.assertEqual(calls, ["daemon-reexec", "show -p DefaultLimitNOFILE -p DefaultLimitNOFILESoft"])
             self.assertEqual(config, CONFIG)
             self.assertEqual(result.stdout.count(SUCCESS), 1)
             self.assertNotIn("ERROR:", result.stderr)
@@ -128,14 +132,14 @@ DefaultLimitNOFILE=1048576" ] || return 97
         result, calls, config = self.run_setup(repeat=True, errexit=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(config, CONFIG)
-        self.assertEqual(calls, ["daemon-reexec", "daemon-reexec"])
+        self.assertEqual(calls, ["daemon-reexec", "show -p DefaultLimitNOFILE -p DefaultLimitNOFILESoft", "daemon-reexec", "show -p DefaultLimitNOFILE -p DefaultLimitNOFILESoft"])
         self.assertEqual(result.stdout.count(SUCCESS), 2)
 
     def test_part2_success(self):
         result, calls, config = self.run_setup(part2=True, errexit=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(config, CONFIG)
-        self.assertEqual(calls, ["daemon-reexec"])
+        self.assertEqual(calls, ["daemon-reexec", "show -p DefaultLimitNOFILE -p DefaultLimitNOFILESoft"])
         self.assertEqual(result.stdout.count("Часть 2 завершена"), 1)
         self.assertEqual([s for s in result.stdout.splitlines() if s.startswith("STEP:")],
                          [f"STEP:{s}" for s in STEPS if s != "configure_systemd_limits"])

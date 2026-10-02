@@ -7,19 +7,28 @@ import tempfile
 import unittest
 
 
-SOURCE = (Path(__file__).resolve().parents[1] / 'tunevps.sh').read_text(encoding='utf-8')
+SOURCE = Path(os.environ.get('BUNDLE_AUDIT_SOURCE', Path(__file__).resolve().parents[1] / 'tunevps.sh')).read_text(encoding='utf-8')
 FUNCTION = 'configure_needrestart() {' + SOURCE.split('configure_needrestart() {', 1)[1].split('\nconfigure_safe_sysctl()', 1)[0]
 SUCCESS = 'Режим автоматического перезапуска записан в основной конфиг needrestart'
 AUTO = b'$nrconf{restart} = "a";\n'
 PRELUDE = r'''
 set -euo pipefail
+
+apt-config() {
+  [ "$1" != dump ] || return 0
+  case "$3" in
+    *AutocleanInterval) echo "value='7'" ;;
+    *Remove-*) echo "value='false'" ;;
+    *) echo "value='1'" ;;
+  esac
+}
 section() { :; }
 info() { echo "INFO: $*"; }
 warn() { echo "WARN: $*"; }
 ok() { echo "OK: $*"; }
 error() { echo "ERROR: $*" >&2; }
 ask() { echo PROMPT; read -r "$2"; }
-python3() { "$PYTHON" "$WRAPPER" "$@"; }
+python3() { if [ "$1" = -c ]; then "$PYTHON" "$@"; else "$PYTHON" "$WRAPPER" "$@"; fi; }
 '''
 WRAPPER = r'''
 import os
@@ -99,8 +108,8 @@ class NeedrestartTest(unittest.TestCase):
         self.wrapper = self.root / 'runner.py'
         self.wrapper.write_text(WRAPPER, encoding='utf-8')
 
-    def run_configure(self, answers='y\ny\n', failure='', through_part2=False):
-        function = FUNCTION.replace('/etc/needrestart/needrestart.conf', '"$CONFIG"')
+    def run_configure(self, answers='y\ny\n', failure='', through_part2=False, extra=''):
+        function = FUNCTION.replace('/etc/needrestart/needrestart.conf', '"$CONFIG"').replace('/etc/needrestart/conf.d', '"$CONFIG_DIR"')
         script = self.root / 'run.sh'
         # A guarded call disables implicit errexit, just as part2_setup does.
         invocation = '\nconfigure_needrestart || exit $?\n'
@@ -109,11 +118,11 @@ class NeedrestartTest(unittest.TestCase):
             stubs = '\n'.join(f'{name}() {{ echo CALL:{name}; }}'
                               for name in STEPS if name != 'configure_needrestart')
             invocation = '\n' + stubs + '\n' + PART2 + '\npart2_setup || exit $?\n'
-        script.write_text(PRELUDE + function + invocation, encoding='utf-8', newline='\n')
+        script.write_text(PRELUDE + extra + '\n' + function + invocation, encoding='utf-8', newline='\n')
         result = subprocess.run(
             [os.environ.get('BASH', 'bash'), script.as_posix()], input=answers.encode('utf-8'),
             capture_output=True, timeout=15,
-            env=dict(os.environ, CONFIG=self.config.as_posix(),
+            env=dict(os.environ, CONFIG=self.config.as_posix(), CONFIG_DIR=(self.root / 'conf.d').as_posix(),
                      PYTHON=Path(sys.executable).as_posix(),
                      WRAPPER=self.wrapper.as_posix(), FAILURE=failure, PYTHONIOENCODING='utf-8'))
         result.stdout = result.stdout.decode('utf-8')

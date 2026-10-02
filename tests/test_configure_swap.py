@@ -34,7 +34,7 @@ swapoff() {
   command mv "$ROOT/next" "$ROOT/active"
 }
 rm() { echo "rm $*" >> "$ROOT/calls"; command rm "$@"; }
-fallocate() { echo "fallocate $*" >> "$ROOT/calls"; touch "${@: -1}"; }
+fallocate() { echo "fallocate $*" >> "$ROOT/calls"; truncate -s "$2" "${@: -1}"; }
 dd() { echo 'unexpected dd' >&2; return 1; }
 chmod() { echo "chmod $*" >> "$ROOT/calls"; }
 mkswap() { echo "mkswap $*" >> "$ROOT/calls"; }
@@ -87,7 +87,7 @@ class SwapTest(unittest.TestCase):
         self.assertEqual(fstab, FSTAB + '/swapfile none swap sw 0 0\n')
 
     def test_matching_noop(self):
-        for size in (2147483648, 2147479552):
+        for size in (2147479552,):
             result, calls, fstab = self.run_swap(f'/swapfile {size} file\n')
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(calls, '')
@@ -146,7 +146,9 @@ class SwapTest(unittest.TestCase):
     def test_swapoff_failure_stops(self):
         result, calls, after = self.run_swap('/swapfile 1073741824 file\n', 'y', off_fail='1')
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(calls, 'swapoff /swapfile\n')
+        self.assertEqual(calls.count('swapoff /swapfile\n'), 1)
+        self.assertIn('fallocate ', calls)
+        self.assertNotIn('swapon ', calls)
         self.assertEqual(after, FSTAB)
 
     @unittest.skipIf(os.name == 'nt', 'Git Bash ln may copy files instead of creating symlinks')

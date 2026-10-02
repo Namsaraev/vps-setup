@@ -242,8 +242,9 @@ esac
         if not os.sys.platform.startswith('linux'):
             self.skipTest('Linux rlimit required')
         r = subprocess.run(['python3', '-c', '''import resource
-resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1048576))
-assert resource.getrlimit(resource.RLIMIT_NOFILE) == (1024, 1048576)
+_, inherited_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (1024, inherited_hard))
+assert resource.getrlimit(resource.RLIMIT_NOFILE) == (1024, inherited_hard)
 '''], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
 

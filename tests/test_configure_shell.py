@@ -26,7 +26,6 @@ BLOCK = (b'# >>> tunevps managed block >>>\n'
 FUNCTION = HELPER + "\n" + FUNCTION
 
 
-
 ENTRYPOINTS = (
     ".oh-my-zsh/oh-my-zsh.sh",
     ".oh-my-zsh/custom/themes/powerlevel10k/powerlevel10k.zsh-theme",
@@ -34,6 +33,7 @@ ENTRYPOINTS = (
     ".oh-my-zsh/custom/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh",
     ".oh-my-zsh/custom/plugins/zsh-completions/src/_fixture",
 )
+
 
 class ConfigureShellTest(unittest.TestCase):
     def setUp(self):
@@ -109,7 +109,7 @@ as_current_user() {
         if not success:
             self.assertIn("ERROR:", result.stderr)
             self.assertNotIn("OK:", result.stdout)
-            self.assertNotIn("Р§Р°СЃС‚СЊ 2 Р·Р°РІРµСЂС€РµРЅР°", result.stdout + result.stderr)
+            self.assertNotIn("Часть 2 завершена", result.stdout + result.stderr)
         if success and os.name == "posix":
             for path in (self.rc, self.managed, self.managed.parent):
                 self.assertEqual(path.stat().st_uid, os.getuid())
